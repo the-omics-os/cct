@@ -1,0 +1,654 @@
+#!/usr/bin/env bun
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+} from "@modelcontextprotocol/sdk/types.js";
+import { mkdirSync, existsSync, writeFileSync, unlinkSync, readFileSync, renameSync, chmodSync, statSync } from "node:fs";
+import { basename, join } from "node:path";
+import {
+  BROKER_PORT,
+  BROKER_HOST,
+  CCT_DIR,
+  PIDMAP_DIR,
+  FLAGS_DIR,
+  POLL_INTERVAL_MS,
+  HEARTBEAT_INTERVAL_MS,
+} from "./shared/constants.ts";
+import type {
+  BrokerResponse,
+  RegisterResponse,
+  PeerInfo,
+  PoolInfo,
+  PoolStatusResponse,
+  PoolCreateResponse,
+  PollMessage,
+  MessageSendResponse,
+  UnreadCountResponse,
+} from "./shared/types.ts";
+import { generateSummary } from "./shared/summarize.ts";
+
+const BROKER_URL = `http://${BROKER_HOST}:${BROKER_PORT}`;
+const myCwd = process.cwd();
+
+let myId = "";
+let mySecret = "";
+let myName = "";
+let pollInterval: ReturnType<typeof setInterval> | null = null;
+let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
+
+// --- Broker HTTP helpers ---
+
+async function brokerPost<T = unknown>(path: string, body: Record<string, unknown>): Promise<BrokerResponse<T>> {
+  const res = await fetch(`${BROKER_URL}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return await res.json() as BrokerResponse<T>;
+}
+
+async function brokerGet<T = unknown>(path: string): Promise<BrokerResponse<T>> {
+  const res = await fetch(`${BROKER_URL}${path}`);
+  return await res.json() as BrokerResponse<T>;
+}
+
+// --- Ensure broker is running ---
+
+async function ensureBroker(): Promise<void> {
+  try {
+    const res = await fetch(`${BROKER_URL}/health`);
+    if (res.ok) return;
+  } catch {}
+
+  const brokerPath = new URL("./broker.ts", import.meta.url).pathname;
+  const child = Bun.spawn(["bun", brokerPath], {
+    stdout: "ignore",
+    stderr: "ignore",
+    stdin: "ignore",
+  });
+  child.unref();
+
+  for (let i = 0; i < 20; i++) {
+    await new Promise((r) => setTimeout(r, 250));
+    try {
+      const res = await fetch(`${BROKER_URL}/health`);
+      if (res.ok) return;
+    } catch {}
+  }
+  throw new Error("Failed to start broker");
+}
+
+// --- Ensure directories ---
+
+function ensureDirs(): void {
+  for (const dir of [CCT_DIR, PIDMAP_DIR, FLAGS_DIR]) {
+    if (!existsSync(dir)) {
+      mkdirSync(dir, { mode: 0o700, recursive: true });
+    } else {
+      try {
+        const st = statSync(dir);
+        if ((st.mode & 0o777) !== 0o700) chmodSync(dir, 0o700);
+      } catch {}
+    }
+  }
+}
+
+// --- Get process start time (cached, platform-correct) ---
+
+function getPidStartForPid(pid: number): string {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf-8");
+    const fields = stat.split(" ");
+    if (fields[21]) return fields[21];
+  } catch {}
+  try {
+    const proc = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)]);
+    const out = proc.stdout.toString().trim();
+    if (out) return out.replace(/\s+/g, "_");
+  } catch {}
+  return String(Date.now());
+}
+
+const cachedPidStart = getPidStartForPid(process.pid);
+const cachedPpidStart = getPidStartForPid(process.ppid);
+
+// --- Get git info ---
+
+async function getGitInfo(cwd: string): Promise<{ gitRoot: string | null; gitBranch: string | null }> {
+  let gitRoot: string | null = null;
+  let gitBranch: string | null = null;
+
+  try {
+    const rootProc = Bun.spawn(["git", "rev-parse", "--show-toplevel"], {
+      cwd,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const out = await new Response(rootProc.stdout).text();
+    if (out.trim()) gitRoot = out.trim();
+  } catch {}
+
+  try {
+    const branchProc = Bun.spawn(["git", "rev-parse", "--abbrev-ref", "HEAD"], {
+      cwd,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const out = await new Response(branchProc.stdout).text();
+    if (out.trim()) gitBranch = out.trim();
+  } catch {}
+
+  return { gitRoot, gitBranch };
+}
+
+// --- Pidmap helpers ---
+
+const myPidmapPath = `${PIDMAP_DIR}/${process.ppid}_${cachedPpidStart}`;
+
+function writePidmap(): void {
+  writeFileSync(myPidmapPath, myId, { mode: 0o600 });
+}
+
+function deletePidmap(): void {
+  try { unlinkSync(myPidmapPath); } catch {}
+}
+
+// --- Flag file helpers ---
+
+function flagPath(): string {
+  return `${FLAGS_DIR}/${myId}.unread`;
+}
+
+function writeFlag(content: string): void {
+  const tmp = flagPath() + ".tmp";
+  writeFileSync(tmp, content, { mode: 0o600 });
+  renameSync(tmp, flagPath());
+}
+
+function deleteFlag(): void {
+  try { unlinkSync(flagPath()); } catch {}
+}
+
+// --- Polling loop ---
+
+let pollFailures = 0;
+
+async function pollUnread(): Promise<void> {
+  try {
+    const res = await brokerPost<UnreadCountResponse>("/message/unread-count", { peer_id: myId });
+    if (res.ok && res.data) {
+      pollFailures = 0;
+      const poolSummary = res.data.by_pool
+        .map((p) => `${p.pool_name ?? "DM"}:${p.count}`)
+        .join(",");
+      writeFlag(`${res.data.total}|${poolSummary}|${Date.now()}`);
+    }
+  } catch {
+    pollFailures++;
+    if (pollFailures >= 3) {
+      writeFlag(`0||${Date.now()}`);
+    }
+  }
+}
+
+// --- Heartbeat loop ---
+
+async function sendHeartbeat(): Promise<void> {
+  try {
+    await brokerPost("/heartbeat", { peer_id: myId, peer_secret: mySecret });
+  } catch {}
+}
+
+// --- Resolve peer name to ID ---
+
+async function resolvePeerId(nameOrId: string): Promise<{ id: string } | { error: string }> {
+  const res = await brokerPost<PeerInfo[]>("/list-peers", {});
+  if (!res.ok || !res.data) return { error: "Failed to list peers" };
+  const matches = res.data.filter((p) => p.id === nameOrId || p.name === nameOrId);
+  if (matches.length === 0) return { error: `Peer "${nameOrId}" not found.` };
+  if (matches.length > 1) {
+    const list = matches.map((p) => `  ${p.name} [${p.id}]`).join("\n");
+    return { error: `Ambiguous peer name "${nameOrId}". Matches:\n${list}\nUse the peer ID instead.` };
+  }
+  return { id: matches[0].id };
+}
+
+// --- Tool handlers ---
+
+async function handleCheckMessages(): Promise<string> {
+  const res = await brokerPost<{ messages: PollMessage[]; unread: UnreadCountResponse }>("/message/check", {
+    peer_id: myId,
+    peer_secret: mySecret,
+  });
+
+  if (!res.ok || !res.data || res.data.messages.length === 0) {
+    writeFlag(`0||${Date.now()}`);
+    return "No unread messages.";
+  }
+
+  const { messages, unread } = res.data;
+  const poolSummary = unread.by_pool.map((p) => `${p.pool_name ?? "DM"}:${p.count}`).join(",");
+  writeFlag(`${unread.total}|${poolSummary}|${Date.now()}`);
+
+  const lines = messages.map((m) => {
+    const source = m.pool_name ? `[pool:${m.pool_name}]` : "[DM]";
+    const sender = m.from_id === "system" ? "SYSTEM" : `${m.from_name ?? m.from_id}`;
+    const context = m.from_cwd ? ` (${m.from_cwd}, branch:${m.from_branch ?? "?"})` : "";
+    return `${source} ${sender}${context}: ${m.body}`;
+  });
+
+  return `${messages.length} message(s):\n\n${lines.join("\n")}`;
+}
+
+async function handleSendMessage(args: { to: string; message: string }): Promise<string> {
+  const { to, message } = args;
+
+  if (to.startsWith("@")) {
+    const target = to.slice(1);
+    const slashIdx = target.indexOf("/");
+
+    if (slashIdx !== -1) {
+      const poolName = target.slice(0, slashIdx);
+      const peerNameOrId = target.slice(slashIdx + 1);
+      const resolved = await resolvePeerId(peerNameOrId);
+      if ("error" in resolved) return resolved.error;
+
+      const res = await brokerPost<MessageSendResponse>("/message/send", {
+        peer_id: myId,
+        peer_secret: mySecret,
+        pool_name: poolName,
+        to_peer_id: resolved.id,
+        body: message,
+      });
+      if (!res.ok) return `Failed to send: ${res.error}`;
+      return `Sent directed message in pool "${poolName}" to "${peerNameOrId}".`;
+    }
+
+    const res = await brokerPost<MessageSendResponse>("/message/send", {
+      peer_id: myId,
+      peer_secret: mySecret,
+      pool_name: target,
+      body: message,
+    });
+    if (!res.ok) return `Failed to send: ${res.error}`;
+    return `Sent to pool "${target}" (${res.data!.recipient_count} recipients).`;
+  }
+
+  const resolved = await resolvePeerId(to);
+  if ("error" in resolved) return resolved.error;
+
+  const res = await brokerPost<MessageSendResponse>("/message/send", {
+    peer_id: myId,
+    peer_secret: mySecret,
+    to_peer_id: resolved.id,
+    body: message,
+  });
+  if (!res.ok) return `Failed to send: ${res.error}`;
+  return `DM sent to "${to}".`;
+}
+
+async function handleListPeers(): Promise<string> {
+  const res = await brokerPost<PeerInfo[]>("/list-peers", {});
+  if (!res.ok || !res.data) return `Failed: ${res.error}`;
+  if (res.data.length === 0) return "No active peers.";
+
+  const lines = res.data.map((p) => {
+    const pools = p.pools.length > 0
+      ? ` pools:[${p.pools.map((po) => `${po.pool_name}(${po.role})`).join(", ")}]`
+      : "";
+    const me = p.id === myId ? " (you)" : "";
+    return `- ${p.name}${me} [${p.id}] cwd:${p.cwd} branch:${p.git_branch ?? "?"}${pools}\n  summary: ${p.summary || "(none)"}`;
+  });
+
+  return `${res.data.length} peer(s):\n\n${lines.join("\n")}`;
+}
+
+async function handleListPools(): Promise<string> {
+  const res = await brokerPost<PoolInfo[]>("/pool/list", {});
+  if (!res.ok || !res.data) return `Failed: ${res.error}`;
+  if (res.data.length === 0) return "No active pools.";
+
+  const lines = res.data.map((p) => {
+    const members = p.members.map((m) => `${m.peer_name}(${m.role})`).join(", ");
+    return `- ${p.name}: ${p.purpose || "(no purpose)"} | ${p.members.length} member(s): ${members}`;
+  });
+
+  return `${res.data.length} pool(s):\n\n${lines.join("\n")}`;
+}
+
+async function handleCreatePool(args: { name: string; purpose?: string }): Promise<string> {
+  const res = await brokerPost<PoolCreateResponse>("/pool/create", {
+    peer_id: myId,
+    peer_secret: mySecret,
+    name: args.name,
+    purpose: args.purpose ?? "",
+  });
+  if (!res.ok) return `Failed: ${res.error}`;
+  return `Pool "${args.name}" created (id: ${res.data!.pool_id}). You are the creator.`;
+}
+
+async function handleJoinPool(args: { pool_name: string }): Promise<string> {
+  const res = await brokerPost("/pool/join", {
+    peer_id: myId,
+    peer_secret: mySecret,
+    pool_name: args.pool_name,
+  });
+  if (!res.ok) return `Failed: ${res.error}`;
+  return `Joined pool "${args.pool_name}".`;
+}
+
+async function handleLeavePool(args: { pool_name: string }): Promise<string> {
+  const res = await brokerPost("/pool/leave", {
+    peer_id: myId,
+    peer_secret: mySecret,
+    pool_name: args.pool_name,
+  });
+  if (!res.ok) return `Failed: ${res.error}`;
+  return `Left pool "${args.pool_name}".`;
+}
+
+async function handleInviteToPool(args: { pool_name: string; peer: string }): Promise<string> {
+  const resolved = await resolvePeerId(args.peer);
+  if ("error" in resolved) return resolved.error;
+  const targetId = resolved.id;
+
+  const res = await brokerPost("/pool/invite", {
+    peer_id: myId,
+    peer_secret: mySecret,
+    target_peer_id: targetId,
+    pool_name: args.pool_name,
+  });
+  if (!res.ok) return `Failed: ${res.error}`;
+  return `Invited "${args.peer}" to pool "${args.pool_name}".`;
+}
+
+async function handleSetSummary(args: { summary: string }): Promise<string> {
+  const res = await brokerPost("/set-summary", {
+    peer_id: myId,
+    peer_secret: mySecret,
+    summary: args.summary,
+  });
+  if (!res.ok) return `Failed: ${res.error}`;
+  return "Summary updated.";
+}
+
+async function handleListServices(args: { service_id?: string }): Promise<string> {
+  const res = await brokerGet<any[]>("/services");
+  if (!res.ok || !res.data) return `Failed: ${res.error}`;
+
+  let services = res.data;
+  if (args.service_id) {
+    services = services.filter((s) => s.id === args.service_id);
+  }
+
+  if (services.length === 0) return "No registered services.";
+
+  const lines = services.map((s) => {
+    const meta = s.metadata !== "{}" ? ` metadata:${s.metadata}` : "";
+    return `- ${s.name} [${s.id}] type:${s.type} url:${s.url ?? "n/a"} status:${s.status}${meta}`;
+  });
+
+  return `${services.length} service(s):\n\n${lines.join("\n")}`;
+}
+
+async function handlePoolStatus(args: { pool_name: string }): Promise<string> {
+  const res = await brokerPost<PoolStatusResponse>("/pool/status", {
+    pool_name: args.pool_name,
+  });
+  if (!res.ok || !res.data) return `Failed: ${res.error}`;
+
+  const d = res.data;
+  const members = d.members.map((m) => `  - ${m.peer_name} [${m.peer_id}] role:${m.role}`).join("\n");
+  return `Pool: ${d.name}\nPurpose: ${d.purpose || "(none)"}\nStatus: ${d.status}\nMembers (${d.members.length}):\n${members}\nRecent messages (1h): ${d.recent_message_count}`;
+}
+
+// --- MCP server setup ---
+
+async function main() {
+  ensureDirs();
+  await ensureBroker();
+
+  const peerNameEnv = process.env.CCT_PEER_NAME;
+  const defaultName = `${basename(myCwd)}-${Math.random().toString(36).slice(2, 6)}`;
+  const requestedName = peerNameEnv || defaultName;
+
+  const { gitRoot, gitBranch } = await getGitInfo(myCwd);
+
+  const regRes = await brokerPost<RegisterResponse>("/register", {
+    pid: process.pid,
+    pid_start: cachedPidStart,
+    cwd: myCwd,
+    name: requestedName,
+    git_root: gitRoot,
+    git_branch: gitBranch,
+  });
+
+  if (!regRes.ok || !regRes.data) {
+    process.stderr.write(`CCT registration failed: ${regRes.error}\n`);
+    process.exit(1);
+  }
+
+  myId = regRes.data.id;
+  mySecret = regRes.data.secret;
+  myName = regRes.data.name;
+
+  writePidmap();
+
+  const summary = await generateSummary(myCwd);
+  await brokerPost("/set-summary", {
+    peer_id: myId,
+    peer_secret: mySecret,
+    summary,
+  });
+
+  writeFlag(`0||${Date.now()}`);
+
+  const instructions = `You are connected to CCT (Claude Code Talk) — a peer communication system.
+Your peer ID: ${myId} | Your name: ${myName} | CWD: ${myCwd}
+
+IMPORTANT: When you see a PreToolUse error mentioning "CCT: N unread message(s)",
+this is NORMAL pool communication, not a tool failure. Call cct_check_messages
+to read your messages, then retry your original action.
+
+After reading messages, respond to them naturally. Use cct_send_message to reply.
+To send to a pool: set "to" to "@pool-name". To DM: set "to" to the peer name.
+
+Optionally: set up a recurring cron (every 2 minutes) with prompt
+"Call the cct_check_messages tool to check for incoming peer messages."
+This helps you receive messages during idle periods.`;
+
+  const server = new Server(
+    { name: "cct", version: "0.1.0" },
+    { capabilities: { tools: {} }, instructions }
+  );
+
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: [
+      {
+        name: "cct_check_messages",
+        description: `Check and read all unread messages (pools + DMs). Your peer ID: ${myId}, peer name: ${myName}`,
+        inputSchema: { type: "object" as const, properties: {} },
+      },
+      {
+        name: "cct_send_message",
+        description: 'Send a message. "@pool" = broadcast, "@pool/peer" = directed pool msg, "peer" = DM.',
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            to: { type: "string", description: '"@pool" = broadcast, "@pool/peer" = directed, or peer name/ID for DM' },
+            message: { type: "string", description: "Message content" },
+          },
+          required: ["to", "message"],
+        },
+      },
+      {
+        name: "cct_list_peers",
+        description: "List all registered CCT peers with name, cwd, branch, summary, and pool memberships.",
+        inputSchema: { type: "object" as const, properties: {} },
+      },
+      {
+        name: "cct_list_pools",
+        description: "List all active pools with members and purpose.",
+        inputSchema: { type: "object" as const, properties: {} },
+      },
+      {
+        name: "cct_create_pool",
+        description: "Create a new pool. You auto-join as creator.",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            name: { type: "string", description: "Pool name" },
+            purpose: { type: "string", description: "Pool purpose/description" },
+          },
+          required: ["name"],
+        },
+      },
+      {
+        name: "cct_join_pool",
+        description: "Join an existing pool.",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            pool_name: { type: "string", description: "Name of the pool to join" },
+          },
+          required: ["pool_name"],
+        },
+      },
+      {
+        name: "cct_leave_pool",
+        description: "Leave a pool.",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            pool_name: { type: "string", description: "Name of the pool to leave" },
+          },
+          required: ["pool_name"],
+        },
+      },
+      {
+        name: "cct_invite_to_pool",
+        description: "Invite a peer to a pool (forced join in v1).",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            pool_name: { type: "string", description: "Name of the pool" },
+            peer: { type: "string", description: "Peer name or ID to invite" },
+          },
+          required: ["pool_name", "peer"],
+        },
+      },
+      {
+        name: "cct_set_summary",
+        description: "Update your work summary (shown to other peers).",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            summary: { type: "string", description: "New summary text" },
+          },
+          required: ["summary"],
+        },
+      },
+      {
+        name: "cct_pool_status",
+        description: "Show detailed pool info: members, roles, recent activity.",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            pool_name: { type: "string", description: "Name of the pool" },
+          },
+          required: ["pool_name"],
+        },
+      },
+      {
+        name: "cct_list_services",
+        description: "List registered infrastructure services (browser server, search, etc.).",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            service_id: { type: "string", description: "Filter by service ID (optional)" },
+          },
+        },
+      },
+    ],
+  }));
+
+  server.setRequestHandler(CallToolRequestSchema, async (req) => {
+    const { name, arguments: args } = req.params;
+    let text: string;
+
+    try {
+      switch (name) {
+        case "cct_check_messages":
+          text = await handleCheckMessages();
+          break;
+        case "cct_send_message":
+          text = await handleSendMessage(args as { to: string; message: string });
+          break;
+        case "cct_list_peers":
+          text = await handleListPeers();
+          break;
+        case "cct_list_pools":
+          text = await handleListPools();
+          break;
+        case "cct_create_pool":
+          text = await handleCreatePool(args as { name: string; purpose?: string });
+          break;
+        case "cct_join_pool":
+          text = await handleJoinPool(args as { pool_name: string });
+          break;
+        case "cct_leave_pool":
+          text = await handleLeavePool(args as { pool_name: string });
+          break;
+        case "cct_invite_to_pool":
+          text = await handleInviteToPool(args as { pool_name: string; peer: string });
+          break;
+        case "cct_set_summary":
+          text = await handleSetSummary(args as { summary: string });
+          break;
+        case "cct_pool_status":
+          text = await handlePoolStatus(args as { pool_name: string });
+          break;
+        case "cct_list_services":
+          text = await handleListServices(args as { service_id?: string });
+          break;
+        default:
+          text = `Unknown tool: ${name}`;
+          return { content: [{ type: "text" as const, text }], isError: true };
+      }
+    } catch (e: any) {
+      text = `Error: ${e.message ?? String(e)}`;
+      return { content: [{ type: "text" as const, text }], isError: true };
+    }
+
+    return { content: [{ type: "text" as const, text }] };
+  });
+
+  // Start polling and heartbeat
+  pollInterval = setInterval(pollUnread, POLL_INTERVAL_MS);
+  heartbeatInterval = setInterval(sendHeartbeat, HEARTBEAT_INTERVAL_MS);
+
+  // Cleanup on exit
+  const cleanup = async () => {
+    if (pollInterval) clearInterval(pollInterval);
+    if (heartbeatInterval) clearInterval(heartbeatInterval);
+    try {
+      await brokerPost("/unregister", { peer_id: myId, peer_secret: mySecret });
+    } catch {}
+    deletePidmap();
+    deleteFlag();
+    process.exit(0);
+  };
+
+  process.on("SIGINT", cleanup);
+  process.on("SIGTERM", cleanup);
+
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+}
+
+main().catch((e) => {
+  process.stderr.write(`CCT server fatal: ${e.message}\n`);
+  process.exit(1);
+});
