@@ -123,6 +123,22 @@ CCT provides service discovery for CCP (Claude Code Playwright) and other infras
 
 See `.planning/ccp_handoff_requirements.md` for full integration spec.
 
+## Sister Projects
+
+CCT is part of a three-tool ecosystem for Claude Code agent infrastructure. Each works independently but they collaborate when co-present.
+
+| Project | What | Port | Runtime Dir | Repo |
+|---------|------|------|-------------|------|
+| **CCT** (this) | Agent-to-agent messaging + service discovery | `:7888` | `~/.cct/` | `~/omics-os/cct/` |
+| **CCP** | Shared Playwright browser server | `:8931` | `~/.ccp/` | `~/omics-os/ccp/` |
+| **CCS** | Session + plan search CLI | — (no network) | `~/.cache/ccs/` | `~/omics-os/ccs/` |
+
+**CCT → CCP:** CCT provides the service registry that CCP registers with on startup. Agents discover CCP's health via `cct_list_services`. The `@browser` pool (created by agents, not CCP) enables browser testing coordination. CCP is a service, not a peer — it uses unauthenticated `/service/*` endpoints only.
+
+**CCT → CCS:** CCS can index CCT pool activity and message history for searchability. CCT's SQLite DB (`~/.cct/cct.db`) is a potential CCS data source. No integration exists yet — CCS currently indexes only `~/.claude/` sessions and plans.
+
+**Design rule:** CCT never depends on CCP or CCS. It provides infrastructure (messaging, service discovery) that others consume optionally.
+
 ## Dependencies
 
 - `@modelcontextprotocol/sdk` — MCP server framework

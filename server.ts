@@ -206,11 +206,23 @@ async function sendHeartbeat(): Promise<void> {
 async function resolvePeerId(nameOrId: string): Promise<{ id: string } | { error: string }> {
   const res = await brokerPost<PeerInfo[]>("/list-peers", {});
   if (!res.ok || !res.data) return { error: "Failed to list peers" };
-  const matches = res.data.filter((p) => p.id === nameOrId || p.name === nameOrId);
+  // Exact match on ID or name first
+  const exact = res.data.filter((p) => p.id === nameOrId || p.name === nameOrId);
+  if (exact.length === 1) return { id: exact[0].id };
+
+  // Prefix match on ID (min 4 chars to avoid noise)
+  let matches = exact;
+  if (matches.length === 0 && nameOrId.length >= 4) {
+    matches = res.data.filter((p) => p.id.startsWith(nameOrId));
+  }
+  // Prefix match on name
+  if (matches.length === 0) {
+    matches = res.data.filter((p) => p.name.startsWith(nameOrId));
+  }
   if (matches.length === 0) return { error: `Peer "${nameOrId}" not found.` };
   if (matches.length > 1) {
     const list = matches.map((p) => `  ${p.name} [${p.id}]`).join("\n");
-    return { error: `Ambiguous peer name "${nameOrId}". Matches:\n${list}\nUse the peer ID instead.` };
+    return { error: `Ambiguous match for "${nameOrId}". Matches:\n${list}\nUse a longer prefix or the full peer ID.` };
   }
   return { id: matches[0].id };
 }
@@ -326,7 +338,7 @@ async function handleCreatePool(args: { name: string; purpose?: string }): Promi
     purpose: args.purpose ?? "",
   });
   if (!res.ok) return `Failed: ${res.error}`;
-  return `Pool "${args.name}" created (id: ${res.data!.pool_id}). You are the creator.`;
+  return `Pool "${args.name}" created (id: ${res.data!.pool_id}). You are the creator.\n\n⚠️ IMPORTANT: Set up message polling NOW if you haven't already. Use CronCreate with cron "*/1 * * * *" and prompt "Call the cct_check_messages tool to check for incoming peer messages. If there are any, read and respond to them." This is required to receive messages when idle.`;
 }
 
 async function handleJoinPool(args: { pool_name: string }): Promise<string> {
@@ -336,7 +348,7 @@ async function handleJoinPool(args: { pool_name: string }): Promise<string> {
     pool_name: args.pool_name,
   });
   if (!res.ok) return `Failed: ${res.error}`;
-  return `Joined pool "${args.pool_name}".`;
+  return `Joined pool "${args.pool_name}".\n\n⚠️ IMPORTANT: Set up message polling NOW if you haven't already. Use CronCreate with cron "*/1 * * * *" and prompt "Call the cct_check_messages tool to check for incoming peer messages. If there are any, read and respond to them." This is required to receive messages when idle.`;
 }
 
 async function handleLeavePool(args: { pool_name: string }): Promise<string> {
@@ -361,7 +373,7 @@ async function handleInviteToPool(args: { pool_name: string; peer: string }): Pr
     pool_name: args.pool_name,
   });
   if (!res.ok) return `Failed: ${res.error}`;
-  return `Invited "${args.peer}" to pool "${args.pool_name}".`;
+  return `Invited "${args.peer}" to pool "${args.pool_name}".\n\nNote: The invited peer will be prompted to set up message polling when they next interact with CCT.`;
 }
 
 async function handleSetSummary(args: { summary: string }): Promise<string> {
@@ -455,9 +467,11 @@ to read your messages, then retry your original action.
 After reading messages, respond to them naturally. Use cct_send_message to reply.
 To send to a pool: set "to" to "@pool-name". To DM: set "to" to the peer name.
 
-Optionally: set up a recurring cron (every 2 minutes) with prompt
-"Call the cct_check_messages tool to check for incoming peer messages."
-This helps you receive messages during idle periods.`;
+IMPORTANT: When you join or create a pool, you MUST immediately set up a recurring
+cron (every 1 minute) using CronCreate with cron "*/1 * * * *" and prompt
+"Call the cct_check_messages tool to check for incoming peer messages. If there are any, read and respond to them."
+This is REQUIRED for receiving messages during idle periods. Without it, you are
+deaf to pool messages when not actively making tool calls. Only set it up once per session.`;
 
   const server = new Server(
     { name: "cct", version: "0.1.0" },

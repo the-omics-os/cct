@@ -56,9 +56,26 @@ async function requireBroker(): Promise<void> {
 async function resolvePeerNameToId(nameOrId: string): Promise<string> {
   const res = await brokerFetch<PeerInfo[]>("/list-peers", {});
   if (!res.ok || !res.data) die(`Failed to list peers: ${res.error}`);
-  const match = res.data.find((p) => p.id === nameOrId || p.name === nameOrId);
-  if (!match) die(`Peer not found: ${nameOrId}`);
-  return match.id;
+
+  // Exact match on ID or name first
+  const exact = res.data.find((p) => p.id === nameOrId || p.name === nameOrId);
+  if (exact) return exact.id;
+
+  // Prefix match on ID (min 4 chars)
+  let matches: PeerInfo[] = [];
+  if (nameOrId.length >= 4) {
+    matches = res.data.filter((p) => p.id.startsWith(nameOrId));
+  }
+  // Prefix match on name
+  if (matches.length === 0) {
+    matches = res.data.filter((p) => p.name.startsWith(nameOrId));
+  }
+  if (matches.length === 0) die(`Peer not found: ${nameOrId}`);
+  if (matches.length > 1) {
+    const list = matches.map((p) => `  ${p.name} [${p.id}]`).join("\n");
+    die(`Ambiguous match for "${nameOrId}":\n${list}\nUse a longer prefix or the full peer ID.`);
+  }
+  return matches[0].id;
 }
 
 function padRight(s: string, len: number): string {
