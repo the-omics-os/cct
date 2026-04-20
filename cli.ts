@@ -2,7 +2,14 @@
 import { existsSync, readFileSync, writeFileSync, chmodSync, mkdirSync, copyFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
-import { BROKER_HOST, BROKER_PORT } from "./shared/constants.ts";
+import {
+  BROKER_PORT,
+  BROKER_BIND_HOST,
+  BROKER_URL,
+  BROKER_TOKEN,
+  IS_REMOTE,
+  CONFIG_PATH,
+} from "./shared/constants.ts";
 import type {
   BrokerResponse,
   HealthResponse,
@@ -12,7 +19,6 @@ import type {
   MessageSendResponse,
 } from "./shared/types.ts";
 
-const BROKER_URL = `http://${BROKER_HOST}:${BROKER_PORT}`;
 const CCT_DIR = join(import.meta.dir);
 const SERVER_PATH = join(CCT_DIR, "server.ts");
 const HOOK_PATH = join(CCT_DIR, "hook.sh");
@@ -24,11 +30,11 @@ const CLAUDE_SETTINGS = join(homedir(), ".claude", "settings.json");
 
 async function brokerFetch<T>(path: string, body?: unknown): Promise<BrokerResponse<T>> {
   const method = body !== undefined ? "POST" : "GET";
-  const opts: RequestInit = { method };
-  if (body !== undefined) {
-    opts.headers = { "Content-Type": "application/json" };
-    opts.body = JSON.stringify(body);
-  }
+  const headers: Record<string, string> = {};
+  if (BROKER_TOKEN) headers["Authorization"] = `Bearer ${BROKER_TOKEN}`;
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  const opts: RequestInit = { method, headers };
+  if (body !== undefined) opts.body = JSON.stringify(body);
   const res = await fetch(`${BROKER_URL}${path}`, opts);
   return res.json() as Promise<BrokerResponse<T>>;
 }
@@ -49,6 +55,9 @@ function die(msg: string): never {
 
 async function requireBroker(): Promise<void> {
   if (!(await brokerIsRunning())) {
+    if (IS_REMOTE) {
+      die(`Cannot reach remote broker at ${BROKER_URL}. Is it running?`);
+    }
     die("Broker not running. Start with: cct start");
   }
 }
@@ -114,11 +123,22 @@ Commands:
   broadcast <pool> <message...>  Broadcast to a pool
   messages [--pool <name>]     Show recent messages
   services                     List registered infrastructure services
-  start                        Start the broker (detached)
+  start                        Start the broker (detached, localhost)
+  lan-start                    Start the broker on 0.0.0.0 (LAN mode)
   kill                         Stop the broker
+  config                       Show or set persistent config
   install                      Register MCP server + hook
   uninstall                    Remove MCP server + hook
-  help                         Show this help`);
+  help                         Show this help
+
+LAN mode:
+  Host the broker:   cct lan-start --token <shared-secret>
+  Join from client:  CCT_BROKER=192.168.x.x CCT_TOKEN=<secret> claude
+
+  Or persist with:   cct config set broker 192.168.x.x
+                     cct config set token <shared-secret>
+
+Env vars: CCT_HOST (bind addr), CCT_PORT, CCT_BROKER (connect addr), CCT_TOKEN`);
 }
 
 async function cmdStatus() {
@@ -128,6 +148,8 @@ async function cmdStatus() {
   const pools = await brokerFetch<PoolInfo[]>("/pool/list", {});
 
   console.log("=== CCT Broker Status ===");
+  console.log(`Broker:  ${BROKER_URL}`);
+  console.log(`Mode:    ${IS_REMOTE ? "remote" : "local"}`);
   console.log(`Status:  ${health.data?.status ?? "unknown"}`);
   console.log(`Peers:   ${health.data?.peers ?? 0}`);
   console.log(`Pools:   ${health.data?.pools ?? 0}`);
@@ -301,6 +323,9 @@ async function cmdServices() {
 }
 
 async function cmdStart() {
+  if (IS_REMOTE) {
+    die("CCT_BROKER points to a remote host. Use 'cct status' to check it, or unset with 'cct config rm broker'.");
+  }
   if (await brokerIsRunning()) {
     console.log("Broker is already running.");
     return;
@@ -309,21 +334,120 @@ async function cmdStart() {
     stdio: ["ignore", "ignore", "inherit"],
   });
   proc.unref();
-  // Wait briefly for startup
   await Bun.sleep(500);
   if (await brokerIsRunning()) {
-    console.log("Broker started.");
+    console.log("Broker started on localhost.");
   } else {
     console.log("Broker process spawned. Check stderr for errors.");
   }
 }
 
+async function cmdLanStart(args: string[]) {
+  if (IS_REMOTE) {
+    die("CCT_BROKER points to a remote host. lan-start is for hosting the broker locally.");
+  }
+  if (await brokerIsRunning()) {
+    console.log("Broker is already running. Kill it first with: cct kill");
+    return;
+  }
+
+  let token = "";
+  for (let i = 0; i < args.length; i++) {
+    if ((args[i] === "--token" || args[i] === "-t") && i + 1 < args.length) {
+      token = args[++i];
+    }
+  }
+
+  if (!token) {
+    const { randomBytes } = await import("node:crypto");
+    token = randomBytes(24).toString("hex");
+    console.log(`Generated token: ${token}`);
+    console.log(`Clients connect with: CCT_BROKER=<this-ip> CCT_TOKEN=${token} claude`);
+    console.log(`Or persist: cct config set token ${token}\n`);
+  }
+
+  const env = { ...process.env, CCT_HOST: "0.0.0.0", CCT_TOKEN: token };
+  const proc = Bun.spawn(["bun", BROKER_PATH], {
+    stdio: ["ignore", "ignore", "inherit"],
+    env,
+  });
+  proc.unref();
+  await Bun.sleep(500);
+  if (await brokerIsRunning()) {
+    let ip = "0.0.0.0";
+    try {
+      const { networkInterfaces } = await import("node:os");
+      const nets = networkInterfaces();
+      for (const name of Object.keys(nets)) {
+        for (const net of nets[name] ?? []) {
+          if (net.family === "IPv4" && !net.internal) {
+            ip = net.address;
+            break;
+          }
+        }
+        if (ip !== "0.0.0.0") break;
+      }
+    } catch {}
+    console.log(`Broker started in LAN mode on ${ip}:${BROKER_PORT}`);
+  } else {
+    console.log("Broker process spawned. Check stderr for errors.");
+  }
+}
+
+async function cmdConfig(args: string[]) {
+  const sub = args[0];
+  const configDir = dirname(CONFIG_PATH);
+  mkdirSync(configDir, { recursive: true });
+
+  if (!sub || sub === "show") {
+    const cfg = readJsonFile(CONFIG_PATH);
+    if (Object.keys(cfg).length === 0) {
+      console.log("No config set. Use: cct config set <key> <value>");
+      console.log("Keys: broker, token");
+      return;
+    }
+    for (const [k, v] of Object.entries(cfg)) {
+      const display = k === "token" ? `${String(v).slice(0, 8)}...` : v;
+      console.log(`  ${k} = ${display}`);
+    }
+    return;
+  }
+
+  if (sub === "set") {
+    const key = args[1];
+    const val = args[2];
+    if (!key || !val) die("Usage: cct config set <key> <value>\nKeys: broker, token");
+    if (!["broker", "token"].includes(key)) die(`Unknown config key: ${key}. Valid: broker, token`);
+    const cfg = readJsonFile(CONFIG_PATH);
+    cfg[key] = val;
+    writeJsonFile(CONFIG_PATH, cfg);
+    const display = key === "token" ? `${val.slice(0, 8)}...` : val;
+    console.log(`Set ${key} = ${display}`);
+    return;
+  }
+
+  if (sub === "rm" || sub === "unset") {
+    const key = args[1];
+    if (!key) die("Usage: cct config rm <key>");
+    const cfg = readJsonFile(CONFIG_PATH);
+    delete cfg[key];
+    writeJsonFile(CONFIG_PATH, cfg);
+    console.log(`Removed ${key}`);
+    return;
+  }
+
+  die(`Unknown config command: ${sub}. Use: show, set, rm`);
+}
+
 async function cmdKill() {
+  if (IS_REMOTE) {
+    die("Can't kill a remote broker. Stop it on the host machine.");
+  }
   try {
     const proc = Bun.spawnSync(["lsof", "-ti", `:${BROKER_PORT}`]);
     const output = proc.stdout.toString().trim();
     if (!output) {
-      console.log("No process found on port 7888.");
+      console.log(`No process found on port ${BROKER_PORT}.`);
       return;
     }
     const pids = output.split("\n").map((s) => parseInt(s.trim(), 10)).filter(Boolean);
@@ -356,6 +480,11 @@ function backupFile(path: string): void {
 async function cmdInstall() {
   mkdirSync(dirname(CLAUDE_SETTINGS), { recursive: true });
 
+  const cfg = readJsonFile(CONFIG_PATH);
+  const mcpEnv: Record<string, string> = {};
+  if (cfg.broker) mcpEnv["CCT_BROKER"] = cfg.broker;
+  if (cfg.token) mcpEnv["CCT_TOKEN"] = cfg.token;
+
   backupFile(CLAUDE_JSON);
   const claudeJson = readJsonFile(CLAUDE_JSON);
   if (!claudeJson.mcpServers) claudeJson.mcpServers = {};
@@ -363,10 +492,12 @@ async function cmdInstall() {
     type: "stdio",
     command: "bun",
     args: [SERVER_PATH],
-    env: {},
+    env: mcpEnv,
   };
   writeJsonFile(CLAUDE_JSON, claudeJson);
   console.log(`Added MCP server to ${CLAUDE_JSON}`);
+  if (cfg.broker) console.log(`  → broker: ${cfg.broker}`);
+  if (cfg.token) console.log(`  → token: ${cfg.token.slice(0, 8)}...`);
 
   backupFile(CLAUDE_SETTINGS);
   const settings = readJsonFile(CLAUDE_SETTINGS);
@@ -492,8 +623,14 @@ try {
     case "start":
       await cmdStart();
       break;
+    case "lan-start":
+      await cmdLanStart(subArgs);
+      break;
     case "kill":
       await cmdKill();
+      break;
+    case "config":
+      await cmdConfig(subArgs);
       break;
     case "install":
       await cmdInstall();

@@ -4,11 +4,13 @@ import { mkdirSync, existsSync, statSync, chmodSync, unlinkSync, readdirSync } f
 import { randomBytes } from "node:crypto";
 import {
   BROKER_PORT,
-  BROKER_HOST,
+  BROKER_BIND_HOST,
+  BROKER_TOKEN,
   CCT_DIR,
   DB_PATH,
   PIDMAP_DIR,
   FLAGS_DIR,
+  HEARTBEAT_INTERVAL_MS,
   STALE_CHECK_INTERVAL_MS,
   PEER_SECRET_LENGTH,
   PEER_ID_LENGTH,
@@ -229,10 +231,6 @@ function handleRegister(body: RegisterRequest): BrokerResponse {
 
   if (!pid || !pid_start || !cwd) {
     return err("pid, pid_start, and cwd are required");
-  }
-
-  if (!pidIsAlive(pid, pid_start)) {
-    return err("pid is not alive");
   }
 
   const id = genId(PEER_ID_LENGTH);
@@ -926,14 +924,19 @@ function cleanupPeerArtifacts(peerId: string, pid: number): void {
 }
 
 function cleanupStalePeers(): void {
-  const activePeers = db.query("SELECT id, pid, pid_start FROM peers WHERE status = 'active'").all() as {
+  const activePeers = db.query("SELECT id, pid, pid_start, last_seen FROM peers WHERE status = 'active'").all() as {
     id: string;
     pid: number;
     pid_start: string;
+    last_seen: string;
   }[];
 
   for (const peer of activePeers) {
-    if (!pidIsAlive(peer.pid, peer.pid_start)) {
+    const age = Date.now() - new Date(peer.last_seen).getTime();
+    const pidDead = !pidIsAlive(peer.pid, peer.pid_start);
+    const heartbeatStale = age > HEARTBEAT_INTERVAL_MS * 3;
+
+    if ((pidDead && age > HEARTBEAT_INTERVAL_MS) || heartbeatStale) {
       markPeerDead(peer.id);
       cleanupPeerArtifacts(peer.id, peer.pid);
     }
@@ -978,7 +981,7 @@ const routes: Record<string, RouteHandler> = {
 };
 
 const server = Bun.serve({
-  hostname: BROKER_HOST,
+  hostname: BROKER_BIND_HOST,
   port: BROKER_PORT,
   async fetch(req) {
     const url = new URL(req.url);
@@ -986,6 +989,14 @@ const server = Bun.serve({
 
     if (method === "GET" && url.pathname === "/health") {
       return Response.json(handleHealth());
+    }
+
+    if (BROKER_TOKEN) {
+      const authHeader = req.headers.get("authorization");
+      const provided = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : "";
+      if (provided !== BROKER_TOKEN) {
+        return Response.json(err("unauthorized — set CCT_TOKEN"), { status: 401 });
+      }
     }
 
     if (method === "GET" && url.pathname === "/services") {
@@ -1009,7 +1020,8 @@ const server = Bun.serve({
   },
 });
 
-console.log(`CCT broker listening on ${BROKER_HOST}:${BROKER_PORT}`);
+const mode = BROKER_BIND_HOST === "0.0.0.0" ? " (LAN)" : "";
+console.log(`CCT broker listening on ${BROKER_BIND_HOST}:${BROKER_PORT}${mode}`);
 
 process.on("SIGINT", () => {
   clearInterval(staleInterval);

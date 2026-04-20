@@ -8,8 +8,9 @@ import {
 import { mkdirSync, existsSync, writeFileSync, unlinkSync, readFileSync, renameSync, chmodSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import {
-  BROKER_PORT,
-  BROKER_HOST,
+  BROKER_URL,
+  IS_REMOTE,
+  BROKER_TOKEN,
   CCT_DIR,
   PIDMAP_DIR,
   FLAGS_DIR,
@@ -29,7 +30,6 @@ import type {
 } from "./shared/types.ts";
 import { generateSummary } from "./shared/summarize.ts";
 
-const BROKER_URL = `http://${BROKER_HOST}:${BROKER_PORT}`;
 const myCwd = process.cwd();
 
 let myId = "";
@@ -41,16 +41,20 @@ let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
 // --- Broker HTTP helpers ---
 
 async function brokerPost<T = unknown>(path: string, body: Record<string, unknown>): Promise<BrokerResponse<T>> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (BROKER_TOKEN) headers["Authorization"] = `Bearer ${BROKER_TOKEN}`;
   const res = await fetch(`${BROKER_URL}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify(body),
   });
   return await res.json() as BrokerResponse<T>;
 }
 
 async function brokerGet<T = unknown>(path: string): Promise<BrokerResponse<T>> {
-  const res = await fetch(`${BROKER_URL}${path}`);
+  const headers: Record<string, string> = {};
+  if (BROKER_TOKEN) headers["Authorization"] = `Bearer ${BROKER_TOKEN}`;
+  const res = await fetch(`${BROKER_URL}${path}`, { headers });
   return await res.json() as BrokerResponse<T>;
 }
 
@@ -61,6 +65,10 @@ async function ensureBroker(): Promise<void> {
     const res = await fetch(`${BROKER_URL}/health`);
     if (res.ok) return;
   } catch {}
+
+  if (IS_REMOTE) {
+    throw new Error(`Cannot reach remote broker at ${BROKER_URL}. Is it running?`);
+  }
 
   const brokerPath = new URL("./broker.ts", import.meta.url).pathname;
   const child = Bun.spawn(["bun", brokerPath], {
