@@ -1,6 +1,14 @@
 {
   "name": "cct",
   "version": "0.1.0",
+  "description": "Claude Code Talk — real-time inter-session communication for Claude Code",
+  "author": "Kevin Yar <kevin.yar@omics-os.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/the-omics-os/cct.git"
+  },
+  "keywords": ["claude-code", "mcp", "agent-communication", "multi-agent"],
   "type": "module",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.1"

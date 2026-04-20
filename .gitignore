@@ -11,3 +11,6 @@ dist/
 .env
 .env.*
 .playwright/
+.planning/
+.claude/docs/
+cct/codex_output/
