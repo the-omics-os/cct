@@ -11,6 +11,14 @@ Real-time inter-session communication for Claude Code. Multiple Claude Code sess
 Session A ──► MCP Server A ──► Broker (SQLite) ◄── MCP Server B ◄── Session B
                                     ↑
                                CLI / Services
+
+LAN mode:
+Machine 1                          Machine 2
+  Session A ──► MCP Server ──┐     ┌── MCP Server ◄── Session C
+  Session B ──► MCP Server ──┤     │── MCP Server ◄── Session D
+                             ▼     ▼
+                     Broker (0.0.0.0:7888)  ←── Bearer token auth
+                        Machine 1
 ```
 
 ## Key Concepts
@@ -35,9 +43,47 @@ cct pool invite P X  # Add peer to pool
 cct send P "msg"     # DM a peer
 cct broadcast X "m"  # Send to pool
 cct messages         # Show message history
-cct start            # Start broker (detached)
+cct start            # Start broker (detached, localhost)
+cct lan-start        # Start broker on 0.0.0.0 with token auth (LAN mode)
 cct kill             # Stop broker
+cct config           # Show/set persistent config (broker URL, token)
 ```
+
+## LAN Mode
+
+CCT supports cross-machine communication on a local network. One machine hosts the broker, others connect as clients.
+
+**Configuration priority:** env vars > `~/.cct/config.json` > defaults.
+
+| Setting | Env Var | Config Key | Default | Used By |
+|---------|---------|------------|---------|---------|
+| Broker bind address | `CCT_HOST` | — | `127.0.0.1` | broker.ts only |
+| Broker port | `CCT_PORT` | — | `7888` | all |
+| Broker connect URL | `CCT_BROKER` | `broker` | `http://127.0.0.1:7888` | server.ts, cli.ts |
+| Bearer token | `CCT_TOKEN` | `token` | (none) | all |
+
+**Host setup:**
+```bash
+cct lan-start --token <shared-secret>
+# Auto-detects LAN IP, prints client instructions
+# Token is auto-generated if --token omitted
+```
+
+**Client setup:**
+```bash
+cct config set broker 192.168.x.x    # host's LAN IP
+cct config set token <shared-secret>  # same token as host
+cct install                           # propagates config to MCP env vars
+# Restart Claude Code sessions
+```
+
+**Guard rails:**
+- `cct start` / `cct kill` / `cct lan-start` are blocked when `CCT_BROKER` points to a remote host
+- `server.ts` will not attempt to auto-launch a local broker when configured for remote
+- `/health` endpoint is always unauthenticated (for probes and status checks)
+- All other endpoints require Bearer token when `CCT_TOKEN` is set
+
+**Stale peer cleanup on LAN:** The broker can't check remote PIDs, so it uses heartbeat age. Peers not seen for 3× the heartbeat interval (45s) are marked dead. Local peers are also cleaned up via PID check after 1× heartbeat interval.
 
 ## MCP Tools (11)
 
@@ -130,7 +176,7 @@ CCT state is exposed in the Claude Code status line (`~/.claude/statusline.sh`):
 2. **SQLite is the only message store.** Flag files are derived caches, not authoritative.
 3. **Hook must be pure bash.** No python, no curl, no jq. Target <10ms.
 4. **Never block CCT tools or ToolSearch** in the hook — prevents infinite loops.
-5. **Peer secrets required** on all mutating peer endpoints. CLI endpoints and service endpoints are unauthenticated (localhost only).
+5. **Peer secrets required** on all mutating peer endpoints. CLI endpoints and service endpoints are unauthenticated (localhost only). **In LAN mode, Bearer token protects all endpoints except `/health`.**
 6. **~/.cct/ directory must be 0700.** Permissions are checked and corrected on startup.
 7. **All multi-step mutations use transactions.** Pool create/join/invite, message send, peer death — all atomic.
 8. **read_at is the only message state.** NULL = unread. No delivered/ack states.
@@ -142,6 +188,7 @@ CCT state is exposed in the Claude Code status line (`~/.claude/statusline.sh`):
 ```
 ~/.cct/                    0700
   cct.db                   SQLite database (6 tables)
+  config.json              Persistent config (broker URL, token) — not committed
   pidmaps/                 0700  —  {claude_ppid}_{start_time} → peer_id
   flags/                   0700  —  {peer_id}.unread → "count|pools|timestamp"
 ```

@@ -8,6 +8,8 @@ Session A ──► MCP Server A ──► Broker (SQLite) ◄── MCP Server 
                                CLI / Services
 ```
 
+Works across machines on the same network — one person hosts the broker, everyone else connects.
+
 ## Quick Start
 
 ```bash
@@ -57,8 +59,12 @@ cct pool invite <peer> <pool>       # Add a peer to a pool
 cct send <peer> <message>           # DM a peer
 cct broadcast <pool> <message>      # Broadcast to a pool
 cct messages [--pool <name>]        # View message history
-cct start                           # Start broker (detached)
+cct start                           # Start broker (localhost)
+cct lan-start [--token <secret>]    # Start broker in LAN mode
 cct kill                            # Stop broker
+cct config show                     # Show persistent config
+cct config set <key> <value>        # Set config (broker, token)
+cct config rm <key>                 # Remove config key
 cct install                         # Register MCP + hook
 cct uninstall                       # Remove MCP + hook
 ```
@@ -79,6 +85,65 @@ cct uninstall                       # Remove MCP + hook
 | `cct_pool_status` | Pool details: members, roles, metadata, recent messages |
 | `cct_list_services` | Registered infrastructure services |
 
+## LAN Mode (Multi-Person)
+
+Multiple people on the same network can have their Claude Code sessions talk to each other.
+
+### Host (one person runs the broker)
+
+```bash
+bun cli.ts lan-start
+# Output:
+#   Generated token: a1b2c3d4e5f6...
+#   Clients connect with: CCT_BROKER=192.168.1.10 CCT_TOKEN=a1b2c3d4e5f6... claude
+#   Broker started in LAN mode on 192.168.1.10:7888
+```
+
+Or bring your own token:
+
+```bash
+bun cli.ts lan-start --token my-team-secret
+```
+
+### Clients (everyone else)
+
+```bash
+# Option A: Persistent config (recommended)
+bun cli.ts config set broker 192.168.1.10
+bun cli.ts config set token a1b2c3d4e5f6...
+bun cli.ts install    # writes config into Claude Code's MCP settings
+# Restart Claude Code
+
+# Option B: Env vars (per-session)
+CCT_BROKER=192.168.1.10 CCT_TOKEN=a1b2c3d4e5f6... claude
+```
+
+### That's it
+
+All sessions across all machines see each other. Create a pool, invite peers, and messages flow.
+
+```bash
+# From any machine:
+bun cli.ts status     # See all peers across the network
+bun cli.ts peers      # List everyone's sessions
+```
+
+### How it works
+
+- The broker binds to `0.0.0.0` (all interfaces) instead of `127.0.0.1`
+- A Bearer token protects all endpoints except `/health`
+- Remote peers are cleaned up via heartbeat timeout (no local PID check needed)
+- Config lives in `~/.cct/config.json` — never committed to git
+
+### Env vars
+
+| Variable | What | Example |
+|----------|------|---------|
+| `CCT_HOST` | Broker bind address | `0.0.0.0` |
+| `CCT_PORT` | Broker port | `7888` |
+| `CCT_BROKER` | Broker URL to connect to | `192.168.1.10` or `http://192.168.1.10:7888` |
+| `CCT_TOKEN` | Shared auth token | `a1b2c3d4e5f6...` |
+
 ## Architecture
 
 - **broker.ts** — HTTP server + SQLite. 26 endpoints. All multi-step mutations wrapped in transactions.
@@ -90,12 +155,14 @@ cct uninstall                       # Remove MCP + hook
 ## Security
 
 - `~/.cct/` directory is `0700` (checked and corrected on every startup)
-- Broker listens on `127.0.0.1` only
+- **Local mode:** broker listens on `127.0.0.1` only
+- **LAN mode:** broker listens on `0.0.0.0` with Bearer token auth on all endpoints except `/health`
 - Peer registration returns a 32-char secret required for all mutations
-- PID + start-time validation prevents PID reuse attacks
+- PID + start-time validation prevents PID reuse attacks (local peers)
+- Heartbeat-based cleanup for remote peers (3× heartbeat interval = 45s)
 - Flag writes are atomic (temp file + rename)
 - Stale flags (>30s) are ignored by the hook
-- CLI and service endpoints are unauthenticated (localhost trust model)
+- `config.json` stores tokens in `~/.cct/` (0700 directory, never committed)
 
 ## Service Registry (CCP Integration)
 
