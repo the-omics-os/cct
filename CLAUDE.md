@@ -5,7 +5,7 @@ Real-time inter-session communication for Claude Code. Multiple Claude Code sess
 ## How It Works
 
 1. **PreToolUse hook** (busy sessions) — Pure-bash hook checks a flag file before every tool call. If unread messages exist, it blocks until Claude reads its inbox. The "Error:" in the UI is normal pool communication.
-2. **CronCreate** (idle sessions, best-effort) — MCP instructions suggest a recurring check. Not required for correctness.
+2. **CronCreate** (idle sessions, required) — Agents MUST set up a `*/1 * * * *` cron on pool join. This is the only way to receive messages when idle (no tool calls happening). Minimum latency: 60s.
 
 ```
 Session A ──► MCP Server A ──► Broker (SQLite) ◄── MCP Server B ◄── Session B
@@ -85,10 +85,44 @@ cct/
 
 All design authority lives in `/Users/tyo/Omics-OS/.planning/cct/`:
 - `ARCHITECTURE.md` — **Frozen design decisions (D1-D15).** Source of truth.
-- `ROADMAP.md` — 4 build phases
+- `ROADMAP.md` — 5 build phases (1-4 complete, 5 = PTY Launcher scoped)
 - `STATE.md` — Current progress
 - `REQUIREMENTS.md` — User flows and constraints
 - `codex_output/` — Research + implementation review
+
+## Pool Lifecycle
+
+Agents MUST follow this lifecycle when participating in pools:
+
+| Event | Action |
+|-------|--------|
+| **Join or create pool** | Set up CronCreate with cron `*/1 * * * *` and prompt `"Call the cct_check_messages tool to check for incoming peer messages. If there are any, read and respond to them."` Only once per session. |
+| **Active in pool** | Hook catches messages instantly when busy (tool calls). Cron catches messages within 60s when idle. |
+| **Leave pool (still in others)** | Keep cron running. |
+| **Leave last pool** | Cancel cron via CronList + CronDelete. No pools = no need to poll. |
+
+The MCP server enforces this: join/create responses include the cron setup reminder, leave responses check remaining pools and prompt for cleanup if zero remain.
+
+**Idle session limitation:** There is no way to push into an idle Claude Code session via MCP. CronCreate bottoms out at 60s. The PreToolUse hook only fires during tool calls. Phase 5 (PTY Launcher) will solve this with `cct claude` wrapping the session for sub-10s delivery.
+
+## Peer Resolution
+
+Both server.ts and cli.ts support flexible peer addressing:
+1. **Exact match** on full peer ID or peer name (priority)
+2. **Prefix match** on peer ID (minimum 4 characters)
+3. **Prefix match** on peer name
+
+Examples: `aaccacce` (full ID), `aacc` (4-char prefix), `ccp-ftts` (full name), `ccp-` (name prefix).
+Ambiguous matches return all candidates with IDs for disambiguation.
+
+## Status Line Integration
+
+CCT state is exposed in the Claude Code status line (`~/.claude/statusline.sh`):
+- Reads `~/.cct/pidmaps/` to resolve current session's peer ID
+- Reads `~/.cct/flags/{peer_id}.unread` for pool memberships and unread counts
+- Format: `CCT:dd5c @pool(N) ✉` — peer ID prefix, pools with unread counts, total unread
+- Refreshes every 10s via `refreshInterval` setting
+- Graceful degradation: shows `CCT:off` if CCT not installed, `CCT:—` if no pidmap match
 
 ## Rules
 
