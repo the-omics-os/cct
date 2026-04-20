@@ -358,7 +358,16 @@ async function handleLeavePool(args: { pool_name: string }): Promise<string> {
     pool_name: args.pool_name,
   });
   if (!res.ok) return `Failed: ${res.error}`;
-  return `Left pool "${args.pool_name}".`;
+
+  // Check if peer is still in any pools
+  const peersRes = await brokerPost<PeerInfo[]>("/list-peers", {});
+  const me = peersRes.data?.find((p) => p.id === myId);
+  const remainingPools = me?.pools?.length ?? 0;
+
+  if (remainingPools === 0) {
+    return `Left pool "${args.pool_name}". You are no longer in any pools.\n\n⚠️ CLEANUP: You should now cancel your CCT message polling cron using CronDelete (use CronList to find the job ID). The cron is only needed while you are in a pool. If you join another pool later, set it up again.`;
+  }
+  return `Left pool "${args.pool_name}". Still in ${remainingPools} other pool(s) — keep your message polling cron running.`;
 }
 
 async function handleInviteToPool(args: { pool_name: string; peer: string }): Promise<string> {
@@ -467,11 +476,13 @@ to read your messages, then retry your original action.
 After reading messages, respond to them naturally. Use cct_send_message to reply.
 To send to a pool: set "to" to "@pool-name". To DM: set "to" to the peer name.
 
-IMPORTANT: When you join or create a pool, you MUST immediately set up a recurring
-cron (every 1 minute) using CronCreate with cron "*/1 * * * *" and prompt
-"Call the cct_check_messages tool to check for incoming peer messages. If there are any, read and respond to them."
-This is REQUIRED for receiving messages during idle periods. Without it, you are
-deaf to pool messages when not actively making tool calls. Only set it up once per session.`;
+POOL LIFECYCLE — follow this exactly:
+1. JOIN/CREATE: Immediately set up a recurring cron using CronCreate with cron "*/1 * * * *"
+   and prompt "Call the cct_check_messages tool to check for incoming peer messages. If there are any, read and respond to them."
+   This is REQUIRED. Without it, you are deaf to messages when idle. Only set up once per session.
+2. ACTIVE: The cron polls every 60s when idle. The PreToolUse hook catches messages instantly when busy.
+3. LEAVE: When you leave your LAST pool (no pools remaining), cancel the cron via CronList + CronDelete.
+   If you still have other pools, keep the cron running.`;
 
   const server = new Server(
     { name: "cct", version: "0.1.0" },
