@@ -1,34 +1,35 @@
 # CCT — Claude Code Talk
 
-Real-time communication between Claude Code sessions. Create pools, invite agents, and they collaborate autonomously — on one machine or across your network.
+Peer-to-peer messaging for Claude Code sessions. MCP tools + PreToolUse hook + SQLite broker. No experimental flags, no subscription gate, works with any auth method.
 
 <p align="center">
   <img src=".content/cct-demo.gif" alt="CCT demo — two Claude Code sessions collaborating in real time" width="800">
 </p>
 
-## Why CCT?
+## Background
 
-AI coding agents work in isolation. When you need multiple sessions to coordinate — one on the backend, one on tests, one on docs — there's no way for them to talk to each other.
+Claude Code has a `notifications/claude/channel` mechanism for pushing messages into sessions. [claude-peers-mcp](https://github.com/louislva/claude-peers-mcp) by [@louislva](https://github.com/louislva) was the first implementation of inter-session communication using this — and the direct inspiration for CCT.
 
-CCT solves this with three design choices that set it apart:
+The problem: channel registration is gated behind a server-side feature flag (`tengu_harbor`) that currently returns `false` for most users ([#36503](https://github.com/anthropics/claude-code/issues/36503)). Even when it was briefly available, it required `--dangerously-load-development-channels` and a claude.ai OAuth login — API key users are locked out entirely.
 
-**Solid pools.** Sessions join named pools with defined purposes. Messages are scoped, roles are tracked, and every pool has a lifecycle — create, collaborate, release, archive. No noisy broadcast channels or unstructured message passing.
+CCT takes a different approach. Instead of channels, it uses:
 
-**Visual and observable.** CCT integrates directly into the Claude Code status line. You see your peer ID, active pools, and unread counts at a glance — without interrupting your workflow. The PreToolUse hook surfaces messages inline as part of the normal tool-call flow.
+- **MCP tools** for all message operations (send, check, pool management)
+- A **PreToolUse hook** (pure bash, <10ms) that blocks tool calls when unread messages exist, forcing Claude to read its inbox
+- **CronCreate** for idle-session polling (60s)
 
-**Reliable connection.** A local SQLite broker handles all message routing with transactional guarantees. Messages don't get lost. Flag files are atomic. Stale peers are cleaned up automatically. In LAN mode, Bearer token auth protects everything over the wire.
+This works on every Claude Code installation — API key, OAuth, Max subscriber, doesn't matter. No experimental flags, no `--dangerously-*` flags.
 
-### How it compares
+## What CCT adds on top
 
-| | CCT | Shared files | Custom scripts | Other MCP bridges |
-|---|---|---|---|---|
-| Structured pools with roles | Yes | No | Manual | No |
-| Message ordering & delivery | SQLite transactions | Race conditions | Fragile | Varies |
-| Peer discovery | Automatic | Manual | Manual | Manual |
-| Status line integration | Built-in | No | No | No |
-| LAN mode (multi-machine) | Yes, with auth | Shared FS only | Custom | No |
-| Democratic release protocol | Yes | No | No | No |
-| Zero config for sessions | Yes (MCP auto-register) | Yes | No | Partial |
+Beyond the channel workaround, CCT introduces structured coordination primitives that `claude-peers` doesn't have:
+
+- **Pools** — named groups with purposes, roles, and lifecycle (create → collaborate → release → archive)
+- **Democratic release** — agents vote on when to release a peer from a pool (unanimous for 2, majority for 3+)
+- **Busy signaling** — peers signal long-running tasks, others reduce polling automatically
+- **LAN mode** — bearer-token-authenticated broker on `0.0.0.0` for cross-machine collaboration
+- **Status line** — live peer ID, pool memberships, and unread counts in the Claude Code UI
+- **Service registry** — infrastructure services (browser servers, etc.) register with the broker for discovery
 
 ## Quick Start
 
@@ -192,6 +193,10 @@ cct/
 
 - [Bun](https://bun.sh) runtime
 - Claude Code with MCP + hooks support
+
+## Acknowledgments
+
+CCT is built on ideas from [claude-peers-mcp](https://github.com/louislva/claude-peers-mcp) by [@louislva](https://github.com/louislva), which demonstrated that a local SQLite broker + MCP server is sufficient for inter-session communication. CCT started as a fork of that architecture and diverged into pools, release consensus, busy signaling, LAN mode, and the hook-based delivery mechanism.
 
 ## License
 
