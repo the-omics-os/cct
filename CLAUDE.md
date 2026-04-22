@@ -122,7 +122,7 @@ cct/
 
 **Peers:** `/register`, `/heartbeat`, `/unregister`, `/set-summary`, `/list-peers`
 **Pools:** `/pool/create`, `/pool/join`, `/pool/leave`, `/pool/invite`, `/pool/list`, `/pool/members`, `/pool/status`, `/pool/update-metadata`
-**Messages:** `/message/send`, `/message/poll`, `/message/read`, `/message/check` (atomic), `/message/unread-count`
+**Messages:** `/message/send`, `/message/poll`, `/message/read`, `/message/check` (atomic), `/message/peek` (read-only), `/message/unread-count`
 **CLI (no auth):** `/pool/create-cli`, `/pool/invite-cli`, `/message/send-cli`, `/message/history`
 **Services (no auth):** `/service/register`, `/service/heartbeat`, `GET /services`
 **System:** `GET /health`

@@ -787,6 +787,57 @@ function handleMessageCheck(body: { peer_id: string; peer_secret: string }): Bro
   return ok(result);
 }
 
+// Read-only version of /message/check — returns unread messages + metadata
+// without marking anything as read. Used by server.ts for deferred ack.
+const messagePeekTx = db.transaction((peerId: string) => {
+  const messages = db.query(
+    `SELECT m.id as message_id, m.pool_id, po.name as pool_name,
+            m.from_id, pe.name as from_name, pe.cwd as from_cwd,
+            pe.git_branch as from_branch, pe.summary as from_summary,
+            m.body, m.msg_type, m.seq, m.created_at
+     FROM message_recipients mr
+     JOIN messages m ON mr.message_id = m.id
+     LEFT JOIN peers pe ON m.from_id = pe.id
+     LEFT JOIN pools po ON m.pool_id = po.id
+     WHERE mr.peer_id = ? AND mr.read_at IS NULL
+     ORDER BY m.seq ASC`
+  ).all(peerId) as any[];
+
+  const unreadByPool = db.query(
+    `SELECT m.pool_id, po.name as pool_name, COUNT(*) as count
+     FROM message_recipients mr
+     JOIN messages m ON mr.message_id = m.id
+     LEFT JOIN pools po ON m.pool_id = po.id
+     WHERE mr.peer_id = ? AND mr.read_at IS NULL
+     GROUP BY m.pool_id`
+  ).all(peerId) as { pool_id: string | null; pool_name: string | null; count: number }[];
+  const unreadTotal = unreadByPool.reduce((sum, r) => sum + r.count, 0);
+
+  const myPools = db.query(
+    "SELECT pool_id FROM pool_members WHERE peer_id = ? AND status = 'active'"
+  ).all(peerId) as { pool_id: string }[];
+  const busyPeers: any[] = [];
+  for (const { pool_id } of myPools) {
+    const busy = db.query(
+      `SELECT pm.peer_id, pe.name as peer_name, pm.busy_until, pm.busy_reason, po.name as pool_name
+       FROM pool_members pm JOIN peers pe ON pm.peer_id = pe.id JOIN pools po ON pm.pool_id = po.id
+       WHERE pm.pool_id = ? AND pm.status = 'active' AND pm.busy_until IS NOT NULL
+         AND datetime(pm.busy_until) > datetime('now') AND pm.peer_id != ?`
+    ).all(pool_id, peerId) as any[];
+    busyPeers.push(...busy);
+  }
+
+  return { messages, unread: { total: unreadTotal, by_pool: unreadByPool }, busy_peers: busyPeers };
+});
+
+function handleMessagePeek(body: { peer_id: string; peer_secret: string }): BrokerResponse {
+  const authErr = requireSecret(body.peer_id, body.peer_secret);
+  if (authErr) return err(authErr);
+
+  const result = messagePeekTx(body.peer_id);
+  return ok(result);
+}
+
 function handleUnreadCount(body: UnreadCountRequest): BrokerResponse {
   if (!body.peer_id) return err("peer_id is required");
 
@@ -1360,6 +1411,7 @@ const routes: Record<string, RouteHandler> = {
   "POST /message/poll": handleMessagePoll,
   "POST /message/read": handleMessageRead,
   "POST /message/check": handleMessageCheck,
+  "POST /message/peek": handleMessagePeek,
   "POST /pool/create-cli": handlePoolCreateCli,
   "POST /pool/invite-cli": handlePoolInviteCli,
   "POST /message/send-cli": handleMessageSendCli,

@@ -42,6 +42,11 @@ let myName = "";
 let pollInterval: ReturnType<typeof setInterval> | null = null;
 let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
 
+// Deferred ack: message IDs returned by the last handleCheckMessages call.
+// These get acked at the START of the next call, so if the cron result is
+// swallowed (never reaches the agent's conversation), messages stay unread.
+let pendingAckIds: number[] = [];
+
 // --- Broker HTTP helpers ---
 
 async function brokerPost<T = unknown>(path: string, body: Record<string, unknown>): Promise<BrokerResponse<T>> {
@@ -242,7 +247,20 @@ async function resolvePeerId(nameOrId: string): Promise<{ id: string } | { error
 // --- Tool handlers ---
 
 async function handleCheckMessages(): Promise<string> {
-  const res = await brokerPost<{ messages: PollMessage[]; unread: UnreadCountResponse }>("/message/check", {
+  // Step 1: Ack messages from the PREVIOUS call (deferred acknowledgment).
+  // If the previous cron result was swallowed, pendingAckIds is still set,
+  // but the agent is calling us again — meaning it DID process the output.
+  if (pendingAckIds.length > 0) {
+    await brokerPost("/message/read", {
+      peer_id: myId,
+      peer_secret: mySecret,
+      message_ids: pendingAckIds,
+    });
+    pendingAckIds = [];
+  }
+
+  // Step 2: Peek at unread messages without marking them read.
+  const res = await brokerPost<{ messages: PollMessage[]; unread: UnreadCountResponse }>("/message/peek", {
     peer_id: myId,
     peer_secret: mySecret,
   });
@@ -253,8 +271,14 @@ async function handleCheckMessages(): Promise<string> {
   }
 
   const { messages, unread, busy_peers } = res.data as any;
+
+  // Step 3: Stash IDs for deferred ack on the next call.
+  pendingAckIds = messages.map((m: any) => m.message_id);
+
+  // Update flag — count excludes messages we just peeked (they'll be acked next call)
   const poolSummary = unread.by_pool.map((p: any) => `${p.pool_name ?? "DM"}:${p.count}`).join(",");
-  writeFlag(`${unread.total}|${poolSummary}|${Date.now()}`);
+  const flagTotal = Math.max(0, unread.total - messages.length);
+  writeFlag(`${flagTotal}|${poolSummary}|${Date.now()}`);
 
   let output: string;
 
@@ -270,7 +294,6 @@ async function handleCheckMessages(): Promise<string> {
 
     output = `${messages.length} message(s):\n\n${lines.join("\n")}`;
 
-    // Use structured msg_type for action detection (not body substring matching)
     if (messages.some((m: any) => m.msg_type === "release_approved")) {
       output += `\n\n🎯 ACTION REQUIRED: You have been released from the pool. Please:\n1. Call cct_leave_pool for the pool\n2. If you have no other pools, cancel your CCT cron via CronList + CronDelete`;
     }
@@ -284,7 +307,6 @@ async function handleCheckMessages(): Promise<string> {
     }
   }
 
-  // Always show busy peers regardless of unread message count
   if (busy_peers && busy_peers.length > 0) {
     const bLines = busy_peers.map((b: any) =>
       `  - ${b.peer_name} in ${b.pool_name}: busy until ${b.busy_until}${b.busy_reason ? ` (${b.busy_reason})` : ""}`
