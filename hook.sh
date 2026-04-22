@@ -12,12 +12,13 @@ TOOL_NAME="${TOOL_NAME%%\"*}"
 case "$TOOL_NAME" in *cct_*|ToolSearch) exit 0 ;; esac
 
 # 3. Find peer ID via pidmap
-PIDMAP="$HOME/.cct/pidmaps/${PPID}_"*
+_CCT="${CCT_DIR:-$HOME/.cct}"
+PIDMAP="$_CCT/pidmaps/${PPID}_"*
 [ -f $PIDMAP ] || exit 0
 PEER_ID=$(cat $PIDMAP)
 
 # 4. Check unread flag
-FLAG="$HOME/.cct/flags/${PEER_ID}.unread"
+FLAG="$_CCT/flags/${PEER_ID}.unread"
 [ -f "$FLAG" ] || exit 0
 RAW=$(cat "$FLAG")
 [ -z "$RAW" ] && exit 0

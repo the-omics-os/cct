@@ -4,11 +4,14 @@ set -euo pipefail
 # CCT Integration Test Suite
 # Tests broker endpoints, hook performance, and security properties.
 
-BROKER_PORT=7888
+BROKER_PORT=17888
 BROKER_URL="http://127.0.0.1:${BROKER_PORT}"
-CCT_DIR="$HOME/.cct"
+CCT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/cct-test.XXXXXX")
 HOOK_SH="$(cd "$(dirname "$0")" && pwd)/hook.sh"
 BROKER_TS="$(cd "$(dirname "$0")" && pwd)/broker.ts"
+
+export CCT_PORT="$BROKER_PORT"
+export CCT_DIR
 
 PASSED=0
 FAILED=0
@@ -66,8 +69,9 @@ cleanup() {
     kill "$BROKER_PID" 2>/dev/null || true
     wait "$BROKER_PID" 2>/dev/null || true
   fi
-  # Also kill any broker on the port
+  # Kill test broker on the isolated port (never the live broker)
   lsof -ti :$BROKER_PORT 2>/dev/null | xargs kill 2>/dev/null || true
+  rm -rf "$CCT_DIR"
   echo "Cleanup complete."
 }
 
@@ -77,14 +81,13 @@ trap cleanup EXIT
 
 echo "=== Starting broker ==="
 
-# Kill any existing broker
+# Kill any leftover test broker on the isolated port
 lsof -ti :$BROKER_PORT 2>/dev/null | xargs kill 2>/dev/null || true
 sleep 0.3
 
-# Remove old DB for clean test
-rm -f "$CCT_DIR/cct.db" "$CCT_DIR/cct.db-shm" "$CCT_DIR/cct.db-wal"
+mkdir -p "$CCT_DIR"
 
-CCT_TOKEN="" bun "$BROKER_TS" &
+CCT_TOKEN="" CCT_PORT="$BROKER_PORT" CCT_DIR="$CCT_DIR" bun "$BROKER_TS" &
 BROKER_PID=$!
 sleep 1
 

@@ -294,6 +294,10 @@ async function handleCheckMessages(): Promise<string> {
 
     output = `${messages.length} message(s):\n\n${lines.join("\n")}`;
 
+    if (messages.some((m: any) => m.from_id === "system" && typeof m.body === "string" && m.body.startsWith("You were added to pool"))) {
+      output += `\n\n🚨 ACTION REQUIRED: You were added to a pool. You MUST set up message polling NOW or you will miss all future messages.\nRun CronCreate with cron "*/1 * * * *" and prompt "Call the cct_check_messages tool to check for incoming peer messages. If there are any, read and respond to them."\nThis is not optional — without it you are deaf to messages when idle.`;
+    }
+
     if (messages.some((m: any) => m.msg_type === "release_approved")) {
       output += `\n\n🎯 ACTION REQUIRED: You have been released from the pool. Please:\n1. Call cct_leave_pool for the pool\n2. If you have no other pools, cancel your CCT cron via CronList + CronDelete`;
     }
