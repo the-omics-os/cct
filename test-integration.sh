@@ -84,7 +84,7 @@ sleep 0.3
 # Remove old DB for clean test
 rm -f "$CCT_DIR/cct.db" "$CCT_DIR/cct.db-shm" "$CCT_DIR/cct.db-wal"
 
-bun "$BROKER_TS" &
+CCT_TOKEN="" bun "$BROKER_TS" &
 BROKER_PID=$!
 sleep 1
 
@@ -323,6 +323,193 @@ check_contains "pool/create without secret rejected" "peer_secret" "$NO_SEC_POOL
 # Broker rejects message send without secret
 NO_SEC_MSG=$(post "/message/send" "{\"peer_id\":\"$PEER_B_ID\",\"pool_name\":\"test-pool\",\"body\":\"evil\"}")
 check_contains "message/send without secret rejected" "peer_secret" "$NO_SEC_MSG"
+
+# --- Release consensus (2-peer) ---
+
+echo ""
+echo "=== Release consensus (2-peer, unanimous) ==="
+
+# Re-register peer A (it was killed earlier)
+sleep 300 &
+SLEEP_PIDS+=($!)
+PID_A2=$!
+PIDSTART_A2=$(date +%s)
+
+REG_A2=$(post "/register" "{\"pid\":$PID_A2,\"pid_start\":\"$PIDSTART_A2\",\"cwd\":\"/tmp/test-a2\",\"name\":\"peer-alpha2\"}")
+PEER_A2_ID=$(json_field "$REG_A2" "['data']['id']")
+PEER_A2_SECRET=$(json_field "$REG_A2" "['data']['secret']")
+check "Peer A2 registered" "peer-alpha2" "$(json_field "$REG_A2" "['data']['name']")"
+
+# Create a fresh pool for release tests
+RPOOL=$(post "/pool/create" "{\"peer_id\":\"$PEER_A2_ID\",\"peer_secret\":\"$PEER_A2_SECRET\",\"name\":\"release-pool\",\"purpose\":\"release test\"}")
+check "Release pool created" "True" "$(json_field "$RPOOL" "['ok']")"
+
+# Invite B
+RINV=$(post "/pool/invite" "{\"peer_id\":\"$PEER_A2_ID\",\"peer_secret\":\"$PEER_A2_SECRET\",\"target_peer_id\":\"$PEER_B_ID\",\"pool_name\":\"release-pool\"}")
+check "B invited to release pool" "True" "$(json_field "$RINV" "['ok']")"
+
+# Clear B's messages
+RPOLL=$(post "/message/check" "{\"peer_id\":\"$PEER_B_ID\",\"peer_secret\":\"$PEER_B_SECRET\"}")
+
+# A proposes releasing B
+PROPOSE=$(post "/pool/propose-release" "{\"peer_id\":\"$PEER_A2_ID\",\"peer_secret\":\"$PEER_A2_SECRET\",\"pool_name\":\"release-pool\",\"target_peer_id\":\"$PEER_B_ID\",\"reason\":\"task complete\"}")
+PROPOSE_OK=$(json_field "$PROPOSE" "['ok']")
+RELEASE_ID=$(json_field "$PROPOSE" "['data']['release_id']")
+QUORUM_RULE=$(json_field "$PROPOSE" "['data']['quorum_rule']")
+check "Release proposal created" "True" "$PROPOSE_OK"
+check "2-peer quorum is unanimous" "unanimous" "$QUORUM_RULE"
+
+# Check release status
+RSTATUS=$(post "/pool/release-status" "{\"pool_name\":\"release-pool\"}")
+check_contains "Release status shows open proposal" "open" "$RSTATUS"
+
+# A's vote was auto-cast; need B's vote for unanimous
+VOTE_B=$(post "/pool/vote-release" "{\"peer_id\":\"$PEER_B_ID\",\"peer_secret\":\"$PEER_B_SECRET\",\"release_id\":\"$RELEASE_ID\",\"vote\":\"yes\"}")
+VOTE_OK=$(json_field "$VOTE_B" "['ok']")
+VOTE_STATUS=$(json_field "$VOTE_B" "['data']['status']")
+check "B voted on release" "True" "$VOTE_OK"
+check "Release approved with unanimous votes" "approved" "$VOTE_STATUS"
+
+# B should have release-approved message
+BMSG=$(post "/message/check" "{\"peer_id\":\"$PEER_B_ID\",\"peer_secret\":\"$PEER_B_SECRET\"}")
+check_contains "B received release approved message" "Release approved" "$(json_field "$BMSG" "['data']")"
+
+# --- Release consensus edge cases ---
+
+echo ""
+echo "=== Release consensus edge cases ==="
+
+# Vote on resolved proposal should fail (covers both double-vote and closed proposal)
+DOUBLE_VOTE=$(post "/pool/vote-release" "{\"peer_id\":\"$PEER_B_ID\",\"peer_secret\":\"$PEER_B_SECRET\",\"release_id\":\"$RELEASE_ID\",\"vote\":\"yes\"}")
+check_contains "Vote on resolved proposal rejected" "already approved" "$DOUBLE_VOTE"
+
+# Duplicate proposal on same peer should fail (need to re-add B and try)
+# Re-invite B first (they haven't left yet in the broker, but the release was approved)
+PROPOSE_DUP=$(post "/pool/propose-release" "{\"peer_id\":\"$PEER_A2_ID\",\"peer_secret\":\"$PEER_A2_SECRET\",\"pool_name\":\"release-pool\",\"target_peer_id\":\"$PEER_B_ID\",\"reason\":\"again\"}")
+# Should succeed since previous proposal was resolved (approved), not open
+PROPOSE_DUP_OK=$(json_field "$PROPOSE_DUP" "['ok']")
+check "New proposal after resolved one succeeds" "True" "$PROPOSE_DUP_OK"
+
+# --- Release consensus (3-peer, majority) ---
+
+echo ""
+echo "=== Release consensus (3-peer, majority) ==="
+
+sleep 300 &
+SLEEP_PIDS+=($!)
+PID_C=$!
+PIDSTART_C=$(date +%s)
+
+REG_C=$(post "/register" "{\"pid\":$PID_C,\"pid_start\":\"$PIDSTART_C\",\"cwd\":\"/tmp/test-c\",\"name\":\"peer-gamma\"}")
+PEER_C_ID=$(json_field "$REG_C" "['data']['id']")
+PEER_C_SECRET=$(json_field "$REG_C" "['data']['secret']")
+check "Peer C registered" "peer-gamma" "$(json_field "$REG_C" "['data']['name']")"
+
+# Create 3-peer pool
+MPOOL=$(post "/pool/create" "{\"peer_id\":\"$PEER_A2_ID\",\"peer_secret\":\"$PEER_A2_SECRET\",\"name\":\"majority-pool\",\"purpose\":\"majority test\"}")
+check "Majority pool created" "True" "$(json_field "$MPOOL" "['ok']")"
+
+post "/pool/invite" "{\"peer_id\":\"$PEER_A2_ID\",\"peer_secret\":\"$PEER_A2_SECRET\",\"target_peer_id\":\"$PEER_B_ID\",\"pool_name\":\"majority-pool\"}" > /dev/null
+post "/pool/invite" "{\"peer_id\":\"$PEER_A2_ID\",\"peer_secret\":\"$PEER_A2_SECRET\",\"target_peer_id\":\"$PEER_C_ID\",\"pool_name\":\"majority-pool\"}" > /dev/null
+
+# Clear messages
+post "/message/check" "{\"peer_id\":\"$PEER_B_ID\",\"peer_secret\":\"$PEER_B_SECRET\"}" > /dev/null
+post "/message/check" "{\"peer_id\":\"$PEER_C_ID\",\"peer_secret\":\"$PEER_C_SECRET\"}" > /dev/null
+
+# A proposes releasing C
+PROPOSE3=$(post "/pool/propose-release" "{\"peer_id\":\"$PEER_A2_ID\",\"peer_secret\":\"$PEER_A2_SECRET\",\"pool_name\":\"majority-pool\",\"target_peer_id\":\"$PEER_C_ID\",\"reason\":\"done\"}")
+RELEASE3_ID=$(json_field "$PROPOSE3" "['data']['release_id']")
+QUORUM3=$(json_field "$PROPOSE3" "['data']['quorum_rule']")
+check "3-peer quorum is majority" "majority" "$QUORUM3"
+
+# B votes yes — should reach quorum (2/3 = majority)
+VOTE3=$(post "/pool/vote-release" "{\"peer_id\":\"$PEER_B_ID\",\"peer_secret\":\"$PEER_B_SECRET\",\"release_id\":\"$RELEASE3_ID\",\"vote\":\"yes\"}")
+VOTE3_STATUS=$(json_field "$VOTE3" "['data']['status']")
+check "3-peer release approved by majority (2/3)" "approved" "$VOTE3_STATUS"
+
+# --- Release rejection ---
+
+echo ""
+echo "=== Release rejection ==="
+
+# New proposal: A proposes releasing B
+PROPOSE_REJ=$(post "/pool/propose-release" "{\"peer_id\":\"$PEER_A2_ID\",\"peer_secret\":\"$PEER_A2_SECRET\",\"pool_name\":\"majority-pool\",\"target_peer_id\":\"$PEER_B_ID\",\"reason\":\"test rejection\"}")
+REJ_ID=$(json_field "$PROPOSE_REJ" "['data']['release_id']")
+
+# B votes no (1 yes, 1 no — still open with 3 members, need 2 for majority)
+VOTE_REJ_B=$(post "/pool/vote-release" "{\"peer_id\":\"$PEER_B_ID\",\"peer_secret\":\"$PEER_B_SECRET\",\"release_id\":\"$REJ_ID\",\"vote\":\"no\"}")
+VOTE_REJ_B_STATUS=$(json_field "$VOTE_REJ_B" "['data']['status']")
+check "1 yes 1 no is still open (3 members)" "open" "$VOTE_REJ_B_STATUS"
+
+# C votes no — now 2 no votes, quorum impossible (need 2 yes but only 1)
+VOTE_REJ_C=$(post "/pool/vote-release" "{\"peer_id\":\"$PEER_C_ID\",\"peer_secret\":\"$PEER_C_SECRET\",\"release_id\":\"$REJ_ID\",\"vote\":\"no\"}")
+VOTE_REJ_STATUS=$(json_field "$VOTE_REJ_C" "['data']['status']")
+check "Rejection after 2 no votes (quorum impossible)" "rejected" "$VOTE_REJ_STATUS"
+
+# --- Busy signaling ---
+
+echo ""
+echo "=== Busy signaling ==="
+
+# Clear messages first
+post "/message/check" "{\"peer_id\":\"$PEER_A2_ID\",\"peer_secret\":\"$PEER_A2_SECRET\"}" > /dev/null
+post "/message/check" "{\"peer_id\":\"$PEER_B_ID\",\"peer_secret\":\"$PEER_B_SECRET\"}" > /dev/null
+post "/message/check" "{\"peer_id\":\"$PEER_C_ID\",\"peer_secret\":\"$PEER_C_SECRET\"}" > /dev/null
+
+# A sets busy
+BUSY_RES=$(post "/pool/set-busy" "{\"peer_id\":\"$PEER_A2_ID\",\"peer_secret\":\"$PEER_A2_SECRET\",\"pool_name\":\"majority-pool\",\"minutes\":10,\"reason\":\"running tests\"}")
+BUSY_OK=$(json_field "$BUSY_RES" "['ok']")
+check "Set busy succeeded" "True" "$BUSY_OK"
+check_contains "Busy response has busy_until" "busy_until" "$BUSY_RES"
+
+# B should get busy notification
+BMSG2=$(post "/message/check" "{\"peer_id\":\"$PEER_B_ID\",\"peer_secret\":\"$PEER_B_SECRET\"}")
+check_contains "B received busy notification" "is busy" "$(json_field "$BMSG2" "['data']")"
+
+# Check busy-peers endpoint
+BUSY_PEERS=$(post "/pool/busy-peers" "{\"pool_name\":\"majority-pool\"}")
+check_contains "Busy peers shows A2" "peer-alpha2" "$BUSY_PEERS"
+
+# Message check should include busy peers
+CMSG=$(post "/message/check" "{\"peer_id\":\"$PEER_C_ID\",\"peer_secret\":\"$PEER_C_SECRET\"}")
+check_contains "Message check includes busy peers" "busy_peers" "$CMSG"
+
+# A sets ready
+READY_RES=$(post "/pool/set-ready" "{\"peer_id\":\"$PEER_A2_ID\",\"peer_secret\":\"$PEER_A2_SECRET\",\"pool_name\":\"majority-pool\"}")
+READY_OK=$(json_field "$READY_RES" "['ok']")
+check "Set ready succeeded" "True" "$READY_OK"
+
+# B should get ready notification
+BMSG3=$(post "/message/check" "{\"peer_id\":\"$PEER_B_ID\",\"peer_secret\":\"$PEER_B_SECRET\"}")
+check_contains "B received ready notification" "available again" "$(json_field "$BMSG3" "['data']")"
+
+# Busy peers should be empty now
+BUSY_PEERS2=$(post "/pool/busy-peers" "{\"pool_name\":\"majority-pool\"}")
+BUSY_COUNT=$(json_field "$BUSY_PEERS2" "['data']" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "0")
+check "No busy peers after set-ready" "0" "$BUSY_COUNT"
+
+# --- Non-member busy/ready should fail ---
+
+echo ""
+echo "=== Busy signaling edge cases ==="
+
+sleep 300 &
+SLEEP_PIDS+=($!)
+PID_D=$!
+
+REG_D=$(post "/register" "{\"pid\":$PID_D,\"pid_start\":\"$(date +%s)\",\"cwd\":\"/tmp/test-d\",\"name\":\"peer-delta\"}")
+PEER_D_ID=$(json_field "$REG_D" "['data']['id']")
+PEER_D_SECRET=$(json_field "$REG_D" "['data']['secret']")
+
+BUSY_FAIL=$(post "/pool/set-busy" "{\"peer_id\":\"$PEER_D_ID\",\"peer_secret\":\"$PEER_D_SECRET\",\"pool_name\":\"majority-pool\",\"minutes\":5}")
+check_contains "Non-member set-busy rejected" "not a member" "$BUSY_FAIL"
+
+READY_FAIL=$(post "/pool/set-ready" "{\"peer_id\":\"$PEER_D_ID\",\"peer_secret\":\"$PEER_D_SECRET\",\"pool_name\":\"majority-pool\"}")
+check_contains "Non-member set-ready rejected" "not a member" "$READY_FAIL"
+
+# Propose release by non-member should fail
+PROPOSE_FAIL=$(post "/pool/propose-release" "{\"peer_id\":\"$PEER_D_ID\",\"peer_secret\":\"$PEER_D_SECRET\",\"pool_name\":\"majority-pool\",\"target_peer_id\":\"$PEER_B_ID\"}")
+check_contains "Non-member propose-release rejected" "not a member" "$PROPOSE_FAIL"
 
 # --- Hook benchmark ---
 

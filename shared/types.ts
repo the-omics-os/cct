@@ -193,6 +193,7 @@ export interface MessageCheckRequest {
 export interface MessageCheckResponse {
   messages: PollMessage[];
   unread: UnreadCountResponse;
+  busy_peers: BusyPeerInfo[];
 }
 
 export interface MessageSendResponse {
@@ -233,6 +234,100 @@ export interface UnreadCountRequest {
 export interface UnreadCountResponse {
   total: number;
   by_pool: { pool_id: string | null; pool_name: string | null; count: number }[];
+}
+
+// --- Release consensus types ---
+
+export interface ReleaseProposal {
+  id: string;
+  pool_id: string;
+  target_peer_id: string;
+  proposed_by: string;
+  reason: string;
+  quorum_rule: "unanimous" | "majority";
+  status: "open" | "approved" | "rejected" | "expired";
+  created_at: string;
+  resolved_at: string | null;
+}
+
+export interface ReleaseVote {
+  release_id: string;
+  voter_peer_id: string;
+  vote: "yes" | "no";
+  cast_at: string;
+}
+
+export interface ProposeReleaseRequest {
+  peer_id: string;
+  peer_secret: string;
+  pool_name: string;
+  target_peer_id: string;
+  reason?: string;
+}
+
+export interface ProposeReleaseResponse {
+  release_id: string;
+  quorum_rule: string;
+  members_count: number;
+}
+
+export interface VoteReleaseRequest {
+  peer_id: string;
+  peer_secret: string;
+  release_id: string;
+  vote: "yes" | "no";
+}
+
+export interface VoteReleaseResponse {
+  voted: boolean;
+  status: string;
+  yes_count: number;
+  no_count: number;
+  quorum_needed: number;
+}
+
+export interface ReleaseStatusRequest {
+  pool_name: string;
+  peer_id?: string;
+}
+
+export interface ReleaseStatusResponse {
+  proposals: {
+    id: string;
+    target_peer_name: string;
+    target_peer_id: string;
+    proposed_by_name: string;
+    reason: string;
+    status: string;
+    quorum_rule: string;
+    yes_count: number;
+    no_count: number;
+    quorum_needed: number;
+    created_at: string;
+  }[];
+}
+
+// --- Busy signaling types ---
+
+export interface SetBusyRequest {
+  peer_id: string;
+  peer_secret: string;
+  pool_name: string;
+  minutes: number;
+  reason?: string;
+}
+
+export interface SetReadyRequest {
+  peer_id: string;
+  peer_secret: string;
+  pool_name: string;
+}
+
+export interface BusyPeerInfo {
+  peer_id: string;
+  peer_name: string;
+  busy_until: string;
+  busy_reason: string;
 }
 
 // --- Health ---

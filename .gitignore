@@ -8,9 +8,13 @@ dist/
 *.db
 *.db-journal
 *.db-wal
+*.db-shm
 .env
 .env.*
 .playwright/
 .planning/
-.claude/docs/
+.claude/
 cct/codex_output/
+.DS_Store
+now
+.content/*.mp4

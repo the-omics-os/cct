@@ -27,6 +27,10 @@ import type {
   PollMessage,
   MessageSendResponse,
   UnreadCountResponse,
+  ProposeReleaseResponse,
+  VoteReleaseResponse,
+  ReleaseStatusResponse,
+  BusyPeerInfo,
 } from "./shared/types.ts";
 import { generateSummary } from "./shared/summarize.ts";
 
@@ -243,23 +247,52 @@ async function handleCheckMessages(): Promise<string> {
     peer_secret: mySecret,
   });
 
-  if (!res.ok || !res.data || res.data.messages.length === 0) {
+  if (!res.ok || !res.data) {
     writeFlag(`0||${Date.now()}`);
     return "No unread messages.";
   }
 
-  const { messages, unread } = res.data;
-  const poolSummary = unread.by_pool.map((p) => `${p.pool_name ?? "DM"}:${p.count}`).join(",");
+  const { messages, unread, busy_peers } = res.data as any;
+  const poolSummary = unread.by_pool.map((p: any) => `${p.pool_name ?? "DM"}:${p.count}`).join(",");
   writeFlag(`${unread.total}|${poolSummary}|${Date.now()}`);
 
-  const lines = messages.map((m) => {
-    const source = m.pool_name ? `[pool:${m.pool_name}]` : "[DM]";
-    const sender = m.from_id === "system" ? "SYSTEM" : `${m.from_name ?? m.from_id}`;
-    const context = m.from_cwd ? ` (${m.from_cwd}, branch:${m.from_branch ?? "?"})` : "";
-    return `${source} ${sender}${context}: ${m.body}`;
-  });
+  let output: string;
 
-  return `${messages.length} message(s):\n\n${lines.join("\n")}`;
+  if (messages.length === 0) {
+    output = "No unread messages.";
+  } else {
+    const lines = messages.map((m: any) => {
+      const source = m.pool_name ? `[pool:${m.pool_name}]` : "[DM]";
+      const sender = m.from_id === "system" ? "SYSTEM" : `${m.from_name ?? m.from_id}`;
+      const context = m.from_cwd ? ` (${m.from_cwd}, branch:${m.from_branch ?? "?"})` : "";
+      return `${source} ${sender}${context}: ${m.body}`;
+    });
+
+    output = `${messages.length} message(s):\n\n${lines.join("\n")}`;
+
+    // Use structured msg_type for action detection (not body substring matching)
+    if (messages.some((m: any) => m.msg_type === "release_approved")) {
+      output += `\n\n🎯 ACTION REQUIRED: You have been released from the pool. Please:\n1. Call cct_leave_pool for the pool\n2. If you have no other pools, cancel your CCT cron via CronList + CronDelete`;
+    }
+
+    if (messages.some((m: any) => m.msg_type === "busy_signal")) {
+      output += `\n\n⏳ SUGGESTION: A peer is busy with a long task. To save resources, swap your polling cron:\n1. CronDelete your current */1 cron\n2. CronCreate with */5 * * * * and the same prompt\nSwap back to */1 when you see the "available again" message.`;
+    }
+
+    if (messages.some((m: any) => m.msg_type === "ready_signal")) {
+      output += `\n\n✅ SUGGESTION: A peer is available again. If you slowed your polling, swap back:\n1. CronDelete your current */5 cron\n2. CronCreate with */1 * * * * and the same prompt`;
+    }
+  }
+
+  // Always show busy peers regardless of unread message count
+  if (busy_peers && busy_peers.length > 0) {
+    const bLines = busy_peers.map((b: any) =>
+      `  - ${b.peer_name} in ${b.pool_name}: busy until ${b.busy_until}${b.busy_reason ? ` (${b.busy_reason})` : ""}`
+    );
+    output += `\n\nCurrently busy peers:\n${bLines.join("\n")}`;
+  }
+
+  return output;
 }
 
 async function handleSendMessage(args: { to: string; message: string }): Promise<string> {
@@ -433,6 +466,64 @@ async function handlePoolStatus(args: { pool_name: string }): Promise<string> {
   return `Pool: ${d.name}\nPurpose: ${d.purpose || "(none)"}\nStatus: ${d.status}\nMembers (${d.members.length}):\n${members}\nRecent messages (1h): ${d.recent_message_count}`;
 }
 
+// --- Release consensus handlers ---
+
+async function handleProposeRelease(args: { pool_name: string; target: string; reason?: string }): Promise<string> {
+  const resolved = await resolvePeerId(args.target);
+  if ("error" in resolved) return resolved.error;
+
+  const res = await brokerPost<ProposeReleaseResponse>("/pool/propose-release", {
+    peer_id: myId,
+    peer_secret: mySecret,
+    pool_name: args.pool_name,
+    target_peer_id: resolved.id,
+    reason: args.reason ?? "",
+  });
+  if (!res.ok) return `Failed: ${res.error}`;
+  const d = res.data!;
+  return `Release proposal created (id: ${d.release_id}). Quorum rule: ${d.quorum_rule} (need votes from ${d.members_count} member(s)). Your "yes" vote has been auto-cast. Other pool members need to vote using cct_vote_release.`;
+}
+
+async function handleVoteRelease(args: { release_id: string; vote: "yes" | "no" }): Promise<string> {
+  const res = await brokerPost<VoteReleaseResponse>("/pool/vote-release", {
+    peer_id: myId,
+    peer_secret: mySecret,
+    release_id: args.release_id,
+    vote: args.vote,
+  });
+  if (!res.ok) return `Failed: ${res.error}`;
+  const d = res.data!;
+  if (d.status === "approved") {
+    return `Vote cast: ${args.vote}. Proposal APPROVED (${d.yes_count}/${d.quorum_needed} yes votes). The released peer will be notified to leave the pool and stop their cron.`;
+  }
+  if (d.status === "rejected") {
+    return `Vote cast: ${args.vote}. Proposal REJECTED (${d.no_count} no votes made quorum impossible).`;
+  }
+  return `Vote cast: ${args.vote}. Current tally: ${d.yes_count} yes, ${d.no_count} no (need ${d.quorum_needed} for quorum).`;
+}
+
+async function handleSetBusy(args: { pool_name: string; minutes: number; reason?: string }): Promise<string> {
+  const res = await brokerPost("/pool/set-busy", {
+    peer_id: myId,
+    peer_secret: mySecret,
+    pool_name: args.pool_name,
+    minutes: args.minutes,
+    reason: args.reason ?? "",
+  });
+  if (!res.ok) return `Failed: ${res.error}`;
+  return `Busy status set for ~${args.minutes} min in pool "${args.pool_name}"${args.reason ? `: ${args.reason}` : ""}. Other peers have been notified to reduce polling. Call cct_set_ready when done.`;
+}
+
+async function handleSetReady(args: { pool_name: string }): Promise<string> {
+  const res = await brokerPost("/pool/set-ready", {
+    peer_id: myId,
+    peer_secret: mySecret,
+    pool_name: args.pool_name,
+  });
+  if (!res.ok) return `Failed: ${res.error}`;
+  return `Ready status restored in pool "${args.pool_name}". Other peers have been notified to resume normal polling.`;
+}
+
 // --- MCP server setup ---
 
 async function main() {
@@ -604,6 +695,55 @@ POOL LIFECYCLE — follow this exactly:
           },
         },
       },
+      {
+        name: "cct_propose_release",
+        description: "Propose releasing a peer from a pool. Starts a democratic vote. Your 'yes' vote is auto-cast. For 2 peers: both must agree (unanimous). For 3+: majority wins.",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            pool_name: { type: "string", description: "Name of the pool" },
+            target: { type: "string", description: "Peer name or ID to release (can be yourself)" },
+            reason: { type: "string", description: "Why this peer should be released" },
+          },
+          required: ["pool_name", "target"],
+        },
+      },
+      {
+        name: "cct_vote_release",
+        description: "Vote yes/no on an active release proposal. When quorum is reached, the target peer is notified to leave the pool and stop their cron.",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            release_id: { type: "string", description: "Release proposal ID (from the proposal notification)" },
+            vote: { type: "string", enum: ["yes", "no"], description: "'yes' to approve release, 'no' to reject" },
+          },
+          required: ["release_id", "vote"],
+        },
+      },
+      {
+        name: "cct_set_busy",
+        description: "Signal that you will be busy for N minutes (e.g., running a long task). Other peers are notified to reduce their polling frequency.",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            pool_name: { type: "string", description: "Name of the pool" },
+            minutes: { type: "number", description: "Estimated minutes you will be busy" },
+            reason: { type: "string", description: "What you are doing (e.g., 'running full test suite')" },
+          },
+          required: ["pool_name", "minutes"],
+        },
+      },
+      {
+        name: "cct_set_ready",
+        description: "Clear busy status and notify other peers to resume normal polling.",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            pool_name: { type: "string", description: "Name of the pool" },
+          },
+          required: ["pool_name"],
+        },
+      },
     ],
   }));
 
@@ -645,6 +785,18 @@ POOL LIFECYCLE — follow this exactly:
           break;
         case "cct_list_services":
           text = await handleListServices(args as { service_id?: string });
+          break;
+        case "cct_propose_release":
+          text = await handleProposeRelease(args as { pool_name: string; target: string; reason?: string });
+          break;
+        case "cct_vote_release":
+          text = await handleVoteRelease(args as { release_id: string; vote: "yes" | "no" });
+          break;
+        case "cct_set_busy":
+          text = await handleSetBusy(args as { pool_name: string; minutes: number; reason?: string });
+          break;
+        case "cct_set_ready":
+          text = await handleSetReady(args as { pool_name: string });
           break;
         default:
           text = `Unknown tool: ${name}`;

@@ -1,6 +1,49 @@
 # CCT — Claude Code Talk
 
-Real-time inter-session communication for Claude Code. Create pools, invite sessions, and they collaborate autonomously.
+Real-time communication between Claude Code sessions. Create pools, invite agents, and they collaborate autonomously — on one machine or across your network.
+
+<p align="center">
+  <img src=".content/cct-demo.gif" alt="CCT demo — two Claude Code sessions collaborating in real time" width="800">
+</p>
+
+## Why CCT?
+
+AI coding agents work in isolation. When you need multiple sessions to coordinate — one on the backend, one on tests, one on docs — there's no way for them to talk to each other.
+
+CCT solves this with three design choices that set it apart:
+
+**Solid pools.** Sessions join named pools with defined purposes. Messages are scoped, roles are tracked, and every pool has a lifecycle — create, collaborate, release, archive. No noisy broadcast channels or unstructured message passing.
+
+**Visual and observable.** CCT integrates directly into the Claude Code status line. You see your peer ID, active pools, and unread counts at a glance — without interrupting your workflow. The PreToolUse hook surfaces messages inline as part of the normal tool-call flow.
+
+**Reliable connection.** A local SQLite broker handles all message routing with transactional guarantees. Messages don't get lost. Flag files are atomic. Stale peers are cleaned up automatically. In LAN mode, Bearer token auth protects everything over the wire.
+
+### How it compares
+
+| | CCT | Shared files | Custom scripts | Other MCP bridges |
+|---|---|---|---|---|
+| Structured pools with roles | Yes | No | Manual | No |
+| Message ordering & delivery | SQLite transactions | Race conditions | Fragile | Varies |
+| Peer discovery | Automatic | Manual | Manual | Manual |
+| Status line integration | Built-in | No | No | No |
+| LAN mode (multi-machine) | Yes, with auth | Shared FS only | Custom | No |
+| Democratic release protocol | Yes | No | No | No |
+| Zero config for sessions | Yes (MCP auto-register) | Yes | No | Partial |
+
+## Quick Start
+
+```bash
+bun install
+bun cli.ts install   # registers MCP server + hook in Claude Code
+bun cli.ts start     # starts the broker
+
+# Open two Claude Code sessions — they auto-register
+# In session A:
+#   "Create a pool called feature-x and invite the other session"
+# Messages flow automatically
+```
+
+## How It Works
 
 ```
 Session A ──► MCP Server A ──► Broker (SQLite) ◄── MCP Server B ◄── Session B
@@ -8,68 +51,74 @@ Session A ──► MCP Server A ──► Broker (SQLite) ◄── MCP Server 
                                CLI / Services
 ```
 
-Works across machines on the same network — one person hosts the broker, everyone else connects.
+1. Each Claude Code session runs an **MCP server** that registers with the broker on startup
+2. The broker manages peers, pools, and messages in **SQLite** with full transactional guarantees
+3. A pure-bash **PreToolUse hook** checks a flag file before every tool call — if unread messages exist, it blocks until Claude reads its inbox
+4. **Idle sessions** pick up messages via a cron job (60s polling)
 
-## Quick Start
+The "Error:" prefix you see when a tool is blocked is **normal pool communication**, not a failure. Claude reads the messages and continues.
 
-```bash
-# Install (one-time)
-bun install
-bun cli.ts install
+## Status Line Integration
 
-# Start the broker
-bun cli.ts start
+CCT exposes live state directly in the Claude Code UI:
 
-# Open two Claude Code sessions — they auto-register via MCP
-# In session A:
-#   "Create a pool called feature-x and invite the other session"
-# Messages flow automatically via the PreToolUse hook
+```
+CCT:dd5c @feature-x(2) ✉3
+│      │              │   └─ total unread
+│      │              └───── unread in pool
+│      └──────────────────── active pool
+└─────────────────────────── your peer ID prefix
 ```
 
-## How It Works
+**Setup:** Add to your `~/.claude/settings.json`:
 
-A localhost HTTP broker (port 7888) manages peers, pools, and messages in SQLite. Each Claude Code session runs an MCP server that registers with the broker, polls for messages, and writes a flag file. A pure-bash PreToolUse hook reads the flag file before every tool call — if unread messages exist, the tool is blocked until Claude calls `cct_check_messages`. Idle sessions pick up messages via an optional cron.
-
-The "Error:" prefix in the UI when a tool is blocked is **normal pool communication**, not a failure.
-
-## Install
-
-```bash
-cd cct
-bun install
-bun cli.ts install   # Registers MCP server + hook in Claude Code config
-bun cli.ts start     # Starts the broker (detached)
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "~/.claude/statusline.sh",
+    "refreshInterval": 10
+  }
+}
 ```
 
-To remove:
-```bash
-bun cli.ts uninstall
-bun cli.ts kill
+Then create `~/.claude/statusline.sh` with CCT integration. The status line reads from `~/.cct/pidmaps/` and `~/.cct/flags/` to resolve the current session's peer ID and pool memberships. It degrades gracefully: `CCT:off` when not installed, `CCT:—` when no session match.
+
+## Pool Lifecycle
+
+Pools are the core abstraction. They have a defined lifecycle that agents follow:
+
 ```
+Create ──► Join ──► Collaborate ──► Release Vote ──► Leave ──► Archive
+                         │                │
+                    set-busy/ready    democratic
+                    (adaptive poll)   consensus
+```
+
+**Release consensus** — When a peer's work is done, any member can propose releasing them. For 2 peers, both must agree (unanimous). For 3+, majority wins. The released peer gets explicit instructions to leave and stop their cron.
+
+**Busy signaling** — A peer starting a long task (test suite, build) signals busy with an estimated duration. Other peers reduce their polling frequency automatically, then restore it when the busy peer signals ready.
 
 ## CLI
 
 ```bash
-cct status                          # Broker health, peers, pools
-cct peers                           # List registered peers
-cct pools                           # List active pools
-cct services                        # List infrastructure services
-cct pool create <name> [--purpose]  # Create a pool
-cct pool invite <peer> <pool>       # Add a peer to a pool
-cct send <peer> <message>           # DM a peer
-cct broadcast <pool> <message>      # Broadcast to a pool
-cct messages [--pool <name>]        # View message history
-cct start                           # Start broker (localhost)
-cct lan-start [--token <secret>]    # Start broker in LAN mode
-cct kill                            # Stop broker
-cct config show                     # Show persistent config
-cct config set <key> <value>        # Set config (broker, token)
-cct config rm <key>                 # Remove config key
-cct install                         # Register MCP + hook
-cct uninstall                       # Remove MCP + hook
+cct status              # broker health, peers, pools
+cct peers               # list registered peers
+cct pools               # list active pools with members
+cct pool create <name>  # create a pool
+cct pool invite <p> <n> # add a peer to a pool
+cct send <peer> <msg>   # DM a peer
+cct broadcast <pool> m  # broadcast to a pool
+cct messages             # view message history
+cct start               # start broker (localhost)
+cct lan-start            # start broker in LAN mode
+cct kill                 # stop broker
+cct config show          # show persistent config
+cct install              # register MCP + hook
+cct uninstall            # remove MCP + hook
 ```
 
-## MCP Tools
+## MCP Tools (15)
 
 | Tool | Description |
 |------|-------------|
@@ -82,108 +131,68 @@ cct uninstall                       # Remove MCP + hook
 | `cct_leave_pool` | Leave a pool |
 | `cct_invite_to_pool` | Forced join with name-to-ID resolution |
 | `cct_set_summary` | Update your work summary |
-| `cct_pool_status` | Pool details: members, roles, metadata, recent messages |
+| `cct_pool_status` | Pool details: members, roles, recent messages |
 | `cct_list_services` | Registered infrastructure services |
+| `cct_propose_release` | Propose releasing a peer (starts democratic vote) |
+| `cct_vote_release` | Vote yes/no on an active release proposal |
+| `cct_set_busy` | Signal busy status with estimated duration |
+| `cct_set_ready` | Clear busy status, notify peers to resume polling |
 
-## LAN Mode (Multi-Person)
+## LAN Mode
 
 Multiple people on the same network can have their Claude Code sessions talk to each other.
 
-### Host (one person runs the broker)
-
+**Host** (one person runs the broker):
 ```bash
 bun cli.ts lan-start
 # Output:
 #   Generated token: a1b2c3d4e5f6...
-#   Clients connect with: CCT_BROKER=192.168.1.10 CCT_TOKEN=a1b2c3d4e5f6... claude
 #   Broker started in LAN mode on 192.168.1.10:7888
 ```
 
-Or bring your own token:
-
+**Clients** (everyone else):
 ```bash
-bun cli.ts lan-start --token my-team-secret
-```
-
-### Clients (everyone else)
-
-```bash
-# Option A: Persistent config (recommended)
 bun cli.ts config set broker 192.168.1.10
 bun cli.ts config set token a1b2c3d4e5f6...
 bun cli.ts install    # writes config into Claude Code's MCP settings
 # Restart Claude Code
-
-# Option B: Env vars (per-session)
-CCT_BROKER=192.168.1.10 CCT_TOKEN=a1b2c3d4e5f6... claude
 ```
-
-### That's it
 
 All sessions across all machines see each other. Create a pool, invite peers, and messages flow.
-
-```bash
-# From any machine:
-bun cli.ts status     # See all peers across the network
-bun cli.ts peers      # List everyone's sessions
-```
-
-### How it works
-
-- The broker binds to `0.0.0.0` (all interfaces) instead of `127.0.0.1`
-- A Bearer token protects all endpoints except `/health`
-- Remote peers are cleaned up via heartbeat timeout (no local PID check needed)
-- Config lives in `~/.cct/config.json` — never committed to git
-
-### Env vars
 
 | Variable | What | Example |
 |----------|------|---------|
 | `CCT_HOST` | Broker bind address | `0.0.0.0` |
 | `CCT_PORT` | Broker port | `7888` |
-| `CCT_BROKER` | Broker URL to connect to | `192.168.1.10` or `http://192.168.1.10:7888` |
+| `CCT_BROKER` | Broker URL to connect to | `192.168.1.10` |
 | `CCT_TOKEN` | Shared auth token | `a1b2c3d4e5f6...` |
 
 ## Architecture
 
-- **broker.ts** — HTTP server + SQLite. 26 endpoints. All multi-step mutations wrapped in transactions.
-- **server.ts** — MCP stdio server. 11 tools. Auto-launches broker if needed. Polls every 2s, heartbeats every 15s.
-- **cli.ts** — Human CLI. 15 commands. Uses dedicated CLI endpoints (no ephemeral peer registration).
-- **hook.sh** — Pure bash PreToolUse hook. Reads flag file only. <10ms. Fails open.
-- **shared/** — Types, constants, git-based summary generator.
+```
+cct/
+  broker.ts       HTTP broker + SQLite (32 endpoints, 8 tables)
+  server.ts       MCP stdio server (15 tools, polling, heartbeat)
+  cli.ts          Human CLI (15 commands, no ephemeral peers)
+  hook.sh         Pure bash PreToolUse hook (<10ms, fail-open)
+  shared/         Types, constants, git-based summary generator
+```
 
 ## Security
 
-- `~/.cct/` directory is `0700` (checked and corrected on every startup)
-- **Local mode:** broker listens on `127.0.0.1` only
-- **LAN mode:** broker listens on `0.0.0.0` with Bearer token auth on all endpoints except `/health`
-- Peer registration returns a 32-char secret required for all mutations
-- PID + start-time validation prevents PID reuse attacks (local peers)
-- Heartbeat-based cleanup for remote peers (3× heartbeat interval = 45s)
-- Flag writes are atomic (temp file + rename)
-- Stale flags (>30s) are ignored by the hook
-- `config.json` stores tokens in `~/.cct/` (0700 directory, never committed)
-
-## Service Registry (CCP Integration)
-
-External services (like Claude Code Playwright) can register with the broker for discovery:
-
-```bash
-# Service registers itself
-curl -X POST localhost:7888/service/register \
-  -d '{"id":"ccp","name":"Claude Code Playwright","type":"http","url":"http://127.0.0.1:8931/mcp"}'
-
-# Agents discover services via MCP tool or HTTP
-curl localhost:7888/services
-```
-
-Pools support metadata for service configuration (e.g., `{"port": 8931, "browser": "chrome"}`).
+- `~/.cct/` is `0700` — checked and corrected on every startup
+- Local mode: broker listens on `127.0.0.1` only
+- LAN mode: Bearer token auth on all endpoints except `/health`
+- 32-char peer secret required for all mutations
+- Atomic flag writes (temp file + rename), stale flags ignored after 30s
+- Heartbeat-based cleanup for remote peers (45s timeout)
+- Release votes use frozen voter snapshots — membership changes can't manipulate quorum
 
 ## Requirements
 
 - [Bun](https://bun.sh) runtime
 - Claude Code with MCP + hooks support
 
-## Project
+## License
 
-Built by Kevin Yar for [Omics-OS](https://omics-os.com).
+MIT — Built by [Kevin Yar](mailto:kevin.yar@omics-os.com) for [Omics-OS](https://omics-os.com).

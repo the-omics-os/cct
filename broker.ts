@@ -32,6 +32,11 @@ import type {
   MessagePollRequest,
   MessageReadRequest,
   UnreadCountRequest,
+  ProposeReleaseRequest,
+  VoteReleaseRequest,
+  ReleaseStatusRequest,
+  SetBusyRequest,
+  SetReadyRequest,
 } from "./shared/types.ts";
 
 // --- Directory setup ---
@@ -132,7 +137,38 @@ CREATE TABLE IF NOT EXISTS services (
   registered_at TEXT NOT NULL,
   last_health   TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS pool_releases (
+  id              TEXT PRIMARY KEY,
+  pool_id         TEXT NOT NULL REFERENCES pools(id) ON DELETE CASCADE,
+  target_peer_id  TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE,
+  proposed_by     TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE,
+  reason          TEXT NOT NULL DEFAULT '',
+  quorum_rule     TEXT NOT NULL DEFAULT 'unanimous',
+  quorum_needed   INTEGER NOT NULL DEFAULT 0,
+  eligible_voters TEXT NOT NULL DEFAULT '[]',
+  status          TEXT NOT NULL DEFAULT 'open',
+  created_at      TEXT NOT NULL,
+  resolved_at     TEXT
+);
+
+CREATE TABLE IF NOT EXISTS release_votes (
+  release_id      TEXT NOT NULL REFERENCES pool_releases(id) ON DELETE CASCADE,
+  voter_peer_id   TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE,
+  vote            TEXT NOT NULL,
+  cast_at         TEXT NOT NULL,
+  PRIMARY KEY (release_id, voter_peer_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_releases_pool_status ON pool_releases(pool_id, status)
+  WHERE status = 'open';
 `);
+
+// Schema migrations for existing DBs
+try { db.exec("ALTER TABLE pool_members ADD COLUMN busy_until TEXT"); } catch {}
+try { db.exec("ALTER TABLE pool_members ADD COLUMN busy_reason TEXT NOT NULL DEFAULT ''"); } catch {}
+try { db.exec("ALTER TABLE pool_releases ADD COLUMN quorum_needed INTEGER NOT NULL DEFAULT 0"); } catch {}
+try { db.exec("ALTER TABLE pool_releases ADD COLUMN eligible_voters TEXT NOT NULL DEFAULT '[]'"); } catch {}
 
 // --- Helpers ---
 
@@ -184,12 +220,16 @@ function getPoolByName(name: string): { id: string; name: string; purpose: strin
   return db.query("SELECT * FROM pools WHERE name = ?").get(name) as any;
 }
 
-function insertSystemMessage(poolId: string, body: string, targetPeerId?: string): void {
+function insertSystemMessage(poolId: string, body: string, targetPeerId?: string, excludePeerId?: string): void {
+  insertSystemMessageTyped(poolId, "system", body, targetPeerId, excludePeerId);
+}
+
+function insertSystemMessageTyped(poolId: string, msgType: string, body: string, targetPeerId?: string, excludePeerId?: string): void {
   const seq = getNextSeq(poolId);
   const ts = now();
   const result = db.query(
-    "INSERT INTO messages (pool_id, from_id, body, msg_type, seq, created_at) VALUES (?, 'system', ?, 'system', ?, ?)"
-  ).run(poolId, body, seq, ts);
+    "INSERT INTO messages (pool_id, from_id, body, msg_type, seq, created_at) VALUES (?, 'system', ?, ?, ?, ?)"
+  ).run(poolId, body, msgType, seq, ts);
   const msgId = Number(result.lastInsertRowid);
 
   if (targetPeerId) {
@@ -202,9 +242,11 @@ function insertSystemMessage(poolId: string, body: string, targetPeerId?: string
     ).all(poolId) as { peer_id: string }[];
 
     for (const m of members) {
-      db.query(
-        "INSERT INTO message_recipients (message_id, peer_id) VALUES (?, ?)"
-      ).run(msgId, m.peer_id);
+      if (m.peer_id !== excludePeerId) {
+        db.query(
+          "INSERT INTO message_recipients (message_id, peer_id) VALUES (?, ?)"
+        ).run(msgId, m.peer_id);
+      }
     }
   }
 }
@@ -262,6 +304,17 @@ function handleUnregister(body: UnregisterRequest): BrokerResponse {
   return ok({ unregistered: true });
 }
 
+function cancelOpenProposalsForPeer(peerId: string): void {
+  const openProposals = db.query(
+    "SELECT id, pool_id FROM pool_releases WHERE target_peer_id = ? AND status = 'open'"
+  ).all(peerId) as { id: string; pool_id: string }[];
+  for (const r of openProposals) {
+    db.query("UPDATE pool_releases SET status = 'expired', resolved_at = ? WHERE id = ?").run(now(), r.id);
+    const peer = db.query("SELECT name FROM peers WHERE id = ?").get(peerId) as { name: string } | null;
+    insertSystemMessage(r.pool_id, `Release proposal for ${peer?.name ?? peerId} cancelled (peer left/disconnected).`);
+  }
+}
+
 const markPeerDeadTx = db.transaction((peerId: string) => {
   db.query("UPDATE peers SET status = 'dead' WHERE id = ?").run(peerId);
 
@@ -269,6 +322,8 @@ const markPeerDeadTx = db.transaction((peerId: string) => {
   const poolMemberships = db.query(
     "SELECT pool_id FROM pool_members WHERE peer_id = ? AND status = 'active'"
   ).all(peerId) as { pool_id: string }[];
+
+  cancelOpenProposalsForPeer(peerId);
 
   for (const { pool_id } of poolMemberships) {
     db.query(
@@ -395,7 +450,7 @@ const poolJoinTx = db.transaction((pool: any, peerId: string) => {
   }
 
   const peer = db.query("SELECT name FROM peers WHERE id = ?").get(peerId) as { name: string } | null;
-  insertSystemMessage(pool.id, `${peer?.name ?? peerId} joined the pool.`);
+  insertSystemMessage(pool.id, `${peer?.name ?? peerId} joined the pool.`, undefined, peerId);
   return null;
 });
 
@@ -418,6 +473,14 @@ const poolLeaveTx = db.transaction((pool: any, peerId: string) => {
   ).get(pool.id, peerId) as { status: string } | null;
 
   if (!membership || membership.status !== "active") return "not a member of this pool";
+
+  // Cancel any open release proposals targeting this peer
+  const openProposals = db.query(
+    "SELECT id FROM pool_releases WHERE pool_id = ? AND target_peer_id = ? AND status = 'open'"
+  ).all(pool.id, peerId) as { id: string }[];
+  for (const r of openProposals) {
+    db.query("UPDATE pool_releases SET status = 'expired', resolved_at = ? WHERE id = ?").run(now(), r.id);
+  }
 
   db.query(
     "UPDATE pool_members SET status = 'left', left_at = ? WHERE pool_id = ? AND peer_id = ?"
@@ -462,7 +525,7 @@ const poolInviteTx = db.transaction((pool: any, body: PoolInviteRequest, target:
 
   const inviter = db.query("SELECT name FROM peers WHERE id = ?").get(body.peer_id) as { name: string } | null;
   insertSystemMessage(pool.id, `You were added to pool ${pool.name} by ${inviter?.name ?? body.peer_id}.`, body.target_peer_id);
-  insertSystemMessage(pool.id, `${target.name} joined the pool.`);
+  insertSystemMessage(pool.id, `${target.name} joined the pool.`, undefined, body.target_peer_id);
   return null;
 });
 
@@ -699,7 +762,21 @@ const messageCheckTx = db.transaction((peerId: string) => {
   ).all(peerId) as { pool_id: string | null; pool_name: string | null; count: number }[];
   const remainingTotal = remaining.reduce((sum, r) => sum + r.count, 0);
 
-  return { messages, unread: { total: remainingTotal, by_pool: remaining } };
+  const myPools = db.query(
+    "SELECT pool_id FROM pool_members WHERE peer_id = ? AND status = 'active'"
+  ).all(peerId) as { pool_id: string }[];
+  const busyPeers: any[] = [];
+  for (const { pool_id } of myPools) {
+    const busy = db.query(
+      `SELECT pm.peer_id, pe.name as peer_name, pm.busy_until, pm.busy_reason, po.name as pool_name
+       FROM pool_members pm JOIN peers pe ON pm.peer_id = pe.id JOIN pools po ON pm.pool_id = po.id
+       WHERE pm.pool_id = ? AND pm.status = 'active' AND pm.busy_until IS NOT NULL
+         AND datetime(pm.busy_until) > datetime('now') AND pm.peer_id != ?`
+    ).all(pool_id, peerId) as any[];
+    busyPeers.push(...busy);
+  }
+
+  return { messages, unread: { total: remainingTotal, by_pool: remaining }, busy_peers: busyPeers };
 });
 
 function handleMessageCheck(body: { peer_id: string; peer_secret: string }): BrokerResponse {
@@ -777,7 +854,7 @@ function handlePoolInviteCli(body: { target_peer_id: string; pool_name: string }
   }
 
   insertSystemMessage(pool.id, `You were added to pool ${pool.name} by CLI.`, body.target_peer_id);
-  insertSystemMessage(pool.id, `${target.name} joined the pool.`);
+  insertSystemMessage(pool.id, `${target.name} joined the pool.`, undefined, body.target_peer_id);
 
   return ok({ invited: true, pool_id: pool.id });
 }
@@ -868,6 +945,310 @@ function handlePoolUpdateMetadata(body: { peer_id: string; peer_secret: string; 
   return ok({ updated: true });
 }
 
+// --- Release consensus handlers ---
+
+function getQuorumNeeded(memberCount: number, rule: string): number {
+  if (rule === "unanimous") return memberCount;
+  return Math.floor(memberCount / 2) + 1;
+}
+
+const proposeReleaseTx = db.transaction((releaseId: string, body: ProposeReleaseRequest, pool: any) => {
+  const ts = now();
+  const members = db.query(
+    "SELECT peer_id FROM pool_members WHERE pool_id = ? AND status = 'active'"
+  ).all(pool.id) as { peer_id: string }[];
+
+  const isMember = members.some((m) => m.peer_id === body.peer_id);
+  if (!isMember) return { error: "not a member of this pool" };
+
+  const targetIsMember = members.some((m) => m.peer_id === body.target_peer_id);
+  if (!targetIsMember) return { error: "target peer is not a member of this pool" };
+
+  const existing = db.query(
+    "SELECT id FROM pool_releases WHERE pool_id = ? AND target_peer_id = ? AND status = 'open'"
+  ).get(pool.id, body.target_peer_id) as { id: string } | null;
+  if (existing) return { error: "an open release proposal already exists for this peer" };
+
+  const quorumRule = members.length <= 2 ? "unanimous" : "majority";
+  const quorumNeeded = getQuorumNeeded(members.length, quorumRule);
+  const eligibleVoters = JSON.stringify(members.map((m) => m.peer_id));
+
+  db.query(
+    `INSERT INTO pool_releases (id, pool_id, target_peer_id, proposed_by, reason, quorum_rule, quorum_needed, eligible_voters, status, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)`
+  ).run(releaseId, pool.id, body.target_peer_id, body.peer_id, body.reason ?? "", quorumRule, quorumNeeded, eligibleVoters, ts);
+
+  db.query(
+    "INSERT INTO release_votes (release_id, voter_peer_id, vote, cast_at) VALUES (?, ?, 'yes', ?)"
+  ).run(releaseId, body.peer_id, ts);
+
+  const targetPeer = db.query("SELECT name FROM peers WHERE id = ?").get(body.target_peer_id) as { name: string } | null;
+  const proposer = db.query("SELECT name FROM peers WHERE id = ?").get(body.peer_id) as { name: string } | null;
+  const reason = body.reason ? ` Reason: ${body.reason}` : "";
+
+  // Auto-resolve if quorum already met (e.g., 1-member pool)
+  if (1 >= quorumNeeded) {
+    db.query("UPDATE pool_releases SET status = 'approved', resolved_at = ? WHERE id = ?").run(ts, releaseId);
+    insertSystemMessageTyped(
+      pool.id,
+      "release_approved",
+      `Release approved for ${targetPeer?.name ?? body.target_peer_id}. You are free to leave the pool and stop your cron job.`,
+      body.target_peer_id
+    );
+    return {
+      data: {
+        release_id: releaseId,
+        quorum_rule: quorumRule,
+        members_count: members.length,
+        status: "approved",
+      },
+    };
+  }
+
+  insertSystemMessage(
+    pool.id,
+    `📋 Release proposal: ${proposer?.name ?? body.peer_id} proposes releasing ${targetPeer?.name ?? body.target_peer_id}.${reason} Vote with cct_vote_release (release_id: ${releaseId}). Quorum: ${quorumRule} (${quorumNeeded}/${members.length}).`
+  );
+
+  return {
+    data: {
+      release_id: releaseId,
+      quorum_rule: quorumRule,
+      members_count: members.length,
+      status: "open",
+    },
+  };
+});
+
+function handleProposeRelease(body: ProposeReleaseRequest): BrokerResponse {
+  const authErr = requireSecret(body.peer_id, body.peer_secret);
+  if (authErr) return err(authErr);
+
+  if (!body.pool_name || !body.target_peer_id) {
+    return err("pool_name and target_peer_id are required");
+  }
+
+  const pool = getPoolByName(body.pool_name);
+  if (!pool || pool.status !== "active") return err("pool not found or not active");
+
+  const releaseId = genId(PEER_ID_LENGTH);
+  const result = proposeReleaseTx(releaseId, body, pool);
+  if ("error" in result) return err(result.error as string);
+  return ok(result.data);
+}
+
+const voteReleaseTx = db.transaction((body: VoteReleaseRequest) => {
+  const release = db.query(
+    "SELECT * FROM pool_releases WHERE id = ?"
+  ).get(body.release_id) as any;
+  if (!release) return { error: "release proposal not found" };
+  if (release.status !== "open") return { error: `proposal is already ${release.status}` };
+
+  // Validate voter is in the frozen eligible voter set
+  const eligibleVoters: string[] = JSON.parse(release.eligible_voters || "[]");
+  if (eligibleVoters.length > 0 && !eligibleVoters.includes(body.peer_id)) {
+    return { error: "not eligible to vote on this proposal" };
+  }
+
+  const existingVote = db.query(
+    "SELECT vote FROM release_votes WHERE release_id = ? AND voter_peer_id = ?"
+  ).get(body.release_id, body.peer_id) as { vote: string } | null;
+  if (existingVote) return { error: "already voted on this proposal" };
+
+  const ts = now();
+  db.query(
+    "INSERT INTO release_votes (release_id, voter_peer_id, vote, cast_at) VALUES (?, ?, ?, ?)"
+  ).run(body.release_id, body.peer_id, body.vote, ts);
+
+  const votes = db.query(
+    "SELECT vote, COUNT(*) as cnt FROM release_votes WHERE release_id = ? GROUP BY vote"
+  ).all(body.release_id) as { vote: string; cnt: number }[];
+
+  const yesCount = votes.find((v) => v.vote === "yes")?.cnt ?? 0;
+  const noCount = votes.find((v) => v.vote === "no")?.cnt ?? 0;
+
+  // Use frozen quorum from proposal creation
+  const quorumNeeded = release.quorum_needed;
+  const totalEligible = eligibleVoters.length;
+
+  let finalStatus = "open";
+
+  if (yesCount >= quorumNeeded) {
+    finalStatus = "approved";
+    db.query("UPDATE pool_releases SET status = 'approved', resolved_at = ? WHERE id = ?").run(ts, body.release_id);
+
+    const targetPeer = db.query("SELECT name FROM peers WHERE id = ?").get(release.target_peer_id) as { name: string } | null;
+    insertSystemMessageTyped(
+      release.pool_id,
+      "release_approved",
+      `Release approved for ${targetPeer?.name ?? release.target_peer_id}. You are free to leave the pool and stop your cron job.`,
+      release.target_peer_id
+    );
+    insertSystemMessageTyped(
+      release.pool_id,
+      "release_notify",
+      `Release approved: ${targetPeer?.name ?? release.target_peer_id} has been released from the pool.`,
+      undefined,
+      release.target_peer_id
+    );
+  } else if (noCount > totalEligible - quorumNeeded) {
+    finalStatus = "rejected";
+    db.query("UPDATE pool_releases SET status = 'rejected', resolved_at = ? WHERE id = ?").run(ts, body.release_id);
+
+    const targetPeer = db.query("SELECT name FROM peers WHERE id = ?").get(release.target_peer_id) as { name: string } | null;
+    insertSystemMessageTyped(
+      release.pool_id,
+      "release_rejected",
+      `Release rejected for ${targetPeer?.name ?? release.target_peer_id}. Not enough votes to reach quorum.`
+    );
+  }
+
+  return {
+    data: {
+      voted: true,
+      status: finalStatus,
+      yes_count: yesCount,
+      no_count: noCount,
+      quorum_needed: quorumNeeded,
+    },
+  };
+});
+
+function handleVoteRelease(body: VoteReleaseRequest): BrokerResponse {
+  const authErr = requireSecret(body.peer_id, body.peer_secret);
+  if (authErr) return err(authErr);
+
+  if (!body.release_id || !body.vote) return err("release_id and vote are required");
+  if (body.vote !== "yes" && body.vote !== "no") return err("vote must be 'yes' or 'no'");
+
+  const result = voteReleaseTx(body);
+  if ("error" in result) return err(result.error as string);
+  return ok(result.data);
+}
+
+function handleReleaseStatus(body: ReleaseStatusRequest): BrokerResponse {
+  const pool = getPoolByName(body.pool_name);
+  if (!pool) return err("pool not found");
+
+  const releases = db.query(
+    `SELECT pr.*, pe_target.name as target_name, pe_proposer.name as proposer_name
+     FROM pool_releases pr
+     LEFT JOIN peers pe_target ON pr.target_peer_id = pe_target.id
+     LEFT JOIN peers pe_proposer ON pr.proposed_by = pe_proposer.id
+     WHERE pr.pool_id = ?
+     ORDER BY pr.created_at DESC`
+  ).all(pool.id) as any[];
+
+  const proposals = releases.map((r: any) => {
+    const votes = db.query(
+      "SELECT vote, COUNT(*) as cnt FROM release_votes WHERE release_id = ? GROUP BY vote"
+    ).all(r.id) as { vote: string; cnt: number }[];
+
+    return {
+      id: r.id,
+      target_peer_name: r.target_name ?? r.target_peer_id,
+      target_peer_id: r.target_peer_id,
+      proposed_by_name: r.proposer_name ?? r.proposed_by,
+      reason: r.reason,
+      status: r.status,
+      quorum_rule: r.quorum_rule,
+      yes_count: votes.find((v) => v.vote === "yes")?.cnt ?? 0,
+      no_count: votes.find((v) => v.vote === "no")?.cnt ?? 0,
+      quorum_needed: r.quorum_needed,
+      created_at: r.created_at,
+    };
+  });
+
+  return ok({ proposals });
+}
+
+// --- Busy signaling handlers ---
+
+const setBusyTx = db.transaction((poolId: string, peerId: string, busyUntil: string, reason: string, minutes: number) => {
+  db.query(
+    "UPDATE pool_members SET busy_until = ?, busy_reason = ? WHERE pool_id = ? AND peer_id = ?"
+  ).run(busyUntil, reason, poolId, peerId);
+
+  const peer = db.query("SELECT name FROM peers WHERE id = ?").get(peerId) as { name: string } | null;
+  const reasonText = reason ? `: ${reason}` : "";
+  insertSystemMessageTyped(
+    poolId,
+    "busy_signal",
+    `${peer?.name ?? peerId} is busy (~${minutes} min)${reasonText}. Consider reducing polling frequency.`,
+    undefined,
+    peerId
+  );
+});
+
+function handleSetBusy(body: SetBusyRequest): BrokerResponse {
+  const authErr = requireSecret(body.peer_id, body.peer_secret);
+  if (authErr) return err(authErr);
+
+  if (!body.pool_name || !body.minutes) return err("pool_name and minutes are required");
+
+  const pool = getPoolByName(body.pool_name);
+  if (!pool || pool.status !== "active") return err("pool not found or not active");
+
+  const membership = db.query(
+    "SELECT peer_id FROM pool_members WHERE pool_id = ? AND peer_id = ? AND status = 'active'"
+  ).get(pool.id, body.peer_id);
+  if (!membership) return err("not a member of this pool");
+
+  const busyUntil = new Date(Date.now() + body.minutes * 60_000).toISOString();
+  const reason = body.reason ?? "";
+  setBusyTx(pool.id, body.peer_id, busyUntil, reason, body.minutes);
+
+  return ok({ busy_until: busyUntil, reason });
+}
+
+const setReadyTx = db.transaction((poolId: string, peerId: string) => {
+  db.query(
+    "UPDATE pool_members SET busy_until = NULL, busy_reason = '' WHERE pool_id = ? AND peer_id = ?"
+  ).run(poolId, peerId);
+
+  const peer = db.query("SELECT name FROM peers WHERE id = ?").get(peerId) as { name: string } | null;
+  insertSystemMessageTyped(
+    poolId,
+    "ready_signal",
+    `${peer?.name ?? peerId} is available again. Resume normal polling.`,
+    undefined,
+    peerId
+  );
+});
+
+function handleSetReady(body: SetReadyRequest): BrokerResponse {
+  const authErr = requireSecret(body.peer_id, body.peer_secret);
+  if (authErr) return err(authErr);
+
+  if (!body.pool_name) return err("pool_name is required");
+
+  const pool = getPoolByName(body.pool_name);
+  if (!pool || pool.status !== "active") return err("pool not found or not active");
+
+  const membership = db.query(
+    "SELECT busy_until FROM pool_members WHERE pool_id = ? AND peer_id = ? AND status = 'active'"
+  ).get(pool.id, body.peer_id) as { busy_until: string | null } | null;
+  if (!membership) return err("not a member of this pool");
+
+  setReadyTx(pool.id, body.peer_id);
+
+  return ok({ ready: true });
+}
+
+function handleGetBusyPeers(body: { pool_name: string }): BrokerResponse {
+  const pool = getPoolByName(body.pool_name);
+  if (!pool) return err("pool not found");
+
+  const busy = db.query(
+    `SELECT pm.peer_id, pe.name as peer_name, pm.busy_until, pm.busy_reason
+     FROM pool_members pm JOIN peers pe ON pm.peer_id = pe.id
+     WHERE pm.pool_id = ? AND pm.status = 'active' AND pm.busy_until IS NOT NULL
+       AND datetime(pm.busy_until) > datetime('now')`
+  ).all(pool.id) as any[];
+
+  return ok(busy);
+}
+
 // --- Service handlers ---
 
 function handleServiceRegister(body: { id: string; name: string; type: string; url?: string; metadata?: string }): BrokerResponse {
@@ -945,6 +1326,15 @@ function cleanupStalePeers(): void {
   db.query(
     "UPDATE services SET status = 'down' WHERE status != 'down' AND datetime(last_health) < datetime('now', '-60 seconds')"
   ).run();
+
+  // Expire stale open release proposals (>1 hour old)
+  const staleReleases = db.query(
+    "SELECT id, pool_id FROM pool_releases WHERE status = 'open' AND datetime(created_at) < datetime('now', '-1 hour')"
+  ).all() as { id: string; pool_id: string }[];
+  for (const r of staleReleases) {
+    db.query("UPDATE pool_releases SET status = 'expired', resolved_at = ? WHERE id = ?").run(now(), r.id);
+    insertSystemMessage(r.pool_id, "Release proposal expired (no quorum reached within 1 hour).");
+  }
 }
 
 const staleInterval = setInterval(cleanupStalePeers, STALE_CHECK_INTERVAL_MS);
@@ -975,6 +1365,12 @@ const routes: Record<string, RouteHandler> = {
   "POST /message/send-cli": handleMessageSendCli,
   "POST /message/history": handleMessageHistory,
   "POST /pool/update-metadata": handlePoolUpdateMetadata,
+  "POST /pool/propose-release": handleProposeRelease,
+  "POST /pool/vote-release": handleVoteRelease,
+  "POST /pool/release-status": handleReleaseStatus,
+  "POST /pool/set-busy": handleSetBusy,
+  "POST /pool/set-ready": handleSetReady,
+  "POST /pool/busy-peers": handleGetBusyPeers,
   "POST /service/register": handleServiceRegister,
   "POST /service/heartbeat": handleServiceHeartbeat,
   "POST /message/unread-count": handleUnreadCount,
