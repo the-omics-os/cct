@@ -524,7 +524,7 @@ const poolInviteTx = db.transaction((pool: any, body: PoolInviteRequest, target:
   }
 
   const inviter = db.query("SELECT name FROM peers WHERE id = ?").get(body.peer_id) as { name: string } | null;
-  insertSystemMessage(pool.id, `You were added to pool ${pool.name} by ${inviter?.name ?? body.peer_id}.`, body.target_peer_id);
+  insertSystemMessageTyped(pool.id, "pool_invite", `You were added to pool ${pool.name} by ${inviter?.name ?? body.peer_id}.`, body.target_peer_id);
   insertSystemMessage(pool.id, `${target.name} joined the pool.`, undefined, body.target_peer_id);
   return null;
 });
@@ -904,7 +904,7 @@ function handlePoolInviteCli(body: { target_peer_id: string; pool_name: string }
     ).run(pool.id, body.target_peer_id, ts);
   }
 
-  insertSystemMessage(pool.id, `You were added to pool ${pool.name} by CLI.`, body.target_peer_id);
+  insertSystemMessageTyped(pool.id, "pool_invite", `You were added to pool ${pool.name} by CLI.`, body.target_peer_id);
   insertSystemMessage(pool.id, `${target.name} joined the pool.`, undefined, body.target_peer_id);
 
   return ok({ invited: true, pool_id: pool.id });

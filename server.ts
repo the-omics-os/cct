@@ -193,6 +193,11 @@ function deleteFlag(): void {
 let pollFailures = 0;
 
 async function pollUnread(): Promise<void> {
+  // Skip flag writes while deferred ack is pending — handleCheckMessages owns
+  // the flag during that window. Without this guard, pollUnread overwrites the
+  // adjusted count with the raw DB count, causing the hook to block incorrectly.
+  if (pendingAckIds.length > 0) return;
+
   try {
     const res = await brokerPost<UnreadCountResponse>("/message/unread-count", { peer_id: myId });
     if (res.ok && res.data) {
@@ -294,7 +299,7 @@ async function handleCheckMessages(): Promise<string> {
 
     output = `${messages.length} message(s):\n\n${lines.join("\n")}`;
 
-    if (messages.some((m: any) => m.from_id === "system" && typeof m.body === "string" && m.body.startsWith("You were added to pool"))) {
+    if (messages.some((m: any) => m.msg_type === "pool_invite")) {
       output += `\n\n🚨 ACTION REQUIRED: You were added to a pool. You MUST set up message polling NOW or you will miss all future messages.\nRun CronCreate with cron "*/1 * * * *" and prompt "Call the cct_check_messages tool to check for incoming peer messages. If there are any, read and respond to them."\nThis is not optional — without it you are deaf to messages when idle.`;
     }
 
@@ -844,6 +849,16 @@ POOL LIFECYCLE — follow this exactly:
   const cleanup = async () => {
     if (pollInterval) clearInterval(pollInterval);
     if (heartbeatInterval) clearInterval(heartbeatInterval);
+    if (pendingAckIds.length > 0) {
+      try {
+        await brokerPost("/message/read", {
+          peer_id: myId,
+          peer_secret: mySecret,
+          message_ids: pendingAckIds,
+        });
+      } catch {}
+      pendingAckIds = [];
+    }
     try {
       await brokerPost("/unregister", { peer_id: myId, peer_secret: mySecret });
     } catch {}
