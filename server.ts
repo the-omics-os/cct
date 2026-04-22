@@ -275,7 +275,7 @@ async function handleCheckMessages(): Promise<string> {
     return "No unread messages.";
   }
 
-  const { messages, unread, busy_peers } = res.data as any;
+  const { messages, unread, pool_throttles } = res.data as any;
 
   // Step 3: Stash IDs for deferred ack on the next call.
   pendingAckIds = messages.map((m: any) => m.message_id);
@@ -307,20 +307,20 @@ async function handleCheckMessages(): Promise<string> {
       output += `\n\n🎯 ACTION REQUIRED: You have been released from the pool. Please:\n1. Call cct_leave_pool for the pool\n2. If you have no other pools, cancel your CCT cron via CronList + CronDelete`;
     }
 
-    if (messages.some((m: any) => m.msg_type === "busy_signal")) {
-      output += `\n\n⏳ SUGGESTION: A peer is busy with a long task. To save resources, swap your polling cron:\n1. CronDelete your current */1 cron\n2. CronCreate with */5 * * * * and the same prompt\nSwap back to */1 when you see the "available again" message.`;
+    if (messages.some((m: any) => m.msg_type === "pool_idle")) {
+      output += `\n\n⏳ ACTION REQUIRED: Pool throttle activated — a peer is deep-working. Swap your polling cron to save tokens:\n1. CronDelete your current */1 cron\n2. CronCreate with */5 * * * * and the same prompt\nThe throttle will auto-clear when someone sends a message, the setter finishes, or the timer expires.`;
     }
 
-    if (messages.some((m: any) => m.msg_type === "ready_signal")) {
-      output += `\n\n✅ SUGGESTION: A peer is available again. If you slowed your polling, swap back:\n1. CronDelete your current */5 cron\n2. CronCreate with */1 * * * * and the same prompt`;
+    if (messages.some((m: any) => m.msg_type === "pool_active")) {
+      output += `\n\n✅ ACTION REQUIRED: Pool throttle cleared — resume normal polling:\n1. CronDelete your current */5 cron\n2. CronCreate with */1 * * * * and the same prompt`;
     }
   }
 
-  if (busy_peers && busy_peers.length > 0) {
-    const bLines = busy_peers.map((b: any) =>
-      `  - ${b.peer_name} in ${b.pool_name}: busy until ${b.busy_until}${b.busy_reason ? ` (${b.busy_reason})` : ""}`
+  if (pool_throttles && pool_throttles.length > 0) {
+    const tLines = pool_throttles.map((t: any) =>
+      `  - Pool "${t.pool_name}": throttled by ${t.set_by_peer_name} until ${t.idle_until}${t.reason ? ` (${t.reason})` : ""}`
     );
-    output += `\n\nCurrently busy peers:\n${bLines.join("\n")}`;
+    output += `\n\nActive pool throttles:\n${tLines.join("\n")}`;
   }
 
   return output;
@@ -533,26 +533,40 @@ async function handleVoteRelease(args: { release_id: string; vote: "yes" | "no" 
   return `Vote cast: ${args.vote}. Current tally: ${d.yes_count} yes, ${d.no_count} no (need ${d.quorum_needed} for quorum).`;
 }
 
-async function handleSetBusy(args: { pool_name: string; minutes: number; reason?: string }): Promise<string> {
-  const res = await brokerPost("/pool/set-busy", {
+async function handleSetPoolIdle(args: { pool_name: string; minutes: number; reason?: string; force?: boolean }): Promise<string> {
+  const res = await brokerPost<{ approved: boolean; idle_until?: string; activity?: any }>("/pool/set-idle", {
     peer_id: myId,
     peer_secret: mySecret,
     pool_name: args.pool_name,
     minutes: args.minutes,
     reason: args.reason ?? "",
+    force: args.force ?? false,
   });
   if (!res.ok) return `Failed: ${res.error}`;
-  return `Busy status set for ~${args.minutes} min in pool "${args.pool_name}"${args.reason ? `: ${args.reason}` : ""}. Other peers have been notified to reduce polling. Call cct_set_ready when done.`;
+  const d = res.data!;
+  if (!d.approved) {
+    const act = d.activity;
+    let detail = `Pool throttle rejected: other members are actively discussing.`;
+    if (act) {
+      detail += `\n  Recent chat messages: ${act.recent_chat_count}`;
+      detail += `\n  Active senders: ${act.recent_distinct_senders.join(", ")}`;
+      detail += `\n  Window: last ${act.window_minutes} min`;
+      if (act.unread_from_others > 0) detail += `\n  Unread from others: ${act.unread_from_others}`;
+    }
+    detail += `\nUse force=true to override this check.`;
+    return detail;
+  }
+  return `Pool "${args.pool_name}" throttled for ~${args.minutes} min${args.reason ? `: ${args.reason}` : ""}. Idle until ${d.idle_until}. Other peers notified to reduce polling. Call cct_clear_pool_idle when done.`;
 }
 
-async function handleSetReady(args: { pool_name: string }): Promise<string> {
-  const res = await brokerPost("/pool/set-ready", {
+async function handleClearPoolIdle(args: { pool_name: string }): Promise<string> {
+  const res = await brokerPost("/pool/clear-idle", {
     peer_id: myId,
     peer_secret: mySecret,
     pool_name: args.pool_name,
   });
   if (!res.ok) return `Failed: ${res.error}`;
-  return `Ready status restored in pool "${args.pool_name}". Other peers have been notified to resume normal polling.`;
+  return `Pool throttle cleared for "${args.pool_name}". Other peers notified to resume normal polling.`;
 }
 
 // --- MCP server setup ---
@@ -752,21 +766,22 @@ POOL LIFECYCLE — follow this exactly:
         },
       },
       {
-        name: "cct_set_busy",
-        description: "Signal that you will be busy for N minutes (e.g., running a long task). Other peers are notified to reduce their polling frequency.",
+        name: "cct_set_pool_idle",
+        description: "Request pool throttle for deep work. Broker checks if other members are actively discussing — if so, the request is rejected (use force to override). Other peers are told to swap to */5 polling. Auto-clears on: TTL expiry, you leave/disconnect, or another peer sends a message.",
         inputSchema: {
           type: "object" as const,
           properties: {
-            pool_name: { type: "string", description: "Name of the pool" },
-            minutes: { type: "number", description: "Estimated minutes you will be busy" },
+            pool_name: { type: "string", description: "Name of the pool to throttle" },
+            minutes: { type: "number", description: "Estimated minutes of deep work (max 120)" },
             reason: { type: "string", description: "What you are doing (e.g., 'running full test suite')" },
+            force: { type: "boolean", description: "Override the activity check (use sparingly)" },
           },
           required: ["pool_name", "minutes"],
         },
       },
       {
-        name: "cct_set_ready",
-        description: "Clear busy status and notify other peers to resume normal polling.",
+        name: "cct_clear_pool_idle",
+        description: "Clear pool throttle early and notify peers to resume */1 polling. Only the setter can clear.",
         inputSchema: {
           type: "object" as const,
           properties: {
@@ -823,11 +838,11 @@ POOL LIFECYCLE — follow this exactly:
         case "cct_vote_release":
           text = await handleVoteRelease(args as { release_id: string; vote: "yes" | "no" });
           break;
-        case "cct_set_busy":
-          text = await handleSetBusy(args as { pool_name: string; minutes: number; reason?: string });
+        case "cct_set_pool_idle":
+          text = await handleSetPoolIdle(args as { pool_name: string; minutes: number; reason?: string; force?: boolean });
           break;
-        case "cct_set_ready":
-          text = await handleSetReady(args as { pool_name: string });
+        case "cct_clear_pool_idle":
+          text = await handleClearPoolIdle(args as { pool_name: string });
           break;
         default:
           text = `Unknown tool: ${name}`;

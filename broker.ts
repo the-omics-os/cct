@@ -170,6 +170,16 @@ try { db.exec("ALTER TABLE pool_members ADD COLUMN busy_reason TEXT NOT NULL DEF
 try { db.exec("ALTER TABLE pool_releases ADD COLUMN quorum_needed INTEGER NOT NULL DEFAULT 0"); } catch {}
 try { db.exec("ALTER TABLE pool_releases ADD COLUMN eligible_voters TEXT NOT NULL DEFAULT '[]'"); } catch {}
 
+db.exec(`
+CREATE TABLE IF NOT EXISTS pool_throttles (
+  pool_id        TEXT PRIMARY KEY REFERENCES pools(id) ON DELETE CASCADE,
+  set_by_peer_id TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE,
+  idle_until     TEXT NOT NULL,
+  reason         TEXT NOT NULL DEFAULT '',
+  created_at     TEXT NOT NULL
+)
+`);
+
 // --- Helpers ---
 
 function genId(len: number): string {
@@ -260,6 +270,15 @@ function archivePoolIfEmpty(poolId: string): void {
   }
 }
 
+// --- Pool throttle helpers ---
+
+function clearPoolThrottleWithNotify(poolId: string, reason: string): void {
+  const deleted = db.query("DELETE FROM pool_throttles WHERE pool_id = ?").run(poolId);
+  if (deleted.changes > 0) {
+    insertSystemMessageTyped(poolId, "pool_active", `Pool throttle cleared: ${reason}. Resume normal polling.`);
+  }
+}
+
 // --- Endpoint handlers ---
 
 function handleHealth(): BrokerResponse {
@@ -330,6 +349,7 @@ const markPeerDeadTx = db.transaction((peerId: string) => {
       "UPDATE pool_members SET status = 'left', left_at = ? WHERE pool_id = ? AND peer_id = ?"
     ).run(now(), pool_id, peerId);
     insertSystemMessage(pool_id, `Peer ${peer?.name ?? peerId} (${peer?.cwd ?? "unknown"}) disconnected.`);
+    db.query("DELETE FROM pool_throttles WHERE pool_id = ? AND set_by_peer_id = ?").run(pool_id, peerId);
     archivePoolIfEmpty(pool_id);
   }
 });
@@ -488,6 +508,7 @@ const poolLeaveTx = db.transaction((pool: any, peerId: string) => {
 
   const peer = db.query("SELECT name FROM peers WHERE id = ?").get(peerId) as { name: string } | null;
   insertSystemMessage(pool.id, `${peer?.name ?? peerId} left the pool.`);
+  db.query("DELETE FROM pool_throttles WHERE pool_id = ? AND set_by_peer_id = ?").run(pool.id, peerId);
   archivePoolIfEmpty(pool.id);
   return null;
 });
@@ -637,6 +658,29 @@ const messageSendPoolTx = db.transaction((poolId: string, fromId: string, body: 
     recipientCount = members.length;
   }
 
+  // Auto-clear pool throttle if a non-setter sends a chat message
+  if (msgType === "chat") {
+    const throttle = db.query(
+      "SELECT set_by_peer_id FROM pool_throttles WHERE pool_id = ? AND datetime(idle_until) > datetime('now')"
+    ).get(poolId) as { set_by_peer_id: string } | null;
+    if (throttle && fromId !== throttle.set_by_peer_id && fromId !== "system" && fromId !== "cli") {
+      db.query("DELETE FROM pool_throttles WHERE pool_id = ?").run(poolId);
+      const senderPeer = db.query("SELECT name FROM peers WHERE id = ?").get(fromId) as { name: string } | null;
+      // Inline system message (we're already inside a transaction)
+      const clearSeq = getNextSeq(poolId);
+      const clearResult = db.query(
+        "INSERT INTO messages (pool_id, from_id, body, msg_type, seq, created_at) VALUES (?, 'system', ?, 'pool_active', ?, ?)"
+      ).run(poolId, `Pool throttle auto-cleared: ${senderPeer?.name ?? fromId} sent a message. Resume normal polling.`, clearSeq, ts);
+      const clearMsgId = Number(clearResult.lastInsertRowid);
+      const clearMembers = db.query(
+        "SELECT peer_id FROM pool_members WHERE pool_id = ? AND status = 'active'"
+      ).all(poolId) as { peer_id: string }[];
+      for (const cm of clearMembers) {
+        db.query("INSERT INTO message_recipients (message_id, peer_id) VALUES (?, ?)").run(clearMsgId, cm.peer_id);
+      }
+    }
+  }
+
   return { message_id: msgId, seq, recipient_count: recipientCount };
 });
 
@@ -765,18 +809,19 @@ const messageCheckTx = db.transaction((peerId: string) => {
   const myPools = db.query(
     "SELECT pool_id FROM pool_members WHERE peer_id = ? AND status = 'active'"
   ).all(peerId) as { pool_id: string }[];
-  const busyPeers: any[] = [];
+  const poolThrottles: any[] = [];
   for (const { pool_id } of myPools) {
-    const busy = db.query(
-      `SELECT pm.peer_id, pe.name as peer_name, pm.busy_until, pm.busy_reason, po.name as pool_name
-       FROM pool_members pm JOIN peers pe ON pm.peer_id = pe.id JOIN pools po ON pm.pool_id = po.id
-       WHERE pm.pool_id = ? AND pm.status = 'active' AND pm.busy_until IS NOT NULL
-         AND datetime(pm.busy_until) > datetime('now') AND pm.peer_id != ?`
-    ).all(pool_id, peerId) as any[];
-    busyPeers.push(...busy);
+    const throttle = db.query(
+      `SELECT pt.pool_id, po.name as pool_name, pt.set_by_peer_id, pe.name as set_by_peer_name, pt.idle_until, pt.reason
+       FROM pool_throttles pt
+       JOIN pools po ON pt.pool_id = po.id
+       JOIN peers pe ON pt.set_by_peer_id = pe.id
+       WHERE pt.pool_id = ? AND datetime(pt.idle_until) > datetime('now')`
+    ).get(pool_id) as any;
+    if (throttle) poolThrottles.push(throttle);
   }
 
-  return { messages, unread: { total: remainingTotal, by_pool: remaining }, busy_peers: busyPeers };
+  return { messages, unread: { total: remainingTotal, by_pool: remaining }, busy_peers: [], pool_throttles: poolThrottles };
 });
 
 function handleMessageCheck(body: { peer_id: string; peer_secret: string }): BrokerResponse {
@@ -816,18 +861,19 @@ const messagePeekTx = db.transaction((peerId: string) => {
   const myPools = db.query(
     "SELECT pool_id FROM pool_members WHERE peer_id = ? AND status = 'active'"
   ).all(peerId) as { pool_id: string }[];
-  const busyPeers: any[] = [];
+  const poolThrottles: any[] = [];
   for (const { pool_id } of myPools) {
-    const busy = db.query(
-      `SELECT pm.peer_id, pe.name as peer_name, pm.busy_until, pm.busy_reason, po.name as pool_name
-       FROM pool_members pm JOIN peers pe ON pm.peer_id = pe.id JOIN pools po ON pm.pool_id = po.id
-       WHERE pm.pool_id = ? AND pm.status = 'active' AND pm.busy_until IS NOT NULL
-         AND datetime(pm.busy_until) > datetime('now') AND pm.peer_id != ?`
-    ).all(pool_id, peerId) as any[];
-    busyPeers.push(...busy);
+    const throttle = db.query(
+      `SELECT pt.pool_id, po.name as pool_name, pt.set_by_peer_id, pe.name as set_by_peer_name, pt.idle_until, pt.reason
+       FROM pool_throttles pt
+       JOIN pools po ON pt.pool_id = po.id
+       JOIN peers pe ON pt.set_by_peer_id = pe.id
+       WHERE pt.pool_id = ? AND datetime(pt.idle_until) > datetime('now')`
+    ).get(pool_id) as any;
+    if (throttle) poolThrottles.push(throttle);
   }
 
-  return { messages, unread: { total: unreadTotal, by_pool: unreadByPool }, busy_peers: busyPeers };
+  return { messages, unread: { total: unreadTotal, by_pool: unreadByPool }, busy_peers: [], pool_throttles: poolThrottles };
 });
 
 function handleMessagePeek(body: { peer_id: string; peer_secret: string }): BrokerResponse {
@@ -1213,25 +1259,73 @@ function handleReleaseStatus(body: ReleaseStatusRequest): BrokerResponse {
   return ok({ proposals });
 }
 
-// --- Busy signaling handlers ---
+// --- Pool throttle handlers ---
 
-const setBusyTx = db.transaction((poolId: string, peerId: string, busyUntil: string, reason: string, minutes: number) => {
+const setPoolIdleTx = db.transaction((poolId: string, peerId: string, minutes: number, reason: string, force: boolean) => {
+  const members = db.query(
+    "SELECT peer_id FROM pool_members WHERE pool_id = ? AND status = 'active'"
+  ).all(poolId) as { peer_id: string }[];
+
+  const isMember = members.some((m) => m.peer_id === peerId);
+  if (!isMember) return { error: "not a member of this pool" };
+
+  const others = members.filter((m) => m.peer_id !== peerId);
+
+  if (others.length > 1 && !force) {
+    const recentSenders = db.query(
+      `SELECT DISTINCT from_id FROM messages
+       WHERE pool_id = ? AND from_id != ? AND from_id != 'system' AND from_id != 'cli'
+         AND msg_type = 'chat'
+         AND datetime(created_at) > datetime('now', '-5 minutes')`
+    ).all(poolId, peerId) as { from_id: string }[];
+
+    const unreadFromOthers = db.query(
+      `SELECT COUNT(*) as cnt FROM message_recipients mr
+       JOIN messages m ON mr.message_id = m.id
+       WHERE m.pool_id = ? AND m.from_id != ? AND m.from_id != 'system' AND m.from_id != 'cli'
+         AND m.msg_type = 'chat' AND mr.read_at IS NULL`
+    ).get(poolId, peerId) as { cnt: number };
+
+    if (recentSenders.length >= 2 || unreadFromOthers.cnt > 0) {
+      const senderNames = recentSenders.map((s) => {
+        const p = db.query("SELECT name FROM peers WHERE id = ?").get(s.from_id) as { name: string } | null;
+        return p?.name ?? s.from_id;
+      });
+      return {
+        data: {
+          approved: false,
+          activity: {
+            recent_chat_count: recentSenders.length,
+            recent_distinct_senders: senderNames,
+            window_minutes: 5,
+            unread_from_others: unreadFromOthers.cnt,
+          },
+        },
+      };
+    }
+  }
+
+  const idleUntil = new Date(Date.now() + Math.min(minutes, 120) * 60_000).toISOString();
+  const ts = now();
+
   db.query(
-    "UPDATE pool_members SET busy_until = ?, busy_reason = ? WHERE pool_id = ? AND peer_id = ?"
-  ).run(busyUntil, reason, poolId, peerId);
+    "INSERT OR REPLACE INTO pool_throttles (pool_id, set_by_peer_id, idle_until, reason, created_at) VALUES (?, ?, ?, ?, ?)"
+  ).run(poolId, peerId, idleUntil, reason, ts);
 
   const peer = db.query("SELECT name FROM peers WHERE id = ?").get(peerId) as { name: string } | null;
   const reasonText = reason ? `: ${reason}` : "";
   insertSystemMessageTyped(
     poolId,
-    "busy_signal",
-    `${peer?.name ?? peerId} is busy (~${minutes} min)${reasonText}. Consider reducing polling frequency.`,
+    "pool_idle",
+    `${peer?.name ?? peerId} set pool idle (~${minutes} min)${reasonText}. Reduce polling to save tokens.`,
     undefined,
     peerId
   );
+
+  return { data: { approved: true, idle_until: idleUntil, reason } };
 });
 
-function handleSetBusy(body: SetBusyRequest): BrokerResponse {
+function handleSetPoolIdle(body: { peer_id: string; peer_secret: string; pool_name: string; minutes: number; reason?: string; force?: boolean }): BrokerResponse {
   const authErr = requireSecret(body.peer_id, body.peer_secret);
   if (authErr) return err(authErr);
 
@@ -1240,34 +1334,32 @@ function handleSetBusy(body: SetBusyRequest): BrokerResponse {
   const pool = getPoolByName(body.pool_name);
   if (!pool || pool.status !== "active") return err("pool not found or not active");
 
-  const membership = db.query(
-    "SELECT peer_id FROM pool_members WHERE pool_id = ? AND peer_id = ? AND status = 'active'"
-  ).get(pool.id, body.peer_id);
-  if (!membership) return err("not a member of this pool");
-
-  const busyUntil = new Date(Date.now() + body.minutes * 60_000).toISOString();
-  const reason = body.reason ?? "";
-  setBusyTx(pool.id, body.peer_id, busyUntil, reason, body.minutes);
-
-  return ok({ busy_until: busyUntil, reason });
+  const result = setPoolIdleTx(pool.id, body.peer_id, body.minutes, body.reason ?? "", body.force ?? false);
+  if ("error" in result) return err(result.error as string);
+  return ok(result.data);
 }
 
-const setReadyTx = db.transaction((poolId: string, peerId: string) => {
-  db.query(
-    "UPDATE pool_members SET busy_until = NULL, busy_reason = '' WHERE pool_id = ? AND peer_id = ?"
-  ).run(poolId, peerId);
+const clearPoolIdleTx = db.transaction((poolId: string, peerId: string) => {
+  const throttle = db.query(
+    "SELECT set_by_peer_id FROM pool_throttles WHERE pool_id = ?"
+  ).get(poolId) as { set_by_peer_id: string } | null;
+
+  if (!throttle) return "no active throttle on this pool";
+  if (throttle.set_by_peer_id !== peerId) return "only the setter can clear the throttle";
+
+  db.query("DELETE FROM pool_throttles WHERE pool_id = ?").run(poolId);
 
   const peer = db.query("SELECT name FROM peers WHERE id = ?").get(peerId) as { name: string } | null;
   insertSystemMessageTyped(
     poolId,
-    "ready_signal",
-    `${peer?.name ?? peerId} is available again. Resume normal polling.`,
-    undefined,
-    peerId
+    "pool_active",
+    `${peer?.name ?? peerId} cleared the pool throttle. Resume normal polling.`
   );
+
+  return null;
 });
 
-function handleSetReady(body: SetReadyRequest): BrokerResponse {
+function handleClearPoolIdle(body: { peer_id: string; peer_secret: string; pool_name: string }): BrokerResponse {
   const authErr = requireSecret(body.peer_id, body.peer_secret);
   if (authErr) return err(authErr);
 
@@ -1276,28 +1368,24 @@ function handleSetReady(body: SetReadyRequest): BrokerResponse {
   const pool = getPoolByName(body.pool_name);
   if (!pool || pool.status !== "active") return err("pool not found or not active");
 
-  const membership = db.query(
-    "SELECT busy_until FROM pool_members WHERE pool_id = ? AND peer_id = ? AND status = 'active'"
-  ).get(pool.id, body.peer_id) as { busy_until: string | null } | null;
-  if (!membership) return err("not a member of this pool");
+  const txErr = clearPoolIdleTx(pool.id, body.peer_id);
+  if (txErr) return err(txErr);
 
-  setReadyTx(pool.id, body.peer_id);
-
-  return ok({ ready: true });
+  return ok({ cleared: true });
 }
 
-function handleGetBusyPeers(body: { pool_name: string }): BrokerResponse {
-  const pool = getPoolByName(body.pool_name);
-  if (!pool) return err("pool not found");
+// --- Deprecated busy signaling (returns errors pointing to new endpoints) ---
 
-  const busy = db.query(
-    `SELECT pm.peer_id, pe.name as peer_name, pm.busy_until, pm.busy_reason
-     FROM pool_members pm JOIN peers pe ON pm.peer_id = pe.id
-     WHERE pm.pool_id = ? AND pm.status = 'active' AND pm.busy_until IS NOT NULL
-       AND datetime(pm.busy_until) > datetime('now')`
-  ).all(pool.id) as any[];
+function handleSetBusy(_body: SetBusyRequest): BrokerResponse {
+  return err("deprecated: use POST /pool/set-idle instead");
+}
 
-  return ok(busy);
+function handleSetReady(_body: SetReadyRequest): BrokerResponse {
+  return err("deprecated: use POST /pool/clear-idle instead");
+}
+
+function handleGetBusyPeers(_body: { pool_name: string }): BrokerResponse {
+  return err("deprecated: pool throttle info is now included in /message/check and /message/peek responses");
 }
 
 // --- Service handlers ---
@@ -1386,6 +1474,9 @@ function cleanupStalePeers(): void {
     db.query("UPDATE pool_releases SET status = 'expired', resolved_at = ? WHERE id = ?").run(now(), r.id);
     insertSystemMessage(r.pool_id, "Release proposal expired (no quorum reached within 1 hour).");
   }
+
+  // Clean up expired pool throttles
+  db.query("DELETE FROM pool_throttles WHERE datetime(idle_until) <= datetime('now')").run();
 }
 
 const staleInterval = setInterval(cleanupStalePeers, STALE_CHECK_INTERVAL_MS);
@@ -1420,6 +1511,8 @@ const routes: Record<string, RouteHandler> = {
   "POST /pool/propose-release": handleProposeRelease,
   "POST /pool/vote-release": handleVoteRelease,
   "POST /pool/release-status": handleReleaseStatus,
+  "POST /pool/set-idle": handleSetPoolIdle,
+  "POST /pool/clear-idle": handleClearPoolIdle,
   "POST /pool/set-busy": handleSetBusy,
   "POST /pool/set-ready": handleSetReady,
   "POST /pool/busy-peers": handleGetBusyPeers,

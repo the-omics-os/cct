@@ -307,8 +307,9 @@ export interface ReleaseStatusResponse {
   }[];
 }
 
-// --- Busy signaling types ---
+// --- Busy signaling types (deprecated — use pool throttle) ---
 
+/** @deprecated Use SetPoolIdleRequest */
 export interface SetBusyRequest {
   peer_id: string;
   peer_secret: string;
@@ -317,17 +318,57 @@ export interface SetBusyRequest {
   reason?: string;
 }
 
+/** @deprecated Use ClearPoolIdleRequest */
 export interface SetReadyRequest {
   peer_id: string;
   peer_secret: string;
   pool_name: string;
 }
 
+/** @deprecated Use PoolThrottleInfo */
 export interface BusyPeerInfo {
   peer_id: string;
   peer_name: string;
   busy_until: string;
   busy_reason: string;
+}
+
+// --- Pool throttle types ---
+
+export interface SetPoolIdleRequest {
+  peer_id: string;
+  peer_secret: string;
+  pool_name: string;
+  minutes: number;
+  reason?: string;
+  force?: boolean;
+}
+
+export interface SetPoolIdleResponse {
+  approved: boolean;
+  idle_until?: string;
+  reason?: string;
+  activity?: {
+    recent_chat_count: number;
+    recent_distinct_senders: string[];
+    window_minutes: number;
+    unread_from_others: number;
+  };
+}
+
+export interface ClearPoolIdleRequest {
+  peer_id: string;
+  peer_secret: string;
+  pool_name: string;
+}
+
+export interface PoolThrottleInfo {
+  pool_id: string;
+  pool_name: string;
+  set_by_peer_id: string;
+  set_by_peer_name: string;
+  idle_until: string;
+  reason: string;
 }
 
 // --- Health ---

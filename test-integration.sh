@@ -452,49 +452,67 @@ check "Rejection after 2 no votes (quorum impossible)" "rejected" "$VOTE_REJ_STA
 # --- Busy signaling ---
 
 echo ""
-echo "=== Busy signaling ==="
+echo "=== Pool throttle ==="
 
 # Clear messages first
 post "/message/check" "{\"peer_id\":\"$PEER_A2_ID\",\"peer_secret\":\"$PEER_A2_SECRET\"}" > /dev/null
 post "/message/check" "{\"peer_id\":\"$PEER_B_ID\",\"peer_secret\":\"$PEER_B_SECRET\"}" > /dev/null
 post "/message/check" "{\"peer_id\":\"$PEER_C_ID\",\"peer_secret\":\"$PEER_C_SECRET\"}" > /dev/null
 
-# A sets busy
-BUSY_RES=$(post "/pool/set-busy" "{\"peer_id\":\"$PEER_A2_ID\",\"peer_secret\":\"$PEER_A2_SECRET\",\"pool_name\":\"majority-pool\",\"minutes\":10,\"reason\":\"running tests\"}")
-BUSY_OK=$(json_field "$BUSY_RES" "['ok']")
-check "Set busy succeeded" "True" "$BUSY_OK"
-check_contains "Busy response has busy_until" "busy_until" "$BUSY_RES"
+# A sets pool idle (should auto-approve — no recent cross-talk)
+IDLE_RES=$(post "/pool/set-idle" "{\"peer_id\":\"$PEER_A2_ID\",\"peer_secret\":\"$PEER_A2_SECRET\",\"pool_name\":\"majority-pool\",\"minutes\":10,\"reason\":\"running tests\"}")
+IDLE_OK=$(json_field "$IDLE_RES" "['ok']")
+check "Set pool idle succeeded" "True" "$IDLE_OK"
+check_contains "Idle response has idle_until" "idle_until" "$IDLE_RES"
+check_contains "Idle response approved" "approved" "$IDLE_RES"
 
-# B should get busy notification
+# B should get pool_idle notification
 BMSG2=$(post "/message/check" "{\"peer_id\":\"$PEER_B_ID\",\"peer_secret\":\"$PEER_B_SECRET\"}")
-check_contains "B received busy notification" "is busy" "$(json_field "$BMSG2" "['data']")"
+check_contains "B received pool_idle notification" "set pool idle" "$(json_field "$BMSG2" "['data']")"
 
-# Check busy-peers endpoint
-BUSY_PEERS=$(post "/pool/busy-peers" "{\"pool_name\":\"majority-pool\"}")
-check_contains "Busy peers shows A2" "peer-alpha2" "$BUSY_PEERS"
-
-# Message check should include busy peers
+# Message check should include pool_throttles
 CMSG=$(post "/message/check" "{\"peer_id\":\"$PEER_C_ID\",\"peer_secret\":\"$PEER_C_SECRET\"}")
-check_contains "Message check includes busy peers" "busy_peers" "$CMSG"
+check_contains "Message check includes pool_throttles" "pool_throttles" "$CMSG"
 
-# A sets ready
-READY_RES=$(post "/pool/set-ready" "{\"peer_id\":\"$PEER_A2_ID\",\"peer_secret\":\"$PEER_A2_SECRET\",\"pool_name\":\"majority-pool\"}")
-READY_OK=$(json_field "$READY_RES" "['ok']")
-check "Set ready succeeded" "True" "$READY_OK"
+# B sends a chat — should auto-clear the throttle
+post "/message/send" "{\"peer_id\":\"$PEER_B_ID\",\"peer_secret\":\"$PEER_B_SECRET\",\"pool_name\":\"majority-pool\",\"body\":\"hey everyone\"}" > /dev/null
 
-# B should get ready notification
+# After auto-clear, peek should show pool_active
+PEEK_AFTER=$(post "/message/peek" "{\"peer_id\":\"$PEER_C_ID\",\"peer_secret\":\"$PEER_C_SECRET\"}")
+check_contains "Peek shows pool_active after auto-clear" "pool_active" "$PEEK_AFTER"
+
+# Clear messages for next tests
+post "/message/check" "{\"peer_id\":\"$PEER_A2_ID\",\"peer_secret\":\"$PEER_A2_SECRET\"}" > /dev/null
+post "/message/check" "{\"peer_id\":\"$PEER_B_ID\",\"peer_secret\":\"$PEER_B_SECRET\"}" > /dev/null
+post "/message/check" "{\"peer_id\":\"$PEER_C_ID\",\"peer_secret\":\"$PEER_C_SECRET\"}" > /dev/null
+
+# A sets idle again, then clears explicitly
+IDLE_RES2=$(post "/pool/set-idle" "{\"peer_id\":\"$PEER_A2_ID\",\"peer_secret\":\"$PEER_A2_SECRET\",\"pool_name\":\"majority-pool\",\"minutes\":5,\"reason\":\"second round\"}")
+check "Second set-idle succeeded" "True" "$(json_field "$IDLE_RES2" "['ok']")"
+
+CLEAR_RES=$(post "/pool/clear-idle" "{\"peer_id\":\"$PEER_A2_ID\",\"peer_secret\":\"$PEER_A2_SECRET\",\"pool_name\":\"majority-pool\"}")
+check "Clear idle succeeded" "True" "$(json_field "$CLEAR_RES" "['ok']")"
+
+# B should get pool_active notification
 BMSG3=$(post "/message/check" "{\"peer_id\":\"$PEER_B_ID\",\"peer_secret\":\"$PEER_B_SECRET\"}")
-check_contains "B received ready notification" "available again" "$(json_field "$BMSG3" "['data']")"
+check_contains "B received pool_active notification" "Resume normal polling" "$(json_field "$BMSG3" "['data']")"
 
-# Busy peers should be empty now
-BUSY_PEERS2=$(post "/pool/busy-peers" "{\"pool_name\":\"majority-pool\"}")
-BUSY_COUNT=$(json_field "$BUSY_PEERS2" "['data']" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "0")
-check "No busy peers after set-ready" "0" "$BUSY_COUNT"
+# Non-setter cannot clear
+post "/message/check" "{\"peer_id\":\"$PEER_A2_ID\",\"peer_secret\":\"$PEER_A2_SECRET\"}" > /dev/null
+post "/message/check" "{\"peer_id\":\"$PEER_B_ID\",\"peer_secret\":\"$PEER_B_SECRET\"}" > /dev/null
+post "/message/check" "{\"peer_id\":\"$PEER_C_ID\",\"peer_secret\":\"$PEER_C_SECRET\"}" > /dev/null
+IDLE_RES3=$(post "/pool/set-idle" "{\"peer_id\":\"$PEER_A2_ID\",\"peer_secret\":\"$PEER_A2_SECRET\",\"pool_name\":\"majority-pool\",\"minutes\":5}")
+CLEAR_FAIL=$(post "/pool/clear-idle" "{\"peer_id\":\"$PEER_B_ID\",\"peer_secret\":\"$PEER_B_SECRET\",\"pool_name\":\"majority-pool\"}")
+check_contains "Non-setter clear-idle rejected" "only the setter" "$CLEAR_FAIL"
 
-# --- Non-member busy/ready should fail ---
+# Clean up throttle for next tests
+post "/pool/clear-idle" "{\"peer_id\":\"$PEER_A2_ID\",\"peer_secret\":\"$PEER_A2_SECRET\",\"pool_name\":\"majority-pool\"}" > /dev/null
+post "/message/check" "{\"peer_id\":\"$PEER_A2_ID\",\"peer_secret\":\"$PEER_A2_SECRET\"}" > /dev/null
+post "/message/check" "{\"peer_id\":\"$PEER_B_ID\",\"peer_secret\":\"$PEER_B_SECRET\"}" > /dev/null
+post "/message/check" "{\"peer_id\":\"$PEER_C_ID\",\"peer_secret\":\"$PEER_C_SECRET\"}" > /dev/null
 
 echo ""
-echo "=== Busy signaling edge cases ==="
+echo "=== Pool throttle edge cases ==="
 
 sleep 300 &
 SLEEP_PIDS+=($!)
@@ -504,11 +522,15 @@ REG_D=$(post "/register" "{\"pid\":$PID_D,\"pid_start\":\"$(date +%s)\",\"cwd\":
 PEER_D_ID=$(json_field "$REG_D" "['data']['id']")
 PEER_D_SECRET=$(json_field "$REG_D" "['data']['secret']")
 
-BUSY_FAIL=$(post "/pool/set-busy" "{\"peer_id\":\"$PEER_D_ID\",\"peer_secret\":\"$PEER_D_SECRET\",\"pool_name\":\"majority-pool\",\"minutes\":5}")
-check_contains "Non-member set-busy rejected" "not a member" "$BUSY_FAIL"
+IDLE_FAIL=$(post "/pool/set-idle" "{\"peer_id\":\"$PEER_D_ID\",\"peer_secret\":\"$PEER_D_SECRET\",\"pool_name\":\"majority-pool\",\"minutes\":5}")
+check_contains "Non-member set-idle rejected" "not a member" "$IDLE_FAIL"
 
-READY_FAIL=$(post "/pool/set-ready" "{\"peer_id\":\"$PEER_D_ID\",\"peer_secret\":\"$PEER_D_SECRET\",\"pool_name\":\"majority-pool\"}")
-check_contains "Non-member set-ready rejected" "not a member" "$READY_FAIL"
+# Deprecated endpoints return errors
+BUSY_DEP=$(post "/pool/set-busy" "{\"peer_id\":\"$PEER_A2_ID\",\"peer_secret\":\"$PEER_A2_SECRET\",\"pool_name\":\"majority-pool\",\"minutes\":5}")
+check_contains "set-busy returns deprecated" "deprecated" "$BUSY_DEP"
+
+READY_DEP=$(post "/pool/set-ready" "{\"peer_id\":\"$PEER_A2_ID\",\"peer_secret\":\"$PEER_A2_SECRET\",\"pool_name\":\"majority-pool\"}")
+check_contains "set-ready returns deprecated" "deprecated" "$READY_DEP"
 
 # Propose release by non-member should fail
 PROPOSE_FAIL=$(post "/pool/propose-release" "{\"peer_id\":\"$PEER_D_ID\",\"peer_secret\":\"$PEER_D_SECRET\",\"pool_name\":\"majority-pool\",\"target_peer_id\":\"$PEER_B_ID\"}")

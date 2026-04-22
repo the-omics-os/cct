@@ -85,11 +85,11 @@ cct install                           # propagates config to MCP env vars
 
 **Stale peer cleanup on LAN:** The broker can't check remote PIDs, so it uses heartbeat age. Peers not seen for 3× the heartbeat interval (45s) are marked dead. Local peers are also cleaned up via PID check after 1× heartbeat interval.
 
-## MCP Tools (11)
+## MCP Tools (15)
 
 | Tool | Description |
 |------|-------------|
-| `cct_check_messages` | Atomic read: polls + marks read in one transaction. Updates flag. |
+| `cct_check_messages` | Deferred-ack read: peeks unread messages, acks previous batch. Updates flag. |
 | `cct_send_message` | `@pool` = broadcast, `@pool/peer` = directed pool msg, `peer` = DM |
 | `cct_list_peers` | All peers with name, cwd, branch, summary, pool memberships |
 | `cct_list_pools` | All active pools with members and purpose |
@@ -100,16 +100,20 @@ cct install                           # propagates config to MCP env vars
 | `cct_set_summary` | Update this peer's work summary |
 | `cct_pool_status` | Detailed pool info: members, roles, metadata, recent activity |
 | `cct_list_services` | List registered infrastructure services (CCP, etc.) |
+| `cct_propose_release` | Propose releasing a peer. Starts democratic vote. |
+| `cct_vote_release` | Vote yes/no on release proposal. |
+| `cct_set_pool_idle` | Request pool throttle for deep work. Broker validates pool activity. |
+| `cct_clear_pool_idle` | Clear pool throttle (setter only). Auto-clears on expiry/leave/new-chat. |
 
 ## Project Structure
 
 ```
 cct/
-  broker.ts           HTTP broker + SQLite (26 endpoints, 6 tables, transactions)
-  server.ts           MCP stdio server (11 tools, polling, heartbeat, auto-broker-launch)
+  broker.ts           HTTP broker + SQLite (29 endpoints, 7 tables, transactions)
+  server.ts           MCP stdio server (15 tools, polling, heartbeat, deferred ack, auto-broker-launch)
   cli.ts              CLI (15 commands, no ephemeral peers, uses CLI-specific endpoints)
   hook.sh             PreToolUse hook (pure bash, <10ms, per-pool breakdown, stale detection)
-  test-integration.sh Integration tests (39 tests)
+  test-integration.sh Integration tests (70 tests, isolated on port 17888)
   shared/
     types.ts          TypeScript interfaces
     constants.ts      Ports, paths, timeouts
@@ -121,8 +125,8 @@ cct/
 ## Broker Endpoints
 
 **Peers:** `/register`, `/heartbeat`, `/unregister`, `/set-summary`, `/list-peers`
-**Pools:** `/pool/create`, `/pool/join`, `/pool/leave`, `/pool/invite`, `/pool/list`, `/pool/members`, `/pool/status`, `/pool/update-metadata`
-**Messages:** `/message/send`, `/message/poll`, `/message/read`, `/message/check` (atomic), `/message/peek` (read-only), `/message/unread-count`
+**Pools:** `/pool/create`, `/pool/join`, `/pool/leave`, `/pool/invite`, `/pool/list`, `/pool/members`, `/pool/status`, `/pool/update-metadata`, `/pool/set-idle`, `/pool/clear-idle`
+**Messages:** `/message/send`, `/message/poll`, `/message/read`, `/message/check` (atomic), `/message/peek` (read-only, deferred ack), `/message/unread-count`
 **CLI (no auth):** `/pool/create-cli`, `/pool/invite-cli`, `/message/send-cli`, `/message/history`
 **Services (no auth):** `/service/register`, `/service/heartbeat`, `GET /services`
 **System:** `GET /health`
