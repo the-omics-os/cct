@@ -17,6 +17,11 @@
     "typescript": "^5"
   },
   "devDependencies": {
-    "@types/bun": "latest"
+    "@types/node": "^22",
+    "tsx": "^4.0.0"
+  },
+  "scripts": {
+    "start": "npx tsx broker.ts",
+    "typecheck": "tsc --noEmit"
   }
 }

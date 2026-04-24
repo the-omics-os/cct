@@ -227,6 +227,6 @@ CCT is part of a three-tool ecosystem for Claude Code agent infrastructure. Each
 ## Dependencies
 
 - `@modelcontextprotocol/sdk` — MCP server framework
-- `bun:sqlite` — Database (Bun built-in)
-- `Bun.serve()` — HTTP server (Bun built-in)
+- `node:sqlite` — Database (Node.js built-in, zero deps)
+- Runtime: Node.js 22+ with `tsx` (TypeScript execution)
 - No external API dependencies

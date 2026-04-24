@@ -1,4 +1,5 @@
 import { basename } from "node:path";
+import { spawnSync } from "node:child_process";
 
 export async function generateSummary(cwd: string): Promise<string> {
   let gitRoot = cwd;
@@ -6,33 +7,18 @@ export async function generateSummary(cwd: string): Promise<string> {
   const recentFiles: string[] = [];
 
   try {
-    const rootProc = Bun.spawn(["git", "rev-parse", "--show-toplevel"], {
-      cwd,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const rootOut = await new Response(rootProc.stdout).text();
-    if (rootOut.trim()) gitRoot = rootOut.trim();
+    const out = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd }).stdout?.toString().trim() ?? "";
+    if (out) gitRoot = out;
   } catch {}
 
   try {
-    const branchProc = Bun.spawn(["git", "rev-parse", "--abbrev-ref", "HEAD"], {
-      cwd,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const branchOut = await new Response(branchProc.stdout).text();
-    if (branchOut.trim()) branch = branchOut.trim();
+    const out = spawnSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd }).stdout?.toString().trim() ?? "";
+    if (out) branch = out;
   } catch {}
 
   try {
-    const diffProc = Bun.spawn(["git", "diff", "--name-only", "HEAD~3"], {
-      cwd,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const diffOut = await new Response(diffProc.stdout).text();
-    for (const line of diffOut.trim().split("\n")) {
+    const out = spawnSync("git", ["diff", "--name-only", "HEAD~3"], { cwd }).stdout?.toString().trim() ?? "";
+    for (const line of out.split("\n")) {
       if (line.trim() && recentFiles.length < 3) {
         recentFiles.push(line.trim());
       }

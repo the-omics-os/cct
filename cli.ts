@@ -1,7 +1,9 @@
-#!/usr/bin/env bun
+#!/usr/bin/env tsx
 import { existsSync, readFileSync, writeFileSync, chmodSync, mkdirSync, copyFileSync } from "node:fs";
 import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
+import { spawn as nodeSpawn, spawnSync } from "node:child_process";
 import {
   BROKER_PORT,
   BROKER_BIND_HOST,
@@ -19,7 +21,7 @@ import type {
   MessageSendResponse,
 } from "./shared/types.ts";
 
-const CCT_DIR = join(import.meta.dir);
+const CCT_DIR = dirname(fileURLToPath(import.meta.url));
 const SERVER_PATH = join(CCT_DIR, "server.ts");
 const HOOK_PATH = join(CCT_DIR, "hook.sh");
 const BROKER_PATH = join(CCT_DIR, "broker.ts");
@@ -330,11 +332,12 @@ async function cmdStart() {
     console.log("Broker is already running.");
     return;
   }
-  const proc = Bun.spawn(["bun", BROKER_PATH], {
+  const proc = nodeSpawn("npx", ["tsx", BROKER_PATH], {
     stdio: ["ignore", "ignore", "inherit"],
+    detached: true,
   });
   proc.unref();
-  await Bun.sleep(500);
+  await new Promise(r => setTimeout(r, 500));
   if (await brokerIsRunning()) {
     console.log("Broker started on localhost.");
   } else {
@@ -367,12 +370,13 @@ async function cmdLanStart(args: string[]) {
   }
 
   const env = { ...process.env, CCT_HOST: "0.0.0.0", CCT_TOKEN: token };
-  const proc = Bun.spawn(["bun", BROKER_PATH], {
+  const proc = nodeSpawn("npx", ["tsx", BROKER_PATH], {
     stdio: ["ignore", "ignore", "inherit"],
     env,
+    detached: true,
   });
   proc.unref();
-  await Bun.sleep(500);
+  await new Promise(r => setTimeout(r, 500));
   if (await brokerIsRunning()) {
     let ip = "0.0.0.0";
     try {
@@ -444,8 +448,8 @@ async function cmdKill() {
     die("Can't kill a remote broker. Stop it on the host machine.");
   }
   try {
-    const proc = Bun.spawnSync(["lsof", "-ti", `:${BROKER_PORT}`]);
-    const output = proc.stdout.toString().trim();
+    const proc = spawnSync("lsof", ["-ti", `:${BROKER_PORT}`]);
+    const output = proc.stdout?.toString().trim() ?? "";
     if (!output) {
       console.log(`No process found on port ${BROKER_PORT}.`);
       return;
@@ -453,8 +457,8 @@ async function cmdKill() {
     const pids = output.split("\n").map((s) => parseInt(s.trim(), 10)).filter(Boolean);
     let killed = 0;
     for (const pid of pids) {
-      const ps = Bun.spawnSync(["ps", "-o", "command=", "-p", String(pid)]);
-      const cmd = ps.stdout.toString().trim();
+      const ps = spawnSync("ps", ["-o", "command=", "-p", String(pid)]);
+      const cmd = ps.stdout?.toString().trim() ?? "";
       if (cmd.includes("broker.ts") || cmd.includes("cct")) {
         process.kill(pid, "SIGTERM");
         killed++;
@@ -490,8 +494,8 @@ async function cmdInstall() {
   if (!claudeJson.mcpServers) claudeJson.mcpServers = {};
   claudeJson.mcpServers.cct = {
     type: "stdio",
-    command: "bun",
-    args: [SERVER_PATH],
+    command: "npx",
+    args: ["tsx", SERVER_PATH],
     env: mcpEnv,
   };
   writeJsonFile(CLAUDE_JSON, claudeJson);

@@ -87,7 +87,7 @@ sleep 0.3
 
 mkdir -p "$CCT_DIR"
 
-CCT_TOKEN="" CCT_PORT="$BROKER_PORT" CCT_DIR="$CCT_DIR" bun "$BROKER_TS" &
+CCT_TOKEN="" CCT_PORT="$BROKER_PORT" CCT_DIR="$CCT_DIR" npx tsx "$BROKER_TS" &
 BROKER_PID=$!
 sleep 1
 

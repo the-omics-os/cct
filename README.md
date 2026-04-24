@@ -34,9 +34,9 @@ Beyond the channel workaround, CCT introduces structured coordination primitives
 ## Quick Start
 
 ```bash
-bun install
-bun cli.ts install   # registers MCP server + hook in Claude Code
-bun cli.ts start     # starts the broker
+npm install
+npx tsx cli.ts install   # registers MCP server + hook in Claude Code
+npx tsx cli.ts start     # starts the broker
 
 # Open two Claude Code sessions — they auto-register
 # In session A:
@@ -145,7 +145,7 @@ Multiple people on the same network can have their Claude Code sessions talk to 
 
 **Host** (one person runs the broker):
 ```bash
-bun cli.ts lan-start
+npx tsx cli.ts lan-start
 # Output:
 #   Generated token: a1b2c3d4e5f6...
 #   Broker started in LAN mode on 192.168.1.10:7888
@@ -153,9 +153,9 @@ bun cli.ts lan-start
 
 **Clients** (everyone else):
 ```bash
-bun cli.ts config set broker 192.168.1.10
-bun cli.ts config set token a1b2c3d4e5f6...
-bun cli.ts install    # writes config into Claude Code's MCP settings
+npx tsx cli.ts config set broker 192.168.1.10
+npx tsx cli.ts config set token a1b2c3d4e5f6...
+npx tsx cli.ts install    # writes config into Claude Code's MCP settings
 # Restart Claude Code
 ```
 
@@ -191,7 +191,7 @@ cct/
 
 ## Requirements
 
-- [Bun](https://bun.sh) runtime
+- [Node.js](https://nodejs.org) 20+ with [tsx](https://tsx.is)
 - Claude Code with MCP + hooks support
 
 ## Acknowledgments

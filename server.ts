@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env tsx
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -6,6 +6,7 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { mkdirSync, existsSync, writeFileSync, unlinkSync, readFileSync, renameSync, chmodSync, statSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
 import { basename, join } from "node:path";
 import {
   BROKER_URL,
@@ -80,10 +81,9 @@ async function ensureBroker(): Promise<void> {
   }
 
   const brokerPath = new URL("./broker.ts", import.meta.url).pathname;
-  const child = Bun.spawn(["bun", brokerPath], {
-    stdout: "ignore",
-    stderr: "ignore",
-    stdin: "ignore",
+  const child = spawn("npx", ["tsx", brokerPath], {
+    stdio: "ignore",
+    detached: true,
   });
   child.unref();
 
@@ -121,8 +121,8 @@ function getPidStartForPid(pid: number): string {
     if (fields[21]) return fields[21];
   } catch {}
   try {
-    const proc = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)]);
-    const out = proc.stdout.toString().trim();
+    const proc = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)]);
+    const out = proc.stdout?.toString().trim() ?? "";
     if (out) return out.replace(/\s+/g, "_");
   } catch {}
   return String(Date.now());
@@ -138,23 +138,15 @@ async function getGitInfo(cwd: string): Promise<{ gitRoot: string | null; gitBra
   let gitBranch: string | null = null;
 
   try {
-    const rootProc = Bun.spawn(["git", "rev-parse", "--show-toplevel"], {
-      cwd,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const out = await new Response(rootProc.stdout).text();
-    if (out.trim()) gitRoot = out.trim();
+    const rootProc = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd });
+    const out = rootProc.stdout?.toString().trim() ?? "";
+    if (out) gitRoot = out;
   } catch {}
 
   try {
-    const branchProc = Bun.spawn(["git", "rev-parse", "--abbrev-ref", "HEAD"], {
-      cwd,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const out = await new Response(branchProc.stdout).text();
-    if (out.trim()) gitBranch = out.trim();
+    const branchProc = spawnSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd });
+    const out2 = branchProc.stdout?.toString().trim() ?? "";
+    if (out2) gitBranch = out2;
   } catch {}
 
   return { gitRoot, gitBranch };
