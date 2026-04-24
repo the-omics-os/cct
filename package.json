@@ -1,5 +1,5 @@
 {
-  "name": "cct",
+  "name": "@omics-os/cct",
   "version": "0.1.0",
   "description": "Claude Code Talk — real-time inter-session communication for Claude Code",
   "author": "Kevin Yar <kevin.yar@omics-os.com>",
@@ -10,18 +10,31 @@
   },
   "keywords": ["claude-code", "mcp", "agent-communication", "multi-agent"],
   "type": "module",
+  "bin": {
+    "cct": "./bin/cct.mjs"
+  },
+  "files": [
+    "bin/",
+    "broker.ts",
+    "server.ts",
+    "cli.ts",
+    "hook.sh",
+    "shared/",
+    "LICENSE",
+    "README.md"
+  ],
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.27.1"
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "tsx": "^4.0.0"
   },
   "peerDependencies": {
     "typescript": "^5"
   },
   "devDependencies": {
-    "@types/node": "^22",
-    "tsx": "^4.0.0"
+    "@types/node": "^22"
   },
   "scripts": {
-    "start": "npx tsx broker.ts",
+    "start": "tsx broker.ts",
     "typecheck": "tsc --noEmit"
   }
 }

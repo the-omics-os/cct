@@ -129,7 +129,26 @@ function getPidStartForPid(pid: number): string {
 }
 
 const cachedPidStart = getPidStartForPid(process.pid);
-const cachedPpidStart = getPidStartForPid(process.ppid);
+
+// Walk up to find the Claude Code process (handles npx/tsx wrapper layers)
+function findClaudePid(): number {
+  let pid = process.ppid;
+  for (let i = 0; i < 5; i++) {
+    try {
+      const comm = spawnSync("ps", ["-o", "comm=", "-p", String(pid)]);
+      const name = comm.stdout?.toString().trim() ?? "";
+      if (name.endsWith("/claude") || name === "claude") return pid;
+      const ppid = spawnSync("ps", ["-o", "ppid=", "-p", String(pid)]);
+      const parent = parseInt(ppid.stdout?.toString().trim() ?? "", 10);
+      if (!parent || parent === 1) break;
+      pid = parent;
+    } catch { break; }
+  }
+  return process.ppid;
+}
+
+const claudePid = findClaudePid();
+const cachedPpidStart = getPidStartForPid(claudePid);
 
 // --- Get git info ---
 
@@ -154,7 +173,7 @@ async function getGitInfo(cwd: string): Promise<{ gitRoot: string | null; gitBra
 
 // --- Pidmap helpers ---
 
-const myPidmapPath = `${PIDMAP_DIR}/${process.ppid}_${cachedPpidStart}`;
+const myPidmapPath = `${PIDMAP_DIR}/${claudePid}_${cachedPpidStart}`;
 
 function writePidmap(): void {
   writeFileSync(myPidmapPath, myId, { mode: 0o600 });
