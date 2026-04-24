@@ -1,5 +1,5 @@
 {
-  "name": "@omics-os/cct",
+  "name": "@omicsos/cct",
   "version": "0.1.0",
   "description": "Claude Code Talk — real-time inter-session communication for Claude Code",
   "author": "Kevin Yar <kevin.yar@omics-os.com>",
