@@ -176,7 +176,7 @@ async function getGitInfo(cwd: string): Promise<{ gitRoot: string | null; gitBra
 const myPidmapPath = `${PIDMAP_DIR}/${claudePid}_${cachedPpidStart}`;
 
 function writePidmap(): void {
-  writeFileSync(myPidmapPath, myId, { mode: 0o600 });
+  writeFileSync(myPidmapPath, `${myId}|${myName}`, { mode: 0o600 });
 }
 
 function deletePidmap(): void {

@@ -908,6 +908,10 @@ function handleUnreadCount(body: UnreadCountRequest): BrokerResponse {
      JOIN messages m ON mr.message_id = m.id
      LEFT JOIN pools po ON m.pool_id = po.id
      WHERE mr.peer_id = ? AND mr.read_at IS NULL
+       AND (m.pool_id IS NULL OR EXISTS (
+         SELECT 1 FROM pool_members pm
+         WHERE pm.pool_id = m.pool_id AND pm.peer_id = mr.peer_id AND pm.status = 'active'
+       ))
      GROUP BY m.pool_id`
   ).all(body.peer_id) as { pool_id: string | null; pool_name: string | null; count: number }[];
 
