@@ -5,7 +5,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { mkdirSync, existsSync, writeFileSync, unlinkSync, readFileSync, renameSync, chmodSync, statSync } from "node:fs";
+import { mkdirSync, existsSync, writeFileSync, unlinkSync, readFileSync, readdirSync, renameSync, chmodSync, statSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { basename, join } from "node:path";
 import {
@@ -42,6 +42,9 @@ let mySecret = "";
 let myName = "";
 let pollInterval: ReturnType<typeof setInterval> | null = null;
 let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
+let parentMonitorInterval: ReturnType<typeof setInterval> | null = null;
+let idleCheckInterval: ReturnType<typeof setInterval> | null = null;
+let lastActivity = Date.now();
 
 // Deferred ack: message IDs returned by the last handleCheckMessages call.
 // These get acked at the START of the next call, so if the cron result is
@@ -112,6 +115,25 @@ function ensureDirs(): void {
   }
 }
 
+// --- Clean stale pidmaps and flags from dead sessions ---
+
+function cleanStalePidmaps(): void {
+  try {
+    const files = readdirSync(PIDMAP_DIR);
+    for (const f of files) {
+      const pid = parseInt(f.split("_")[0], 10);
+      if (!pid) { try { unlinkSync(join(PIDMAP_DIR, f)); } catch {} continue; }
+      const alive = spawnSync("kill", ["-0", String(pid)]);
+      if (alive.status !== 0) {
+        const content = readFileSync(join(PIDMAP_DIR, f), "utf-8");
+        const peerId = content.split("|")[0];
+        try { unlinkSync(join(PIDMAP_DIR, f)); } catch {}
+        if (peerId) try { unlinkSync(join(FLAGS_DIR, `${peerId}.unread`)); } catch {}
+      }
+    }
+  } catch {}
+}
+
 // --- Get process start time (cached, platform-correct) ---
 
 function getPidStartForPid(pid: number): string {
@@ -149,6 +171,15 @@ function findClaudePid(): number {
 
 const claudePid = findClaudePid();
 const cachedPpidStart = getPidStartForPid(claudePid);
+
+function isOriginalProcessAlive(pid: number, expectedStart: string): boolean {
+  try {
+    process.kill(pid, 0);
+  } catch {
+    return false;
+  }
+  return getPidStartForPid(pid) === expectedStart;
+}
 
 // --- Get git info ---
 
@@ -584,6 +615,7 @@ async function handleClearPoolIdle(args: { pool_name: string }): Promise<string>
 
 async function main() {
   ensureDirs();
+  cleanStalePidmaps();
   await ensureBroker();
 
   const peerNameEnv = process.env.CCT_PEER_NAME;
@@ -644,8 +676,9 @@ POOL LIFECYCLE — follow this exactly:
     { capabilities: { tools: {} }, instructions }
   );
 
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: [
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
+    lastActivity = Date.now();
+    return { tools: [
       {
         name: "cct_check_messages",
         description: `Check and read all unread messages (pools + DMs). Your peer ID: ${myId}, peer name: ${myName}`,
@@ -802,9 +835,10 @@ POOL LIFECYCLE — follow this exactly:
         },
       },
     ],
-  }));
+  }; });
 
   server.setRequestHandler(CallToolRequestSchema, async (req) => {
+    lastActivity = Date.now();
     const { name, arguments: args } = req.params;
     let text: string;
 
@@ -871,10 +905,26 @@ POOL LIFECYCLE — follow this exactly:
   pollInterval = setInterval(pollUnread, POLL_INTERVAL_MS);
   heartbeatInterval = setInterval(sendHeartbeat, HEARTBEAT_INTERVAL_MS);
 
-  // Cleanup on exit
+  // --- Idempotent cleanup with force-exit deadline ---
+
+  let cleanupStarted = false;
+
+  function requestCleanup(reason: string): void {
+    if (cleanupStarted) return;
+    cleanupStarted = true;
+    process.stderr.write(`CCT cleanup: ${reason}\n`);
+    void cleanup();
+  }
+
   const cleanup = async () => {
-    if (pollInterval) clearInterval(pollInterval);
-    if (heartbeatInterval) clearInterval(heartbeatInterval);
+    const forceExit = setTimeout(() => process.exit(0), 5_000);
+    forceExit.unref();
+
+    if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
+    if (heartbeatInterval) { clearInterval(heartbeatInterval); heartbeatInterval = null; }
+    if (parentMonitorInterval) { clearInterval(parentMonitorInterval); parentMonitorInterval = null; }
+    if (idleCheckInterval) { clearInterval(idleCheckInterval); idleCheckInterval = null; }
+
     if (pendingAckIds.length > 0) {
       try {
         await brokerPost("/message/read", {
@@ -893,11 +943,32 @@ POOL LIFECYCLE — follow this exactly:
     process.exit(0);
   };
 
-  process.on("SIGINT", cleanup);
-  process.on("SIGTERM", cleanup);
+  process.once("SIGINT", () => requestCleanup("SIGINT"));
+  process.once("SIGTERM", () => requestCleanup("SIGTERM"));
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
+
+  // Layer 1: stdin EOF/close — primary lifecycle signal
+  process.stdin.once("end", () => requestCleanup("stdin end"));
+  process.stdin.once("close", () => requestCleanup("stdin close"));
+
+  // Layer 2: parent death detection — backup (30s interval, PID start-time validated)
+  parentMonitorInterval = setInterval(() => {
+    if (!isOriginalProcessAlive(claudePid, cachedPpidStart)) {
+      requestCleanup("parent process exited");
+    }
+  }, 30_000);
+
+  // Layer 3: idle timeout — last-resort fuse, disabled by default
+  const idleTimeoutMs = Number(process.env.CCT_IDLE_TIMEOUT_MS ?? 0);
+  if (idleTimeoutMs > 0) {
+    idleCheckInterval = setInterval(() => {
+      if (Date.now() - lastActivity > idleTimeoutMs) {
+        requestCleanup(`idle timeout (${idleTimeoutMs}ms)`);
+      }
+    }, 60_000);
+  }
 }
 
 main().catch((e) => {

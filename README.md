@@ -167,17 +167,28 @@ All sessions across all machines see each other. Create a pool, invite peers, an
 | `CCT_PORT` | Broker port | `7888` |
 | `CCT_BROKER` | Broker URL to connect to | `192.168.1.10` |
 | `CCT_TOKEN` | Shared auth token | `a1b2c3d4e5f6...` |
+| `CCT_IDLE_TIMEOUT_MS` | Idle timeout fuse (0=disabled) | `28800000` (8h) |
 
 ## Architecture
 
 ```
 cct/
   broker.ts       HTTP broker + SQLite (32 endpoints, 8 tables)
-  server.ts       MCP stdio server (15 tools, polling, heartbeat)
+  server.ts       MCP stdio server (15 tools, polling, heartbeat, orphan prevention)
   cli.ts          Human CLI (15 commands, no ephemeral peers)
   hook.sh         Pure bash PreToolUse hook (<10ms, fail-open)
   shared/         Types, constants, git-based summary generator
 ```
+
+## Process Lifecycle
+
+MCP stdio servers are spawned per Claude Code session. Three layers prevent orphaned processes from accumulating:
+
+1. **stdin EOF/close** (instant) — when Claude Code exits, the pipe closes and the server self-terminates
+2. **Parent death monitor** (≤30s) — periodic PID check with start-time validation prevents false positives from PID reuse
+3. **Idle timeout** (optional) — set `CCT_IDLE_TIMEOUT_MS` for a last-resort fuse; disabled by default since sessions can run for days
+
+All cleanup is idempotent with a 5s force-exit deadline to prevent hanging on broker I/O.
 
 ## Security
 
@@ -188,6 +199,7 @@ cct/
 - Atomic flag writes (temp file + rename), stale flags ignored after 30s
 - Heartbeat-based cleanup for remote peers (45s timeout)
 - Release votes use frozen voter snapshots — membership changes can't manipulate quorum
+- Stale pidmaps from dead sessions cleaned on startup
 
 ## Requirements
 

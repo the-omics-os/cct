@@ -61,6 +61,7 @@ CCT supports cross-machine communication on a local network. One machine hosts t
 | Broker port | `CCT_PORT` | — | `7888` | all |
 | Broker connect URL | `CCT_BROKER` | `broker` | `http://127.0.0.1:7888` | server.ts, cli.ts |
 | Bearer token | `CCT_TOKEN` | `token` | (none) | all |
+| Idle timeout (ms) | `CCT_IDLE_TIMEOUT_MS` | — | `0` (disabled) | server.ts |
 
 **Host setup:**
 ```bash
@@ -110,7 +111,7 @@ cct install                           # propagates config to MCP env vars
 ```
 cct/
   broker.ts           HTTP broker + SQLite (29 endpoints, 7 tables, transactions)
-  server.ts           MCP stdio server (15 tools, polling, heartbeat, deferred ack, auto-broker-launch)
+  server.ts           MCP stdio server (15 tools, polling, heartbeat, deferred ack, auto-broker-launch, orphan prevention)
   cli.ts              CLI (15 commands, no ephemeral peers, uses CLI-specific endpoints)
   hook.sh             PreToolUse hook (pure bash, <10ms, per-pool breakdown, stale detection)
   test-integration.sh Integration tests (70 tests, isolated on port 17888)
@@ -174,6 +175,18 @@ CCT state is exposed in the Claude Code status line (`~/.claude/statusline.sh`):
 - Refreshes every 10s via `refreshInterval` setting
 - Graceful degradation: shows `CCT:off` if CCT not installed, `CCT:—` if no pidmap match
 
+## Process Lifecycle (Orphan Prevention)
+
+MCP stdio servers are spawned per Claude Code session. When sessions end, the server must self-terminate. Three layers ensure no orphaned processes accumulate:
+
+| Layer | Mechanism | Latency | Signal |
+|-------|-----------|---------|--------|
+| 1 | **stdin EOF/close** | Instant | Claude Code exits → pipe closes → `process.stdin.once('end'/'close')` |
+| 2 | **Parent death monitor** | ≤30s | `kill(claudePid, 0)` + PID start-time validation every 30s |
+| 3 | **Idle timeout** | Configurable | `CCT_IDLE_TIMEOUT_MS` env var, disabled by default (sessions can run for days) |
+
+All triggers route through `requestCleanup(reason)` — idempotent guard prevents double cleanup. A 5s force-exit deadline prevents hanging on broker I/O during cleanup. Cleanup unregisters from broker, clears pidmap/flag files, and exits.
+
 ## Rules
 
 1. **ARCHITECTURE.md is the source of truth** for design decisions.
@@ -210,19 +223,25 @@ See `.planning/ccp_handoff_requirements.md` for full integration spec.
 
 ## Sister Projects
 
-CCT is part of a three-tool ecosystem for Claude Code agent infrastructure. Each works independently but they collaborate when co-present.
+CCT is part of a five-tool ecosystem for Claude Code agent infrastructure. Each works independently but they collaborate when co-present.
 
 | Project | What | Port | Runtime Dir | Repo |
 |---------|------|------|-------------|------|
 | **CCT** (this) | Agent-to-agent messaging + service discovery | `:7888` | `~/.cct/` | `~/omics-os/cct/` |
-| **CCP** | Shared Playwright browser server | `:8931` | `~/.ccp/` | `~/omics-os/ccp/` |
+| **CCP** | Session-aware Playwright browser multiplexer | `:8931` | `~/.ccp/` | `~/omics-os/ccp/` |
+| **CCC** | Secure peer-to-peer protocol library (identity, signing, encryption) | — | `~/.ccc/` | `~/omics-os/ccc/` |
+| **CCI** | Browser → source code bridge (React component inspection, CCP plugin) | — (CCP plugin) | `~/.cci/` | `~/omics-os/cci/` |
 | **CCS** | Session + plan search CLI | — (no network) | `~/.cache/ccs/` | `~/omics-os/ccs/` |
 
 **CCT → CCP:** CCT provides the service registry that CCP registers with on startup. Agents discover CCP's health via `cct_list_services`. The `@browser` pool (created by agents, not CCP) enables browser testing coordination. CCP is a service, not a peer — it uses unauthenticated `/service/*` endpoints only.
 
+**CCT → CCC:** CCT uses CCC as its protocol library for cross-machine secure communication. CCC provides identity (ed25519 keypairs), signed envelopes, encrypted messages, pairing, and transport. Dependency direction: CCT → CCC (never reverse). CCC never imports CCT.
+
+**CCT → CCI (none):** CCI is a CCP plugin. CCT has no direct interaction with CCI. Agents could optionally broadcast CCI selections to a CCT pool, but this is not implemented.
+
 **CCT → CCS:** CCS can index CCT pool activity and message history for searchability. CCT's SQLite DB (`~/.cct/cct.db`) is a potential CCS data source. No integration exists yet — CCS currently indexes only `~/.claude/` sessions and plans.
 
-**Design rule:** CCT never depends on CCP or CCS. It provides infrastructure (messaging, service discovery) that others consume optionally.
+**Design rule:** CCT never depends on CCP, CCI, or CCS. It provides infrastructure (messaging, service discovery) that others consume optionally. CCT depends on CCC only for the cross-machine protocol layer.
 
 ## Dependencies
 
