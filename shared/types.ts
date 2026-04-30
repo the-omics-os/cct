@@ -196,10 +196,18 @@ export interface MessageCheckResponse {
   busy_peers: BusyPeerInfo[];
 }
 
+export interface StaleRecipientInfo {
+  peer_id: string;
+  peer_name: string;
+  last_seen: string;
+  age_seconds: number;
+}
+
 export interface MessageSendResponse {
   message_id: number;
   seq: number;
   recipient_count: number;
+  stale_recipients?: StaleRecipientInfo[];
 }
 
 export interface MessagePollRequest {

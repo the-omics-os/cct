@@ -660,14 +660,41 @@ const messageSendPoolTx = transaction((poolId: string, fromId: string, body: str
   const msgId = Number(result.lastInsertRowid);
 
   let recipientCount: number;
+  const staleRecipients: { peer_id: string; peer_name: string; last_seen: string; age_seconds: number }[] = [];
+  const staleThresholdMs = HEARTBEAT_INTERVAL_MS * 2;
+
   if (targetPeerId) {
+    const targetPeer = db.prepare("SELECT name, last_seen, status FROM peers WHERE id = ?").get(targetPeerId) as
+      { name: string; last_seen: string; status: string } | null;
+    if (targetPeer && (targetPeer.status === "dead" || Date.now() - new Date(targetPeer.last_seen).getTime() > staleThresholdMs)) {
+      staleRecipients.push({
+        peer_id: targetPeerId,
+        peer_name: targetPeer.name,
+        last_seen: targetPeer.last_seen,
+        age_seconds: Math.round((Date.now() - new Date(targetPeer.last_seen).getTime()) / 1000),
+      });
+    }
     db.prepare("INSERT INTO message_recipients (message_id, peer_id) VALUES (?, ?)").run(msgId, targetPeerId);
     recipientCount = 1;
   } else {
     const members = db.prepare(
-      "SELECT peer_id FROM pool_members WHERE pool_id = ? AND status = 'active' AND peer_id != ?"
-    ).all(poolId, fromId) as { peer_id: string }[];
+      `SELECT pm.peer_id, p.name, p.last_seen, p.status
+       FROM pool_members pm JOIN peers p ON pm.peer_id = p.id
+       WHERE pm.pool_id = ? AND pm.status = 'active' AND pm.peer_id != ?`
+    ).all(poolId, fromId) as { peer_id: string; name: string; last_seen: string; status: string }[];
+    let liveCount = 0;
     for (const m of members) {
+      const age = Date.now() - new Date(m.last_seen).getTime();
+      if (m.status === "dead" || age > staleThresholdMs) {
+        staleRecipients.push({
+          peer_id: m.peer_id,
+          peer_name: m.name,
+          last_seen: m.last_seen,
+          age_seconds: Math.round(age / 1000),
+        });
+      } else {
+        liveCount++;
+      }
       db.prepare("INSERT INTO message_recipients (message_id, peer_id) VALUES (?, ?)").run(msgId, m.peer_id);
     }
     recipientCount = members.length;
@@ -696,7 +723,12 @@ const messageSendPoolTx = transaction((poolId: string, fromId: string, body: str
     }
   }
 
-  return { message_id: msgId, seq, recipient_count: recipientCount };
+  return {
+    message_id: msgId,
+    seq,
+    recipient_count: recipientCount,
+    stale_recipients: staleRecipients.length > 0 ? staleRecipients : undefined,
+  };
 });
 
 const messageSendDmTx = transaction((fromId: string, toPeerId: string, body: string) => {
@@ -707,7 +739,21 @@ const messageSendDmTx = transaction((fromId: string, toPeerId: string, body: str
   ).run(fromId, body, seq, ts);
   const msgId = Number(result.lastInsertRowid);
   db.prepare("INSERT INTO message_recipients (message_id, peer_id) VALUES (?, ?)").run(msgId, toPeerId);
-  return { message_id: msgId, seq, recipient_count: 1 };
+
+  const targetPeer = db.prepare("SELECT name, last_seen, status FROM peers WHERE id = ?").get(toPeerId) as
+    { name: string; last_seen: string; status: string } | null;
+  const staleThresholdMs = HEARTBEAT_INTERVAL_MS * 2;
+  let staleRecipients: { peer_id: string; peer_name: string; last_seen: string; age_seconds: number }[] | undefined;
+  if (targetPeer && (targetPeer.status === "dead" || Date.now() - new Date(targetPeer.last_seen).getTime() > staleThresholdMs)) {
+    staleRecipients = [{
+      peer_id: toPeerId,
+      peer_name: targetPeer.name,
+      last_seen: targetPeer.last_seen,
+      age_seconds: Math.round((Date.now() - new Date(targetPeer.last_seen).getTime()) / 1000),
+    }];
+  }
+
+  return { message_id: msgId, seq, recipient_count: 1, stale_recipients: staleRecipients };
 });
 
 function handleMessageSend(body: MessageSendRequest): BrokerResponse {
@@ -1447,6 +1493,93 @@ function handleListServices(): BrokerResponse {
   return ok(services);
 }
 
+// --- Undelivered message bounce-back ---
+
+function bounceUndeliveredMessages(): void {
+  // Find unread messages sent to dead/stale peers older than 30s.
+  // Notify the sender once, then mark as read (so we don't re-bounce).
+  const undelivered = db.prepare(
+    `SELECT mr.message_id, mr.peer_id as recipient_id, m.from_id, m.pool_id, m.body, m.created_at,
+            pr.name as recipient_name, po.name as pool_name
+     FROM message_recipients mr
+     JOIN messages m ON mr.message_id = m.id
+     JOIN peers pr ON mr.peer_id = pr.id
+     LEFT JOIN pools po ON m.pool_id = po.id
+     WHERE mr.read_at IS NULL
+       AND pr.status = 'dead'
+       AND m.from_id != 'system'
+       AND m.from_id != 'cli'
+       AND datetime(m.created_at) < datetime('now', '-30 seconds')
+     ORDER BY m.created_at ASC
+     LIMIT 50`
+  ).all() as {
+    message_id: number;
+    recipient_id: string;
+    from_id: string;
+    pool_id: string | null;
+    body: string;
+    created_at: string;
+    recipient_name: string;
+    pool_name: string | null;
+  }[];
+
+  if (undelivered.length === 0) return;
+
+  // Group by sender to batch notifications
+  const bySender = new Map<string, typeof undelivered>();
+  for (const msg of undelivered) {
+    const existing = bySender.get(msg.from_id) ?? [];
+    existing.push(msg);
+    bySender.set(msg.from_id, existing);
+  }
+
+  const ts = now();
+  for (const [senderId, msgs] of bySender) {
+    // Check sender is still active (don't bounce to dead peers)
+    const sender = db.prepare("SELECT status FROM peers WHERE id = ?").get(senderId) as { status: string } | null;
+    if (!sender || sender.status !== "active") {
+      // Just mark as read to clean up
+      for (const msg of msgs) {
+        db.prepare("UPDATE message_recipients SET read_at = ? WHERE message_id = ? AND peer_id = ?")
+          .run(ts, msg.message_id, msg.recipient_id);
+      }
+      continue;
+    }
+
+    // Build bounce notification grouped by recipient
+    const byRecipient = new Map<string, { name: string; pool_name: string | null; count: number }>();
+    for (const msg of msgs) {
+      const key = msg.recipient_id;
+      const existing = byRecipient.get(key);
+      if (existing) {
+        existing.count++;
+      } else {
+        byRecipient.set(key, { name: msg.recipient_name, pool_name: msg.pool_name, count: 1 });
+      }
+    }
+
+    const details = Array.from(byRecipient.values())
+      .map((r) => `${r.name} (${r.count} msg${r.count > 1 ? "s" : ""}${r.pool_name ? ` in ${r.pool_name}` : ""})`)
+      .join(", ");
+
+    const bounceBody = `⚠️ UNDELIVERED: ${msgs.length} message(s) could not be delivered — recipient(s) disconnected: ${details}. These peers are offline and will NOT respond. Do not wait for replies from them.`;
+
+    // Send as DM to the sender
+    const seq = getNextSeq(null);
+    const result = db.prepare(
+      "INSERT INTO messages (pool_id, from_id, body, msg_type, seq, created_at) VALUES (NULL, 'system', ?, 'bounce', ?, ?)"
+    ).run(bounceBody, seq, ts);
+    const bounceMsgId = Number(result.lastInsertRowid);
+    db.prepare("INSERT INTO message_recipients (message_id, peer_id) VALUES (?, ?)").run(bounceMsgId, senderId);
+
+    // Mark original messages as read to prevent re-bouncing
+    for (const msg of msgs) {
+      db.prepare("UPDATE message_recipients SET read_at = ? WHERE message_id = ? AND peer_id = ?")
+        .run(ts, msg.message_id, msg.recipient_id);
+    }
+  }
+}
+
 // --- Stale peer cleanup ---
 
 function cleanupPeerArtifacts(peerId: string, pid: number): void {
@@ -1496,6 +1629,9 @@ function cleanupStalePeers(): void {
 
   // Clean up expired pool throttles
   db.prepare("DELETE FROM pool_throttles WHERE datetime(idle_until) <= datetime('now')").run();
+
+  // Bounce-back: notify senders of undelivered messages to dead peers
+  bounceUndeliveredMessages();
 }
 
 const staleInterval = setInterval(cleanupStalePeers, STALE_CHECK_INTERVAL_MS);

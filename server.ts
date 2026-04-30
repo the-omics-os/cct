@@ -368,6 +368,12 @@ async function handleCheckMessages(): Promise<string> {
   return output;
 }
 
+function formatStaleWarning(data: MessageSendResponse): string {
+  if (!data.stale_recipients || data.stale_recipients.length === 0) return "";
+  const names = data.stale_recipients.map((s) => `${s.peer_name} (last seen ${s.age_seconds}s ago)`);
+  return `\n\n⚠️ WARNING: ${data.stale_recipients.length} recipient(s) may be OFFLINE and unlikely to respond:\n${names.map((n) => `  - ${n}`).join("\n")}\nDo NOT wait for a reply from these peers. They may have disconnected (e.g., worktree agent finished). Consider proceeding without their input or checking cct_list_peers to confirm peer status.`;
+}
+
 async function handleSendMessage(args: { to: string; message: string }): Promise<string> {
   const { to, message } = args;
 
@@ -389,7 +395,7 @@ async function handleSendMessage(args: { to: string; message: string }): Promise
         body: message,
       });
       if (!res.ok) return `Failed to send: ${res.error}`;
-      return `Sent directed message in pool "${poolName}" to "${peerNameOrId}".`;
+      return `Sent directed message in pool "${poolName}" to "${peerNameOrId}".${formatStaleWarning(res.data!)}`;
     }
 
     const res = await brokerPost<MessageSendResponse>("/message/send", {
@@ -399,7 +405,8 @@ async function handleSendMessage(args: { to: string; message: string }): Promise
       body: message,
     });
     if (!res.ok) return `Failed to send: ${res.error}`;
-    return `Sent to pool "${target}" (${res.data!.recipient_count} recipients).`;
+    const liveCount = res.data!.recipient_count - (res.data!.stale_recipients?.length ?? 0);
+    return `Sent to pool "${target}" (${res.data!.recipient_count} recipients, ${liveCount} live).${formatStaleWarning(res.data!)}`;
   }
 
   const resolved = await resolvePeerId(to);
@@ -412,7 +419,7 @@ async function handleSendMessage(args: { to: string; message: string }): Promise
     body: message,
   });
   if (!res.ok) return `Failed to send: ${res.error}`;
-  return `DM sent to "${to}".`;
+  return `DM sent to "${to}".${formatStaleWarning(res.data!)}`;
 }
 
 async function handleListPeers(): Promise<string> {

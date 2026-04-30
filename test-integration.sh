@@ -536,6 +536,57 @@ check_contains "set-ready returns deprecated" "deprecated" "$READY_DEP"
 PROPOSE_FAIL=$(post "/pool/propose-release" "{\"peer_id\":\"$PEER_D_ID\",\"peer_secret\":\"$PEER_D_SECRET\",\"pool_name\":\"majority-pool\",\"target_peer_id\":\"$PEER_B_ID\"}")
 check_contains "Non-member propose-release rejected" "not a member" "$PROPOSE_FAIL"
 
+# --- Stale peer detection ---
+
+echo ""
+echo "=== Stale peer detection (undelivered message bounce) ==="
+
+# Register a new peer that will go stale
+STALE_PEER=$(post "/register" '{"name":"stale-peer","pid":99999,"pid_start":"fake_999","cwd":"/tmp/stale","git_root":"/tmp/stale","git_branch":"main"}')
+STALE_PEER_ID=$(json_field "$STALE_PEER" "['data']['id']")
+STALE_PEER_SECRET=$(json_field "$STALE_PEER" "['data']['secret']")
+check_contains "Stale peer registered" "\"ok\":true" "$STALE_PEER"
+
+# Create pool and add both the stale peer and peer A
+STALE_POOL=$(post "/pool/create" "{\"peer_id\":\"$PEER_A_ID\",\"peer_secret\":\"$PEER_A_SECRET\",\"name\":\"stale-test-pool\",\"purpose\":\"test stale detection\"}")
+check_contains "Stale test pool created" "\"ok\":true" "$STALE_POOL"
+
+post "/pool/join" "{\"peer_id\":\"$STALE_PEER_ID\",\"peer_secret\":\"$STALE_PEER_SECRET\",\"pool_name\":\"stale-test-pool\"}" > /dev/null
+
+# Make the stale peer's last_seen very old but keep status active initially
+# (simulates a peer that stopped heartbeating but hasn't been cleaned up yet)
+# Must use ISO format with T and Z to match Node's Date serialization
+python3 << PYEOF
+import sqlite3, os, datetime
+db = sqlite3.connect(os.environ['CCT_DIR'] + '/cct.db')
+old_ts = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=120)).strftime('%Y-%m-%dT%H:%M:%S.000Z')
+db.execute("UPDATE peers SET last_seen = ? WHERE id = ?", (old_ts, '$STALE_PEER_ID'))
+db.commit()
+db.close()
+PYEOF
+
+# Send message to pool — stale peer should be flagged
+STALE_SEND=$(post "/message/send" "{\"peer_id\":\"$PEER_A_ID\",\"peer_secret\":\"$PEER_A_SECRET\",\"pool_name\":\"stale-test-pool\",\"body\":\"hello?\"}")
+check_contains "Message sent despite stale recipient" "\"ok\":true" "$STALE_SEND"
+check_contains "Stale recipients included in response" "stale_recipients" "$STALE_SEND"
+check_contains "Stale peer name in warning" "stale-peer" "$STALE_SEND"
+
+# DM to stale peer — peer still has status=active so DM should go through with warning
+DM_STALE=$(post "/message/send" "{\"peer_id\":\"$PEER_A_ID\",\"peer_secret\":\"$PEER_A_SECRET\",\"to_peer_id\":\"$STALE_PEER_ID\",\"body\":\"you there?\"}")
+check_contains "DM to stale peer succeeds" "\"ok\":true" "$DM_STALE"
+check_contains "DM stale recipient warning" "stale_recipients" "$DM_STALE"
+
+# DM to dead peer should be rejected
+python3 << PYEOF
+import sqlite3, os
+db = sqlite3.connect(os.environ['CCT_DIR'] + '/cct.db')
+db.execute("UPDATE peers SET status = 'dead' WHERE id = ?", ('$STALE_PEER_ID',))
+db.commit()
+db.close()
+PYEOF
+DM_DEAD=$(post "/message/send" "{\"peer_id\":\"$PEER_A_ID\",\"peer_secret\":\"$PEER_A_SECRET\",\"to_peer_id\":\"$STALE_PEER_ID\",\"body\":\"you there?\"}")
+check_contains "DM to dead peer rejected" "not found or not active" "$DM_DEAD"
+
 # --- Hook benchmark ---
 
 echo ""
