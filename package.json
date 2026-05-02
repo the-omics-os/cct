@@ -11,7 +11,7 @@
   "keywords": ["claude-code", "mcp", "agent-communication", "multi-agent"],
   "type": "module",
   "bin": {
-    "cct": "./bin/cct.mjs"
+    "cct": "bin/cct.mjs"
   },
   "files": [
     "bin/",

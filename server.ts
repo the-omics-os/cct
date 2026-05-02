@@ -37,6 +37,13 @@ import { generateSummary } from "./shared/summarize.ts";
 
 const myCwd = process.cwd();
 
+// --- Runtime detection ---
+// Codex sets CODEX_HOME; explicit CCT_RUNTIME overrides auto-detection.
+type AgentRuntime = "claude" | "codex";
+const detectedRuntime: AgentRuntime =
+  (process.env.CCT_RUNTIME as AgentRuntime) ??
+  (process.env.CODEX_HOME ? "codex" : "claude");
+
 let myId = "";
 let mySecret = "";
 let myName = "";
@@ -169,8 +176,11 @@ function findClaudePid(): number {
   return process.ppid;
 }
 
-const claudePid = findClaudePid();
-const cachedPpidStart = getPidStartForPid(claudePid);
+// For Codex: use session_id env var as stable identity key.
+// For Claude: use PID-based identity (existing behavior).
+const codexSessionId = process.env.CCT_CODEX_SESSION_ID ?? process.env.CODEX_SESSION_ID;
+const hostPid = detectedRuntime === "codex" ? process.ppid : findClaudePid();
+const cachedPpidStart = getPidStartForPid(hostPid);
 
 function isOriginalProcessAlive(pid: number, expectedStart: string): boolean {
   try {
@@ -203,15 +213,46 @@ async function getGitInfo(cwd: string): Promise<{ gitRoot: string | null; gitBra
 }
 
 // --- Pidmap helpers ---
+// Codex uses session_id-based pidmap key; Claude uses PID-based key.
+// For Codex without explicit session_id: write a "codex_mcp_{pid}" marker
+// that the SessionStart hook will find and link to the session_id.
 
-const myPidmapPath = `${PIDMAP_DIR}/${claudePid}_${cachedPpidStart}`;
+const myPidmapKey = detectedRuntime === "codex" && codexSessionId
+  ? `codex_${codexSessionId}`
+  : `${hostPid}_${cachedPpidStart}`;
+const myPidmapPath = `${PIDMAP_DIR}/${myPidmapKey}`;
+
+// Codex MCP marker — written alongside the main pidmap so SessionStart can find us
+const codexMcpMarkerPath = detectedRuntime === "codex"
+  ? `${PIDMAP_DIR}/codex_mcp_${process.pid}`
+  : null;
 
 function writePidmap(): void {
   writeFileSync(myPidmapPath, `${myId}|${myName}`, { mode: 0o600 });
+  if (codexMcpMarkerPath) {
+    writeFileSync(codexMcpMarkerPath, `${myId}|${myName}`, { mode: 0o600 });
+  }
 }
 
 function deletePidmap(): void {
   try { unlinkSync(myPidmapPath); } catch {}
+  if (codexMcpMarkerPath) {
+    try { unlinkSync(codexMcpMarkerPath); } catch {}
+  }
+  // Clean up session-keyed pidmaps that point to our peer ID
+  if (detectedRuntime === "codex") {
+    try {
+      const files = readdirSync(PIDMAP_DIR);
+      for (const f of files) {
+        if (f.startsWith("codex_") && !f.startsWith("codex_mcp_")) {
+          const content = readFileSync(join(PIDMAP_DIR, f), "utf-8");
+          if (content.startsWith(myId)) {
+            try { unlinkSync(join(PIDMAP_DIR, f)); } catch {}
+          }
+        }
+      }
+    } catch {}
+  }
 }
 
 // --- Flag file helpers ---
@@ -342,18 +383,22 @@ async function handleCheckMessages(): Promise<string> {
     output = `${messages.length} message(s):\n\n${lines.join("\n")}`;
 
     if (messages.some((m: any) => m.msg_type === "pool_invite")) {
-      output += `\n\n🚨 ACTION REQUIRED: You were added to a pool. You MUST set up message polling NOW or you will miss all future messages.\nRun CronCreate with cron "*/1 * * * *" and prompt "Call the cct_check_messages tool to check for incoming peer messages. If there are any, read and respond to them."\nThis is not optional — without it you are deaf to messages when idle.`;
+      output += detectedRuntime === "claude"
+        ? `\n\n🚨 ACTION REQUIRED: You were added to a pool. You MUST set up message polling NOW or you will miss all future messages.\nRun CronCreate with cron "*/1 * * * *" and prompt "Call the cct_check_messages tool to check for incoming peer messages. If there are any, read and respond to them."\nThis is not optional — without it you are deaf to messages when idle.`
+        : `\n\n🚨 You were added to a pool. Messages will arrive automatically via hooks — no action needed.`;
     }
 
     if (messages.some((m: any) => m.msg_type === "release_approved")) {
-      output += `\n\n🎯 ACTION REQUIRED: You have been released from the pool. Please:\n1. Call cct_leave_pool for the pool\n2. If you have no other pools, cancel your CCT cron via CronList + CronDelete`;
+      output += detectedRuntime === "claude"
+        ? `\n\n🎯 ACTION REQUIRED: You have been released from the pool. Please:\n1. Call cct_leave_pool for the pool\n2. If you have no other pools, cancel your CCT cron via CronList + CronDelete`
+        : `\n\n🎯 ACTION REQUIRED: You have been released from the pool. Call cct_leave_pool for the pool.`;
     }
 
-    if (messages.some((m: any) => m.msg_type === "pool_idle")) {
+    if (messages.some((m: any) => m.msg_type === "pool_idle") && detectedRuntime === "claude") {
       output += `\n\n⏳ ACTION REQUIRED: Pool throttle activated — a peer is deep-working. Swap your polling cron to save tokens:\n1. CronDelete your current */1 cron\n2. CronCreate with */5 * * * * and the same prompt\nThe throttle will auto-clear when someone sends a message, the setter finishes, or the timer expires.`;
     }
 
-    if (messages.some((m: any) => m.msg_type === "pool_active")) {
+    if (messages.some((m: any) => m.msg_type === "pool_active") && detectedRuntime === "claude") {
       output += `\n\n✅ ACTION REQUIRED: Pool throttle cleared — resume normal polling:\n1. CronDelete your current */5 cron\n2. CronCreate with */1 * * * * and the same prompt`;
     }
   }
@@ -459,7 +504,10 @@ async function handleCreatePool(args: { name: string; purpose?: string }): Promi
     purpose: args.purpose ?? "",
   });
   if (!res.ok) return `Failed: ${res.error}`;
-  return `Pool "${args.name}" created (id: ${res.data!.pool_id}). You are the creator.\n\n⚠️ IMPORTANT: Set up message polling NOW if you haven't already. Use CronCreate with cron "*/1 * * * *" and prompt "Call the cct_check_messages tool to check for incoming peer messages. If there are any, read and respond to them." This is required to receive messages when idle.`;
+  const cronReminder = detectedRuntime === "claude"
+    ? `\n\n⚠️ IMPORTANT: Set up message polling NOW if you haven't already. Use CronCreate with cron "*/1 * * * *" and prompt "Call the cct_check_messages tool to check for incoming peer messages. If there are any, read and respond to them." This is required to receive messages when idle.`
+    : `\n\nMessages will be delivered automatically via PreToolUse hook (busy) or UserPromptSubmit hook (idle).`;
+  return `Pool "${args.name}" created (id: ${res.data!.pool_id}). You are the creator.${cronReminder}`;
 }
 
 async function handleJoinPool(args: { pool_name: string }): Promise<string> {
@@ -469,7 +517,10 @@ async function handleJoinPool(args: { pool_name: string }): Promise<string> {
     pool_name: args.pool_name,
   });
   if (!res.ok) return `Failed: ${res.error}`;
-  return `Joined pool "${args.pool_name}".\n\n⚠️ IMPORTANT: Set up message polling NOW if you haven't already. Use CronCreate with cron "*/1 * * * *" and prompt "Call the cct_check_messages tool to check for incoming peer messages. If there are any, read and respond to them." This is required to receive messages when idle.`;
+  const joinCronReminder = detectedRuntime === "claude"
+    ? `\n\n⚠️ IMPORTANT: Set up message polling NOW if you haven't already. Use CronCreate with cron "*/1 * * * *" and prompt "Call the cct_check_messages tool to check for incoming peer messages. If there are any, read and respond to them." This is required to receive messages when idle.`
+    : `\n\nMessages will be delivered automatically via PreToolUse hook (busy) or UserPromptSubmit hook (idle).`;
+  return `Joined pool "${args.pool_name}".${joinCronReminder}`;
 }
 
 async function handleLeavePool(args: { pool_name: string }): Promise<string> {
@@ -626,7 +677,8 @@ async function main() {
   await ensureBroker();
 
   const peerNameEnv = process.env.CCT_PEER_NAME;
-  const defaultName = `${basename(myCwd)}-${Math.random().toString(36).slice(2, 6)}`;
+  const prefix = detectedRuntime === "codex" ? "codex" : basename(myCwd);
+  const defaultName = `${prefix}-${Math.random().toString(36).slice(2, 6)}`;
   const requestedName = peerNameEnv || defaultName;
 
   const { gitRoot, gitBranch } = await getGitInfo(myCwd);
@@ -660,8 +712,23 @@ async function main() {
 
   writeFlag(`0||${Date.now()}`);
 
+  const cronInstructions = detectedRuntime === "claude"
+    ? `
+POOL LIFECYCLE — follow this exactly:
+1. JOIN/CREATE: Immediately set up a recurring cron using CronCreate with cron "*/1 * * * *"
+   and prompt "Call the cct_check_messages tool to check for incoming peer messages. If there are any, read and respond to them."
+   This is REQUIRED. Without it, you are deaf to messages when idle. Only set up once per session.
+2. ACTIVE: The cron polls every 60s when idle. The PreToolUse hook catches messages instantly when busy.
+3. LEAVE: When you leave your LAST pool (no pools remaining), cancel the cron via CronList + CronDelete.
+   If you still have other pools, keep the cron running.`
+    : `
+MESSAGE DELIVERY (Codex):
+- BUSY: The PreToolUse hook blocks your next tool call when unread messages exist.
+- IDLE: Messages are injected as context on your next user prompt via UserPromptSubmit hook.
+- No cron setup needed. Delivery is automatic via hooks.`;
+
   const instructions = `You are connected to CCT (Claude Code Talk) — a peer communication system.
-Your peer ID: ${myId} | Your name: ${myName} | CWD: ${myCwd}
+Your peer ID: ${myId} | Your name: ${myName} | CWD: ${myCwd} | Runtime: ${detectedRuntime}
 
 IMPORTANT: When you see a PreToolUse error mentioning "CCT: N unread message(s)",
 this is NORMAL pool communication, not a tool failure. Call cct_check_messages
@@ -669,14 +736,7 @@ to read your messages, then retry your original action.
 
 After reading messages, respond to them naturally. Use cct_send_message to reply.
 To send to a pool: set "to" to "@pool-name". To DM: set "to" to the peer name.
-
-POOL LIFECYCLE — follow this exactly:
-1. JOIN/CREATE: Immediately set up a recurring cron using CronCreate with cron "*/1 * * * *"
-   and prompt "Call the cct_check_messages tool to check for incoming peer messages. If there are any, read and respond to them."
-   This is REQUIRED. Without it, you are deaf to messages when idle. Only set up once per session.
-2. ACTIVE: The cron polls every 60s when idle. The PreToolUse hook catches messages instantly when busy.
-3. LEAVE: When you leave your LAST pool (no pools remaining), cancel the cron via CronList + CronDelete.
-   If you still have other pools, keep the cron running.`;
+${cronInstructions}`;
 
   const server = new Server(
     { name: "cct", version: "0.1.0" },
@@ -961,8 +1021,9 @@ POOL LIFECYCLE — follow this exactly:
   process.stdin.once("close", () => requestCleanup("stdin close"));
 
   // Layer 2: parent death detection — backup (30s interval, PID start-time validated)
+  // For Codex: MCP child processes get stdin EOF on session end, so this is a backup.
   parentMonitorInterval = setInterval(() => {
-    if (!isOriginalProcessAlive(claudePid, cachedPpidStart)) {
+    if (!isOriginalProcessAlive(hostPid, cachedPpidStart)) {
       requestCleanup("parent process exited");
     }
   }, 30_000);

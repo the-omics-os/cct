@@ -1,6 +1,6 @@
 # CCT — Claude Code Talk
 
-Peer-to-peer messaging for Claude Code sessions. MCP tools + PreToolUse hook + SQLite broker. No experimental flags, no subscription gate, works with any auth method.
+Peer-to-peer messaging for AI coding agents. Works with **Claude Code** and **OpenAI Codex CLI**. MCP tools + lifecycle hooks + SQLite broker. No experimental flags, no subscription gate.
 
 <p align="center">
   <img src=".content/cct-demo.gif" alt="CCT demo — two Claude Code sessions collaborating in real time" width="800">
@@ -35,10 +35,10 @@ Beyond the channel workaround, CCT introduces structured coordination primitives
 
 ```bash
 npm install
-npx tsx cli.ts install   # registers MCP server + hook in Claude Code
+npx tsx cli.ts install   # auto-detects Claude Code + Codex CLI, installs both
 npx tsx cli.ts start     # starts the broker
 
-# Open two Claude Code sessions — they auto-register
+# Open two sessions (any mix of Claude Code / Codex) — they auto-register
 # In session A:
 #   "Create a pool called feature-x and invite the other session"
 # Messages flow automatically
@@ -47,15 +47,15 @@ npx tsx cli.ts start     # starts the broker
 ## How It Works
 
 ```
-Session A ──► MCP Server A ──► Broker (SQLite) ◄── MCP Server B ◄── Session B
-                                    ↑
-                               CLI / Services
+Claude Code A ──► MCP Server ──► Broker (SQLite) ◄── MCP Server ◄── Codex CLI B
+                                      ↑
+                                 CLI / Services
 ```
 
-1. Each Claude Code session runs an **MCP server** that registers with the broker on startup
+1. Each session (Claude Code or Codex) runs an **MCP server** that registers with the broker on startup
 2. The broker manages peers, pools, and messages in **SQLite** with full transactional guarantees
-3. A pure-bash **PreToolUse hook** checks a flag file before every tool call — if unread messages exist, it blocks until Claude reads its inbox
-4. **Idle sessions** pick up messages via a cron job (60s polling)
+3. A **PreToolUse hook** checks a flag file before every tool call — if unread messages exist, it blocks until the agent reads its inbox
+4. **Idle sessions** pick up messages via cron (Claude Code, 60s) or UserPromptSubmit hook (Codex, next prompt)
 
 The "Error:" prefix you see when a tool is blocked is **normal pool communication**, not a failure. Claude reads the messages and continues.
 
@@ -115,8 +115,8 @@ cct start               # start broker (localhost)
 cct lan-start            # start broker in LAN mode
 cct kill                 # stop broker
 cct config show          # show persistent config
-cct install              # register MCP + hook
-cct uninstall            # remove MCP + hook
+cct install              # register MCP + hooks (Claude Code + Codex)
+cct uninstall            # remove MCP + hooks from all runtimes
 ```
 
 ## MCP Tools (15)
@@ -173,18 +173,30 @@ All sessions across all machines see each other. Create a pool, invite peers, an
 
 ```
 cct/
-  broker.ts       HTTP broker + SQLite (32 endpoints, 8 tables)
-  server.ts       MCP stdio server (15 tools, polling, heartbeat, orphan prevention)
-  cli.ts          Human CLI (15 commands, no ephemeral peers)
-  hook.sh         Pure bash PreToolUse hook (<10ms, fail-open)
-  shared/         Types, constants, git-based summary generator
+  broker.ts              HTTP broker + SQLite (32 endpoints, 8 tables)
+  server.ts              MCP stdio server (15 tools, runtime detection, orphan prevention)
+  cli.ts                 Human CLI (15 commands, unified installer)
+  hook.sh                Claude Code PreToolUse hook (pure bash, <10ms)
+  hook-codex.sh          Codex PreToolUse hook (JSON stdin/stdout, <10ms)
+  prompt-codex.sh        Codex UserPromptSubmit hook (idle delivery)
+  session-start-codex.sh Codex SessionStart hook (identity bridge)
+  shared/                Types, constants, git-based summary generator
 ```
+
+## Supported Runtimes
+
+| Runtime | Message Delivery (Busy) | Message Delivery (Idle) | Identity |
+|---------|------------------------|------------------------|----------|
+| **Claude Code** | PreToolUse hook blocks | CronCreate polls every 60s | PID-based pidmap |
+| **Codex CLI** | PreToolUse hook blocks (JSON) | UserPromptSubmit injects context | Session-ID based pidmap |
+
+`cct install` auto-detects both and installs for whichever is present. Cross-tool pools work — Claude and Codex peers communicate in the same pool.
 
 ## Process Lifecycle
 
-MCP stdio servers are spawned per Claude Code session. Three layers prevent orphaned processes from accumulating:
+MCP stdio servers are spawned per session. Three layers prevent orphaned processes from accumulating:
 
-1. **stdin EOF/close** (instant) — when Claude Code exits, the pipe closes and the server self-terminates
+1. **stdin EOF/close** (instant) — when the host exits, the pipe closes and the server self-terminates
 2. **Parent death monitor** (≤30s) — periodic PID check with start-time validation prevents false positives from PID reuse
 3. **Idle timeout** (optional) — set `CCT_IDLE_TIMEOUT_MS` for a last-resort fuse; disabled by default since sessions can run for days
 
@@ -203,8 +215,9 @@ All cleanup is idempotent with a 5s force-exit deadline to prevent hanging on br
 
 ## Requirements
 
-- [Node.js](https://nodejs.org) 20+ with [tsx](https://tsx.is)
-- Claude Code with MCP + hooks support
+- [Node.js](https://nodejs.org) 22+ with [tsx](https://tsx.is)
+- Claude Code with MCP + hooks support, and/or
+- Codex CLI v0.118+ with hooks enabled (`codex_hooks = true`)
 
 ## Acknowledgments
 

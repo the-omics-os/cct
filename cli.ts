@@ -24,9 +24,19 @@ import type {
 const CCT_DIR = dirname(fileURLToPath(import.meta.url));
 const SERVER_PATH = join(CCT_DIR, "server.ts");
 const HOOK_PATH = join(CCT_DIR, "hook.sh");
+const HOOK_CODEX_PATH = join(CCT_DIR, "hook-codex.sh");
+const PROMPT_CODEX_PATH = join(CCT_DIR, "prompt-codex.sh");
+const SESSION_START_CODEX_PATH = join(CCT_DIR, "session-start-codex.sh");
 const BROKER_PATH = join(CCT_DIR, "broker.ts");
-const CLAUDE_JSON = join(homedir(), ".claude.json");
-const CLAUDE_SETTINGS = join(homedir(), ".claude", "settings.json");
+const GLOBAL_CLAUDE_JSON = join(homedir(), ".claude.json");
+const GLOBAL_CLAUDE_SETTINGS = join(homedir(), ".claude", "settings.json");
+const CODEX_CONFIG_PATH = join(homedir(), ".codex", "config.toml");
+
+function resolveTargetPaths(projectMode: boolean): { claudeJson: string; claudeSettings: string } {
+  if (!projectMode) return { claudeJson: GLOBAL_CLAUDE_JSON, claudeSettings: GLOBAL_CLAUDE_SETTINGS };
+  const cwd = process.cwd();
+  return { claudeJson: join(cwd, ".claude.json"), claudeSettings: join(cwd, ".claude", "settings.json") };
+}
 
 // --- Helpers ---
 
@@ -129,8 +139,8 @@ Commands:
   lan-start                    Start the broker on 0.0.0.0 (LAN mode)
   kill                         Stop the broker
   config                       Show or set persistent config
-  install                      Register MCP server + hook
-  uninstall                    Remove MCP server + hook
+  install [--project]          Register MCP + hooks (auto-detects Claude Code & Codex)
+  uninstall [--project]        Remove MCP + hooks (auto-detects Claude Code & Codex)
   help                         Show this help
 
 LAN mode:
@@ -481,7 +491,10 @@ function backupFile(path: string): void {
   }
 }
 
-async function cmdInstall() {
+async function cmdInstall(projectMode: boolean) {
+  const { claudeJson: CLAUDE_JSON, claudeSettings: CLAUDE_SETTINGS } = resolveTargetPaths(projectMode);
+  const scope = projectMode ? "project" : "global";
+
   mkdirSync(dirname(CLAUDE_SETTINGS), { recursive: true });
 
   const cfg = readJsonFile(CONFIG_PATH);
@@ -499,7 +512,7 @@ async function cmdInstall() {
     env: mcpEnv,
   };
   writeJsonFile(CLAUDE_JSON, claudeJson);
-  console.log(`Added MCP server to ${CLAUDE_JSON}`);
+  console.log(`Added MCP server to ${CLAUDE_JSON} (${scope})`);
   if (cfg.broker) console.log(`  → broker: ${cfg.broker}`);
   if (cfg.token) console.log(`  → token: ${cfg.token.slice(0, 8)}...`);
 
@@ -525,24 +538,151 @@ async function cmdInstall() {
     ],
   });
   writeJsonFile(CLAUDE_SETTINGS, settings);
-  console.log(`Added PreToolUse hook to ${CLAUDE_SETTINGS}`);
+  console.log(`Added PreToolUse hook to ${CLAUDE_SETTINGS} (${scope})`);
 
-  console.log("\nCCT installed. Restart Claude Code sessions to activate.");
+  console.log(`\nCCT installed for Claude Code (${scope}). Restart sessions to activate.`);
   console.log("Start the broker with: cct start");
+
+  // --- Auto-detect Codex and install there too ---
+  if (detectCodex()) {
+    installCodex();
+  }
 }
 
-async function cmdUninstall() {
-  // 1. Remove MCP from ~/.claude.json
+function detectCodex(): boolean {
+  const codexBin = spawnSync("which", ["codex"]);
+  return codexBin.status === 0 && existsSync(join(homedir(), ".codex"));
+}
+
+function readTomlFile(path: string): string {
+  if (!existsSync(path)) return "";
+  return readFileSync(path, "utf-8");
+}
+
+function installCodex(): void {
+  const cfg = readJsonFile(CONFIG_PATH);
+  const configDir = join(homedir(), ".codex");
+  if (!existsSync(configDir)) mkdirSync(configDir, { recursive: true });
+
+  let toml = readTomlFile(CODEX_CONFIG_PATH);
+
+  // Add codex_hooks feature flag if not present
+  if (!toml.includes("codex_hooks")) {
+    if (toml.includes("[features]")) {
+      toml = toml.replace("[features]", "[features]\ncodex_hooks = true");
+    } else {
+      toml += "\n[features]\ncodex_hooks = true\n";
+    }
+  }
+
+  // Add MCP server if not present
+  if (!toml.includes("[mcp_servers.cct]")) {
+    const envParts: string[] = [`CCT_RUNTIME = "codex"`, `CCT_BROKER = "${cfg.broker || "http://127.0.0.1:7888"}"`];
+    const envVarsList: string[] = [];
+    if (cfg.token) envVarsList.push(`"CCT_TOKEN"`);
+
+    let mcpSection = `\n[mcp_servers.cct]\ncommand = "npx"\nargs = ["tsx", "${SERVER_PATH}"]\ncwd = "${CCT_DIR}"\nstartup_timeout_sec = 10\ntool_timeout_sec = 30\nenv = { ${envParts.join(", ")} }\n`;
+    if (envVarsList.length > 0) {
+      mcpSection += `env_vars = [${envVarsList.join(", ")}]\n`;
+    }
+    toml += mcpSection;
+    console.log(`Added [mcp_servers.cct] to ${CODEX_CONFIG_PATH}`);
+  } else {
+    console.log(`MCP server 'cct' already in ${CODEX_CONFIG_PATH}`);
+  }
+
+  // Add hooks if not present
+  if (!toml.includes("hook-codex.sh")) {
+    toml += `\n[[hooks.PreToolUse]]\nmatcher = ".*"\n\n[[hooks.PreToolUse.hooks]]\ntype = "command"\ncommand = "${HOOK_CODEX_PATH}"\ntimeout = 1\n`;
+    console.log(`Added PreToolUse hook to ${CODEX_CONFIG_PATH}`);
+  }
+
+  if (!toml.includes("prompt-codex.sh")) {
+    toml += `\n[[hooks.UserPromptSubmit]]\n\n[[hooks.UserPromptSubmit.hooks]]\ntype = "command"\ncommand = "${PROMPT_CODEX_PATH}"\ntimeout = 1\n`;
+    console.log(`Added UserPromptSubmit hook to ${CODEX_CONFIG_PATH}`);
+  }
+
+  if (!toml.includes("session-start-codex.sh")) {
+    toml += `\n[[hooks.SessionStart]]\nmatcher = "startup|resume"\n\n[[hooks.SessionStart.hooks]]\ntype = "command"\ncommand = "${SESSION_START_CODEX_PATH}"\ntimeout = 1\n`;
+    console.log(`Added SessionStart hook to ${CODEX_CONFIG_PATH}`);
+  }
+
+  backupFile(CODEX_CONFIG_PATH);
+  writeFileSync(CODEX_CONFIG_PATH, toml);
+  console.log(`\nCCT installed for Codex CLI. Restart Codex sessions to activate.`);
+  console.log(`  Busy delivery: PreToolUse hook blocks until messages read`);
+  console.log(`  Idle delivery: UserPromptSubmit injects context on next prompt`);
+}
+
+function removeCctFromToml(toml: string): string {
+  const lines = toml.split("\n");
+  const result: string[] = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+
+    // Skip [mcp_servers.cct] section (single table, ends at next [header])
+    if (line.trim() === "[mcp_servers.cct]") {
+      i++;
+      while (i < lines.length && !lines[i].match(/^\s*\[/)) i++;
+      continue;
+    }
+
+    // Skip [[hooks.*]] blocks that reference our scripts
+    if (line.match(/^\[\[hooks\.(PreToolUse|UserPromptSubmit|SessionStart)\]\]/)) {
+      // Look ahead to see if this block references a CCT script
+      let end = i + 1;
+      while (end < lines.length && !lines[end].match(/^\s*\[\[/) && !lines[end].match(/^\s*\[(?!\[)/)) end++;
+      const block = lines.slice(i, end).join("\n");
+      if (block.includes("hook-codex.sh") || block.includes("prompt-codex.sh") || block.includes("session-start-codex.sh")) {
+        i = end;
+        // Skip trailing blank lines
+        while (i < lines.length && lines[i].trim() === "") i++;
+        continue;
+      }
+    }
+
+    result.push(line);
+    i++;
+  }
+
+  return result.join("\n").replace(/\n{3,}/g, "\n\n");
+}
+
+function uninstallCodex(): void {
+  if (!existsSync(CODEX_CONFIG_PATH)) {
+    console.log("No Codex config found.");
+    return;
+  }
+
+  const toml = readTomlFile(CODEX_CONFIG_PATH);
+  const cleaned = removeCctFromToml(toml);
+
+  if (cleaned !== toml) {
+    backupFile(CODEX_CONFIG_PATH);
+    writeFileSync(CODEX_CONFIG_PATH, cleaned);
+    console.log(`Removed CCT from ${CODEX_CONFIG_PATH}`);
+  } else {
+    console.log(`No CCT entries found in ${CODEX_CONFIG_PATH}`);
+  }
+}
+
+async function cmdUninstall(projectMode: boolean) {
+  const { claudeJson: CLAUDE_JSON, claudeSettings: CLAUDE_SETTINGS } = resolveTargetPaths(projectMode);
+  const scope = projectMode ? "project" : "global";
+
+  // 1. Remove MCP
   const claudeJson = readJsonFile(CLAUDE_JSON);
   if (claudeJson.mcpServers?.cct) {
     delete claudeJson.mcpServers.cct;
     writeJsonFile(CLAUDE_JSON, claudeJson);
-    console.log(`Removed MCP server from ${CLAUDE_JSON}`);
+    console.log(`Removed MCP server from ${CLAUDE_JSON} (${scope})`);
   } else {
     console.log(`No CCT MCP entry in ${CLAUDE_JSON}`);
   }
 
-  // 2. Remove hook from ~/.claude/settings.json
+  // 2. Remove hook
   const settings = readJsonFile(CLAUDE_SETTINGS);
   if (settings.hooks?.PreToolUse) {
     const before = settings.hooks.PreToolUse.length;
@@ -560,7 +700,7 @@ async function cmdUninstall() {
     }
     writeJsonFile(CLAUDE_SETTINGS, settings);
     if (settings.hooks?.PreToolUse?.length !== before) {
-      console.log(`Removed PreToolUse hook from ${CLAUDE_SETTINGS}`);
+      console.log(`Removed PreToolUse hook from ${CLAUDE_SETTINGS} (${scope})`);
     } else {
       console.log(`No CCT hook found in ${CLAUDE_SETTINGS}`);
     }
@@ -568,7 +708,12 @@ async function cmdUninstall() {
     console.log(`No hooks in ${CLAUDE_SETTINGS}`);
   }
 
-  console.log("\nCCT uninstalled. Restart Claude Code sessions to deactivate.");
+  console.log(`\nCCT uninstalled from Claude Code (${scope}). Restart sessions to deactivate.`);
+
+  // --- Auto-detect Codex and uninstall there too ---
+  if (detectCodex()) {
+    uninstallCodex();
+  }
 }
 
 // --- Main ---
@@ -637,10 +782,10 @@ try {
       await cmdConfig(subArgs);
       break;
     case "install":
-      await cmdInstall();
+      await cmdInstall(subArgs.includes("--project"));
       break;
     case "uninstall":
-      await cmdUninstall();
+      await cmdUninstall(subArgs.includes("--project"));
       break;
     default:
       die(`Unknown command: ${cmd}. Run "cct help" for usage.`);
