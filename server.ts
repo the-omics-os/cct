@@ -677,7 +677,8 @@ async function main() {
   await ensureBroker();
 
   const peerNameEnv = process.env.CCT_PEER_NAME;
-  const defaultName = `${basename(myCwd)}-${Math.random().toString(36).slice(2, 6)}`;
+  const prefix = detectedRuntime === "codex" ? "codex" : basename(myCwd);
+  const defaultName = `${prefix}-${Math.random().toString(36).slice(2, 6)}`;
   const requestedName = peerNameEnv || defaultName;
 
   const { gitRoot, gitBranch } = await getGitInfo(myCwd);
