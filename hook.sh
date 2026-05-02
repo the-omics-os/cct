@@ -16,6 +16,7 @@ _CCT="${CCT_DIR:-$HOME/.cct}"
 PIDMAP="$_CCT/pidmaps/${PPID}_"*
 [ -f $PIDMAP ] || exit 0
 PEER_ID=$(cat $PIDMAP)
+PEER_ID="${PEER_ID%%|*}"
 
 # 4. Check unread flag
 FLAG="$_CCT/flags/${PEER_ID}.unread"

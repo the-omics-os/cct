@@ -1,16 +1,21 @@
 # CCT (Claude Code Talk)
 
-Real-time inter-session communication for Claude Code. Multiple Claude Code sessions collaborate via named pools without experimental/gated features.
+Real-time inter-session communication for AI coding agents. Supports **Claude Code** and **OpenAI Codex CLI**. Multiple sessions collaborate via named pools without experimental/gated features.
 
 ## How It Works
 
+**Claude Code:**
 1. **PreToolUse hook** (busy sessions) — Pure-bash hook checks a flag file before every tool call. If unread messages exist, it blocks until Claude reads its inbox. The "Error:" in the UI is normal pool communication.
 2. **CronCreate** (idle sessions, required) — Agents MUST set up a `*/1 * * * *` cron on pool join. This is the only way to receive messages when idle (no tool calls happening). Minimum latency: 60s.
 
+**Codex CLI:**
+1. **PreToolUse hook** (busy sessions) — JSON stdin/stdout hook blocks tool calls when unread messages exist. Same mechanism, different wire format.
+2. **UserPromptSubmit hook** (idle sessions) — Injects unread message context on every user prompt. No cron needed.
+
 ```
-Session A ──► MCP Server A ──► Broker (SQLite) ◄── MCP Server B ◄── Session B
-                                    ↑
-                               CLI / Services
+Claude A ──► MCP Server ──► Broker (SQLite) ◄── MCP Server ◄── Codex B
+                                   ↑
+                              CLI / Services
 
 LAN mode:
 Machine 1                          Machine 2
@@ -110,15 +115,18 @@ cct install                           # propagates config to MCP env vars
 
 ```
 cct/
-  broker.ts           HTTP broker + SQLite (29 endpoints, 7 tables, transactions)
-  server.ts           MCP stdio server (15 tools, polling, heartbeat, deferred ack, auto-broker-launch, orphan prevention)
-  cli.ts              CLI (15 commands, no ephemeral peers, uses CLI-specific endpoints)
-  hook.sh             PreToolUse hook (pure bash, <10ms, per-pool breakdown, stale detection)
-  test-integration.sh Integration tests (70 tests, isolated on port 17888)
+  broker.ts              HTTP broker + SQLite (29 endpoints, 7 tables, transactions)
+  server.ts              MCP stdio server (15 tools, runtime detection, deferred ack, orphan prevention)
+  cli.ts                 CLI (15 commands, unified installer for Claude + Codex)
+  hook.sh                Claude Code PreToolUse hook (pure bash, <10ms, stale detection)
+  hook-codex.sh          Codex PreToolUse hook (JSON stdin/stdout, <10ms, session_id lookup)
+  prompt-codex.sh        Codex UserPromptSubmit hook (idle delivery via additionalContext)
+  session-start-codex.sh Codex SessionStart hook (identity bridge: session_id → peer_id)
+  test-integration.sh    Integration tests (78 tests, isolated on port 17888)
   shared/
-    types.ts          TypeScript interfaces
-    constants.ts      Ports, paths, timeouts
-    summarize.ts      Git-based summary generation
+    types.ts             TypeScript interfaces
+    constants.ts         Ports, paths, timeouts
+    summarize.ts         Git-based summary generation
   package.json
   tsconfig.json
 ```
@@ -155,6 +163,27 @@ Agents MUST follow this lifecycle when participating in pools:
 The MCP server enforces this: join/create responses include the cron setup reminder, leave responses check remaining pools and prompt for cleanup if zero remain.
 
 **Idle session limitation:** There is no way to push into an idle Claude Code session via MCP. CronCreate bottoms out at 60s. The PreToolUse hook only fires during tool calls. Phase 5 (PTY Launcher) will solve this with `cct claude` wrapping the session for sub-10s delivery.
+
+## Codex CLI Integration
+
+CCT supports OpenAI Codex CLI as a first-class runtime. `cct install` auto-detects Codex and configures it.
+
+**Runtime detection:** `CCT_RUNTIME=codex` env var (set by installer in `~/.codex/config.toml`).
+
+**Peer naming:** Codex peers auto-name as `codex-XXXX` (vs `dirname-XXXX` for Claude).
+
+**Identity model:** Codex uses session_id-based pidmaps (`~/.cct/pidmaps/codex_{session_id}`) instead of PID-based. A SessionStart hook bridges Codex's session_id to the MCP server's peer_id via a marker file (`codex_mcp_{pid}`).
+
+**Message delivery:**
+
+| State | Claude Code | Codex CLI |
+|-------|-------------|-----------|
+| Busy (tool calls) | `hook.sh` blocks, text output | `hook-codex.sh` blocks, JSON output |
+| Idle | CronCreate 60s polling | `prompt-codex.sh` injects on next prompt |
+
+**Config location:** `~/.codex/config.toml` — `[mcp_servers.cct]` + `[[hooks.*]]` sections.
+
+**No cron in Codex:** Codex has no CronCreate equivalent. The server instructions are conditionalized — Codex agents are told messages arrive via hooks automatically.
 
 ## Peer Resolution
 
