@@ -35,14 +35,44 @@ import type {
 } from "./shared/types.ts";
 import { generateSummary } from "./shared/summarize.ts";
 
-const myCwd = process.cwd();
-
 // --- Runtime detection ---
 // Codex sets CODEX_HOME; explicit CCT_RUNTIME overrides auto-detection.
 type AgentRuntime = "claude" | "codex";
 const detectedRuntime: AgentRuntime =
   (process.env.CCT_RUNTIME as AgentRuntime) ??
   (process.env.CODEX_HOME ? "codex" : "claude");
+
+// For Codex: process.cwd() returns CCT's dir (forced via config.toml cwd field).
+// Resolve actual session CWD by reading parent Codex process's working directory.
+function resolveSessionCwd(): string {
+  if (detectedRuntime !== "codex") return process.cwd();
+  try {
+    // Walk up process tree to find codex binary, then read its cwd via lsof
+    let pid = process.ppid;
+    for (let i = 0; i < 8; i++) {
+      const comm = spawnSync("ps", ["-o", "comm=", "-p", String(pid)]);
+      const name = comm.stdout?.toString().trim() ?? "";
+      if (name.includes("codex")) {
+        // lsof -Fn output: "fcwd\n" followed by "n/path\n"
+        const cwdProc = spawnSync("lsof", ["-p", String(pid), "-Fn"]);
+        const output = cwdProc.stdout?.toString() ?? "";
+        const lines = output.split("\n");
+        for (let j = 0; j < lines.length; j++) {
+          if (lines[j] === "fcwd" && lines[j + 1]?.startsWith("n")) {
+            return lines[j + 1].slice(1);
+          }
+        }
+      }
+      const ppid = spawnSync("ps", ["-o", "ppid=", "-p", String(pid)]);
+      const parent = parseInt(ppid.stdout?.toString().trim() ?? "", 10);
+      if (!parent || parent === 1) break;
+      pid = parent;
+    }
+  } catch {}
+  return process.cwd();
+}
+
+const myCwd = resolveSessionCwd();
 
 let myId = "";
 let mySecret = "";
