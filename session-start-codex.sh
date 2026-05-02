@@ -26,17 +26,63 @@ PIDMAP_DIR="$_CCT/pidmaps"
 # Already mapped? Skip.
 [ -f "$PIDMAP_DIR/codex_${SESSION_ID}" ] && exit 0
 
-# Find the MCP server's marker (most recent codex_mcp_* file)
-set -- "$PIDMAP_DIR"/codex_mcp_*
-if [ -f "$1" ]; then
-  # Use the most recently modified marker
-  MARKER=$(ls -t "$PIDMAP_DIR"/codex_mcp_* 2>/dev/null | head -1)
-  [ -f "$MARKER" ] || exit 0
-  IFS= read -r CONTENT < "$MARKER" || exit 0
-  [ -n "$CONTENT" ] || exit 0
-  # Write session-keyed pidmap with same content
-  printf '%s' "$CONTENT" > "$PIDMAP_DIR/codex_${SESSION_ID}"
-  chmod 600 "$PIDMAP_DIR/codex_${SESSION_ID}" 2>/dev/null
+pid_has_ancestor() {
+  local child=$1
+  local ancestor=$2
+  local current=$child
+  local parent=""
+  local i=0
+  while [ -n "$current" ] && [ "$i" -lt 12 ]; do
+    [ "$current" = "$ancestor" ] && return 0
+    parent=$(ps -o ppid= -p "$current" 2>/dev/null)
+    parent=${parent//[[:space:]]/}
+    [ -z "$parent" ] && return 1
+    [ "$parent" = "1" ] && return 1
+    current=$parent
+    i=$((i + 1))
+  done
+  return 1
+}
+
+find_marker_for_session() {
+  local marker=""
+  local marker_pid=""
+  for marker in "$PIDMAP_DIR"/codex_mcp_*; do
+    [ -f "$marker" ] || continue
+    marker_pid="${marker##*codex_mcp_}"
+    case "$marker_pid" in ''|*[!0-9]*) continue ;; esac
+    if pid_has_ancestor "$marker_pid" "$PPID"; then
+      printf '%s' "$marker"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Find the MCP server marker for this Codex process. SessionStart can fire
+# before the MCP server has finished registration, so wait briefly.
+MARKER=""
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  MARKER=$(find_marker_for_session)
+  [ -n "$MARKER" ] && break
+  sleep 0.05
+done
+
+if [ -z "$MARKER" ]; then
+  ONLY_MARKER=""
+  MARKER_COUNT=0
+  for candidate in "$PIDMAP_DIR"/codex_mcp_*; do
+    [ -f "$candidate" ] || continue
+    ONLY_MARKER="$candidate"
+    MARKER_COUNT=$((MARKER_COUNT + 1))
+  done
+  [ "$MARKER_COUNT" -eq 1 ] && MARKER="$ONLY_MARKER"
 fi
+
+[ -f "$MARKER" ] || exit 0
+IFS= read -r CONTENT < "$MARKER" || [ -n "$CONTENT" ] || exit 0
+[ -n "$CONTENT" ] || exit 0
+printf '%s' "$CONTENT" > "$PIDMAP_DIR/codex_${SESSION_ID}"
+chmod 600 "$PIDMAP_DIR/codex_${SESSION_ID}" 2>/dev/null
 
 exit 0

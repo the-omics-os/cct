@@ -158,8 +158,13 @@ function cleanStalePidmaps(): void {
   try {
     const files = readdirSync(PIDMAP_DIR);
     for (const f of files) {
-      const pid = parseInt(f.split("_")[0], 10);
-      if (!pid) { try { unlinkSync(join(PIDMAP_DIR, f)); } catch {} continue; }
+      if (f.startsWith("codex_") && !f.startsWith("codex_mcp_")) {
+        continue;
+      }
+      const pid = f.startsWith("codex_mcp_")
+        ? parseInt(f.slice("codex_mcp_".length), 10)
+        : parseInt(f.split("_")[0], 10);
+      if (!pid) continue;
       const alive = spawnSync("kill", ["-0", String(pid)]);
       if (alive.status !== 0) {
         const content = readFileSync(join(PIDMAP_DIR, f), "utf-8");
@@ -208,7 +213,7 @@ function findClaudePid(): number {
 
 // For Codex: use session_id env var as stable identity key.
 // For Claude: use PID-based identity (existing behavior).
-const codexSessionId = process.env.CCT_CODEX_SESSION_ID ?? process.env.CODEX_SESSION_ID;
+const codexSessionId = process.env.CCT_CODEX_SESSION_ID ?? process.env.CODEX_SESSION_ID ?? process.env.CODEX_THREAD_ID;
 const hostPid = detectedRuntime === "codex" ? process.ppid : findClaudePid();
 const cachedPpidStart = getPidStartForPid(hostPid);
 
@@ -513,6 +518,20 @@ async function handleListPeers(): Promise<string> {
   return `${res.data.length} peer(s):\n\n${lines.join("\n")}`;
 }
 
+async function handleWhoAmI(): Promise<string> {
+  const codexLine = detectedRuntime === "codex"
+    ? `\nCodex session/thread ID: ${codexSessionId || "(not propagated to MCP server)"}`
+    : "";
+  return `CCT identity for this session:
+Peer ID: ${myId}
+Peer name: ${myName}
+Runtime: ${detectedRuntime}
+CWD: ${myCwd}
+Pidmap key: ${myPidmapKey}${codexLine}
+
+Use the peer ID or peer name above for CCT addressing. CODEX_THREAD_ID is a Codex session/thread identifier, not an addressable CCT peer ID.`;
+}
+
 async function handleListPools(): Promise<string> {
   const res = await brokerPost<PoolInfo[]>("/pool/list", {});
   if (!res.ok || !res.data) return `Failed: ${res.error}`;
@@ -760,6 +779,9 @@ MESSAGE DELIVERY (Codex):
   const instructions = `You are connected to CCT (Claude Code Talk) — a peer communication system.
 Your peer ID: ${myId} | Your name: ${myName} | CWD: ${myCwd} | Runtime: ${detectedRuntime}
 
+If the user asks for your CCT ID, CCT peer ID, or CCT identity, call cct_whoami.
+Do not answer with CODEX_THREAD_ID; that is a Codex session/thread identifier, not a CCT peer ID.
+
 IMPORTANT: When you see a PreToolUse error mentioning "CCT: N unread message(s)",
 this is NORMAL pool communication, not a tool failure. Call cct_check_messages
 to read your messages, then retry your original action.
@@ -779,6 +801,11 @@ ${cronInstructions}`;
       {
         name: "cct_check_messages",
         description: `Check and read all unread messages (pools + DMs). Your peer ID: ${myId}, peer name: ${myName}`,
+        inputSchema: { type: "object" as const, properties: {} },
+      },
+      {
+        name: "cct_whoami",
+        description: "Show this session's CCT identity. Use this when asked for your CCT ID or peer ID; CODEX_THREAD_ID is not the CCT peer ID.",
         inputSchema: { type: "object" as const, properties: {} },
       },
       {
@@ -943,6 +970,9 @@ ${cronInstructions}`;
       switch (name) {
         case "cct_check_messages":
           text = await handleCheckMessages();
+          break;
+        case "cct_whoami":
+          text = await handleWhoAmI();
           break;
         case "cct_send_message":
           text = await handleSendMessage(args as { to: string; message: string });

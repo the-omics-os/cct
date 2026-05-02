@@ -1,5 +1,5 @@
 #!/usr/bin/env tsx
-import { existsSync, readFileSync, writeFileSync, chmodSync, mkdirSync, copyFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, chmodSync, mkdirSync, copyFileSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
@@ -11,6 +11,7 @@ import {
   BROKER_TOKEN,
   IS_REMOTE,
   CONFIG_PATH,
+  PIDMAP_DIR,
 } from "./shared/constants.ts";
 import type {
   BrokerResponse,
@@ -103,6 +104,135 @@ function padRight(s: string, len: number): string {
   return s.length >= len ? s.slice(0, len) : s + " ".repeat(len - s.length);
 }
 
+type LocalIdentity = {
+  peerId: string;
+  peerName?: string;
+  source: string;
+};
+
+function parsePidmapContent(content: string, source: string): LocalIdentity | null {
+  const [peerId, peerName] = content.trim().split("|");
+  if (!peerId) return null;
+  return { peerId, peerName: peerName || undefined, source };
+}
+
+function readPidmap(path: string): LocalIdentity | null {
+  try {
+    return parsePidmapContent(readFileSync(path, "utf-8"), path);
+  } catch {
+    return null;
+  }
+}
+
+function getPidStartForPid(pid: number): string {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf-8");
+    const fields = stat.split(" ");
+    if (fields[21]) return fields[21];
+  } catch {}
+  try {
+    const proc = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)]);
+    const out = proc.stdout?.toString().trim() ?? "";
+    if (out) return out.replace(/\s+/g, "_");
+  } catch {}
+  return "";
+}
+
+function getParentPid(pid: number): number | null {
+  try {
+    const proc = spawnSync("ps", ["-o", "ppid=", "-p", String(pid)]);
+    const parent = parseInt(proc.stdout?.toString().trim() ?? "", 10);
+    return parent && parent !== 1 ? parent : null;
+  } catch {
+    return null;
+  }
+}
+
+function getCommandForPid(pid: number): string {
+  try {
+    const proc = spawnSync("ps", ["-o", "command=", "-p", String(pid)]);
+    return proc.stdout?.toString().trim() ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function pidHasAncestor(pid: number, ancestorPid: number): boolean {
+  let current: number | null = pid;
+  for (let i = 0; current && i < 12; i++) {
+    if (current === ancestorPid) return true;
+    current = getParentPid(current);
+  }
+  return false;
+}
+
+function findCodexAncestorPid(): number | null {
+  let pid: number | null = process.ppid;
+  for (let i = 0; pid && i < 12; i++) {
+    const cmd = getCommandForPid(pid);
+    if (cmd.includes("/codex") || cmd.endsWith(" codex") || cmd.includes("@openai/codex")) return pid;
+    pid = getParentPid(pid);
+  }
+  return null;
+}
+
+function findPidmapByProcessAncestry(): LocalIdentity | null {
+  let pid: number | null = process.ppid;
+  for (let i = 0; pid && i < 12; i++) {
+    const start = getPidStartForPid(pid);
+    if (start) {
+      const exact = join(PIDMAP_DIR, `${pid}_${start}`);
+      const identity = readPidmap(exact);
+      if (identity) return identity;
+    }
+    pid = getParentPid(pid);
+  }
+  return null;
+}
+
+function findCodexMarkerByAncestry(codexPid: number): LocalIdentity | null {
+  try {
+    const markers = readdirSync(PIDMAP_DIR)
+      .filter((f) => f.startsWith("codex_mcp_"))
+      .map((f) => ({ file: f, pid: parseInt(f.slice("codex_mcp_".length), 10) }))
+      .filter((m) => m.pid && pidHasAncestor(m.pid, codexPid));
+    for (const marker of markers) {
+      const identity = readPidmap(join(PIDMAP_DIR, marker.file));
+      if (identity) return identity;
+    }
+  } catch {}
+  return null;
+}
+
+function resolveLocalIdentity(): LocalIdentity | null {
+  if (process.env.CCT_PEER_ID) {
+    return {
+      peerId: process.env.CCT_PEER_ID,
+      peerName: process.env.CCT_PEER_NAME,
+      source: "CCT_PEER_ID",
+    };
+  }
+
+  const codexSessionId = process.env.CCT_CODEX_SESSION_ID ?? process.env.CODEX_SESSION_ID ?? process.env.CODEX_THREAD_ID;
+  if (codexSessionId) {
+    const sessionPidmap = join(PIDMAP_DIR, `codex_${codexSessionId}`);
+    const identity = readPidmap(sessionPidmap);
+    if (identity) return identity;
+
+    const codexPid = findCodexAncestorPid();
+    const markerIdentity = codexPid ? findCodexMarkerByAncestry(codexPid) : null;
+    if (markerIdentity) {
+      try {
+        writeFileSync(sessionPidmap, `${markerIdentity.peerId}|${markerIdentity.peerName ?? ""}`, { mode: 0o600 });
+        chmodSync(sessionPidmap, 0o600);
+      } catch {}
+      return { ...markerIdentity, source: markerIdentity.source + ` -> ${sessionPidmap}` };
+    }
+  }
+
+  return findPidmapByProcessAncestry();
+}
+
 function readJsonFile(path: string): any {
   if (!existsSync(path)) return {};
   const raw = readFileSync(path, "utf-8");
@@ -126,6 +256,7 @@ Usage: cct <command> [args]
 
 Commands:
   status                       Show broker health, peers, and pools
+  whoami                       Show this session's CCT peer ID and name
   peers                        List all registered peers
   pools                        List all active pools
   pool create <name> [--purpose "..."]  Create a new pool
@@ -180,6 +311,37 @@ async function cmdStatus() {
       const memberNames = p.members.map((m) => m.peer_name).join(", ") || "empty";
       console.log(`  ${p.name} — ${p.purpose || "(no purpose)"} — members: ${memberNames}`);
     }
+  }
+}
+
+async function cmdWhoami() {
+  const identity = resolveLocalIdentity();
+  if (!identity) {
+    die(`No CCT identity found for this process.
+
+If you are in Codex, restart the session after running "cct install", or ask the agent to call the cct_whoami MCP tool.
+Do not use CODEX_THREAD_ID as a CCT address; it is only the Codex session/thread ID.`);
+  }
+
+  let peer: PeerInfo | undefined;
+  try {
+    const res = await brokerFetch<PeerInfo[]>("/list-peers", {});
+    peer = res.data?.find((p) => p.id === identity.peerId);
+  } catch {}
+
+  console.log("CCT identity for this session:");
+  console.log(`  peer_id:   ${identity.peerId}`);
+  console.log(`  peer_name: ${peer?.name ?? identity.peerName ?? "(unknown)"}`);
+  if (peer) {
+    console.log(`  cwd:       ${peer.cwd}`);
+    console.log(`  branch:    ${peer.git_branch ?? "(none)"}`);
+    const pools = peer.pools.map((p) => `${p.pool_name}(${p.role})`).join(", ") || "(none)";
+    console.log(`  pools:     ${pools}`);
+  }
+  console.log(`  source:    ${identity.source}`);
+  const codexThreadId = process.env.CODEX_THREAD_ID ?? process.env.CODEX_SESSION_ID ?? process.env.CCT_CODEX_SESSION_ID;
+  if (codexThreadId) {
+    console.log(`  codex_id:  ${codexThreadId} (not a CCT peer ID)`);
   }
 }
 
@@ -559,12 +721,44 @@ function readTomlFile(path: string): string {
   return readFileSync(path, "utf-8");
 }
 
+function ensureTomlEnvVars(toml: string, vars: string[]): { toml: string; changed: boolean } {
+  const lines = toml.split("\n");
+  const start = lines.findIndex((line) => line.trim() === "[mcp_servers.cct]");
+  if (start === -1) return { toml, changed: false };
+
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i++) {
+    if (lines[i].match(/^\s*\[/)) {
+      end = i;
+      break;
+    }
+  }
+
+  const envLineIndex = lines.slice(start + 1, end).findIndex((line) => line.trim().startsWith("env_vars"));
+  const quoted = vars.map((v) => `"${v}"`);
+
+  if (envLineIndex !== -1) {
+    const absoluteIndex = start + 1 + envLineIndex;
+    const missing = quoted.filter((v) => !lines[absoluteIndex].includes(v));
+    if (missing.length === 0) return { toml, changed: false };
+    lines[absoluteIndex] = lines[absoluteIndex].replace(/\]\s*$/, (suffix) => {
+      const needsComma = !lines[absoluteIndex].match(/\[\s*\]\s*$/) && !lines[absoluteIndex].trim().endsWith("[");
+      return `${needsComma ? ", " : ""}${missing.join(", ")}${suffix}`;
+    });
+    return { toml: lines.join("\n"), changed: true };
+  }
+
+  lines.splice(end, 0, `env_vars = [${quoted.join(", ")}]`);
+  return { toml: lines.join("\n"), changed: true };
+}
+
 function installCodex(): void {
   const cfg = readJsonFile(CONFIG_PATH);
   const configDir = join(homedir(), ".codex");
   if (!existsSync(configDir)) mkdirSync(configDir, { recursive: true });
 
   let toml = readTomlFile(CODEX_CONFIG_PATH);
+  const requiredEnvVars = ["CODEX_THREAD_ID", "CODEX_SESSION_ID", "CCT_CODEX_SESSION_ID"];
 
   // Add codex_hooks feature flag if not present
   if (!toml.includes("codex_hooks")) {
@@ -578,7 +772,7 @@ function installCodex(): void {
   // Add MCP server if not present
   if (!toml.includes("[mcp_servers.cct]")) {
     const envParts: string[] = [`CCT_RUNTIME = "codex"`, `CCT_BROKER = "${cfg.broker || "http://127.0.0.1:7888"}"`];
-    const envVarsList: string[] = [];
+    const envVarsList: string[] = requiredEnvVars.map((v) => `"${v}"`);
     if (cfg.token) envVarsList.push(`"CCT_TOKEN"`);
 
     let mcpSection = `\n[mcp_servers.cct]\ncommand = "npx"\nargs = ["tsx", "${SERVER_PATH}"]\ncwd = "${CCT_DIR}"\nstartup_timeout_sec = 10\ntool_timeout_sec = 30\nenv = { ${envParts.join(", ")} }\n`;
@@ -588,6 +782,10 @@ function installCodex(): void {
     toml += mcpSection;
     console.log(`Added [mcp_servers.cct] to ${CODEX_CONFIG_PATH}`);
   } else {
+    const vars = cfg.token ? [...requiredEnvVars, "CCT_TOKEN"] : requiredEnvVars;
+    const ensured = ensureTomlEnvVars(toml, vars);
+    toml = ensured.toml;
+    if (ensured.changed) console.log(`Updated CCT env_vars in ${CODEX_CONFIG_PATH}`);
     console.log(`MCP server 'cct' already in ${CODEX_CONFIG_PATH}`);
   }
 
@@ -732,6 +930,9 @@ try {
       break;
     case "status":
       await cmdStatus();
+      break;
+    case "whoami":
+      await cmdWhoami();
       break;
     case "peers":
       await cmdPeers();

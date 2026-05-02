@@ -19,6 +19,9 @@
     "server.ts",
     "cli.ts",
     "hook.sh",
+    "hook-codex.sh",
+    "prompt-codex.sh",
+    "session-start-codex.sh",
     "shared/",
     "LICENSE",
     "README.md"

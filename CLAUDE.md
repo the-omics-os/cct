@@ -40,6 +40,7 @@ Machine 1                          Machine 2
 cct install          # Register MCP + hook (one-time setup)
 cct uninstall        # Remove MCP + hook
 cct status           # Broker health, peers, pools
+cct whoami           # Show this session's CCT peer ID/name
 cct peers            # List all registered peers
 cct pools            # List pools with members
 cct services         # List registered infrastructure services
@@ -91,11 +92,12 @@ cct install                           # propagates config to MCP env vars
 
 **Stale peer cleanup on LAN:** The broker can't check remote PIDs, so it uses heartbeat age. Peers not seen for 3× the heartbeat interval (45s) are marked dead. Local peers are also cleaned up via PID check after 1× heartbeat interval.
 
-## MCP Tools (15)
+## MCP Tools (16)
 
 | Tool | Description |
 |------|-------------|
 | `cct_check_messages` | Deferred-ack read: peeks unread messages, acks previous batch. Updates flag. |
+| `cct_whoami` | Show this session's CCT peer ID/name. Use this when asked for CCT identity; `CODEX_THREAD_ID` is not a CCT peer ID. |
 | `cct_send_message` | `@pool` = broadcast, `@pool/peer` = directed pool msg, `peer` = DM |
 | `cct_list_peers` | All peers with name, cwd, branch, summary, pool memberships |
 | `cct_list_pools` | All active pools with members and purpose |
@@ -116,8 +118,8 @@ cct install                           # propagates config to MCP env vars
 ```
 cct/
   broker.ts              HTTP broker + SQLite (29 endpoints, 7 tables, transactions)
-  server.ts              MCP stdio server (15 tools, runtime detection, deferred ack, orphan prevention)
-  cli.ts                 CLI (15 commands, unified installer for Claude + Codex)
+  server.ts              MCP stdio server (16 tools, runtime detection, deferred ack, orphan prevention)
+  cli.ts                 CLI (16 commands, unified installer for Claude + Codex)
   hook.sh                Claude Code PreToolUse hook (pure bash, <10ms, stale detection)
   hook-codex.sh          Codex PreToolUse hook (JSON stdin/stdout, <10ms, session_id lookup)
   prompt-codex.sh        Codex UserPromptSubmit hook (idle delivery via additionalContext)
@@ -172,7 +174,9 @@ CCT supports OpenAI Codex CLI as a first-class runtime. `cct install` auto-detec
 
 **Peer naming:** Codex peers auto-name as `codex-XXXX` (vs `dirname-XXXX` for Claude).
 
-**Identity model:** Codex uses session_id-based pidmaps (`~/.cct/pidmaps/codex_{session_id}`) instead of PID-based. A SessionStart hook bridges Codex's session_id to the MCP server's peer_id via a marker file (`codex_mcp_{pid}`).
+**Identity model:** Codex uses session_id-based pidmaps (`~/.cct/pidmaps/codex_{session_id}`) instead of PID-based. The installer propagates `CODEX_THREAD_ID`/`CODEX_SESSION_ID` into the MCP server when available, and the SessionStart/Prompt/PreToolUse hooks can self-heal the `session_id → peer_id` pidmap from the MCP marker (`codex_mcp_{pid}`). `CODEX_THREAD_ID` is never the CCT address; use `cct_whoami`, `cct whoami`, `cct_list_peers`, or the peer name/ID shown by those commands.
+
+**Critical identity rule:** If a Codex agent is asked "what is your CCT ID?", it must call `cct_whoami` or `cct_list_peers` and report the CCT peer ID/name, for example `9a2b01d7` / `codex-vnni`. It must not inspect env vars and return `CODEX_THREAD_ID`; other peers cannot invite or DM that value. After upgrading an installed Codex integration, run `cct install` and restart Codex sessions so `env_vars` and the new hooks are active. Keep Codex pidmap/flag reads tolerant of files without trailing newlines, because CCT writes these marker files with `printf`/`writeFileSync` and no newline.
 
 **Message delivery:**
 

@@ -203,11 +203,12 @@ CREATE INDEX idx_peers_status ON peers(status)
     summarize.ts                       Local git-based summary
 ```
 
-## MCP Tools (10)
+## MCP Tools (16)
 
 | Tool | Description |
 |------|-------------|
 | `cct_check_messages` | Read all unread messages (all pools + DMs). Marks as read. |
+| `cct_whoami` | Show this session's CCT peer ID/name. `CODEX_THREAD_ID` is not a CCT peer ID. |
 | `cct_send_message` | Send DM (to: "peer-name") or pool broadcast (to: "@pool-name") or directed pool msg (to: "@pool-name/peer-name") |
 | `cct_list_peers` | List all registered peers with name, cwd, branch, summary, pool memberships |
 | `cct_list_pools` | List all active pools with members and purpose |
@@ -217,6 +218,11 @@ CREATE INDEX idx_peers_status ON peers(status)
 | `cct_invite_to_pool` | Add a peer to a pool (forced join in v1) |
 | `cct_set_summary` | Update this peer's work summary |
 | `cct_pool_status` | Show detailed pool info: members, roles, recent activity |
+| `cct_list_services` | List registered infrastructure services |
+| `cct_propose_release` | Propose releasing a peer from a pool |
+| `cct_vote_release` | Vote yes/no on an active release proposal |
+| `cct_set_pool_idle` | Ask pool members to reduce polling during deep work |
+| `cct_clear_pool_idle` | Clear pool idle throttle early |
 
 ## Broker Endpoints
 

@@ -104,6 +104,7 @@ Create ──► Join ──► Collaborate ──► Release Vote ──► Lea
 
 ```bash
 cct status              # broker health, peers, pools
+cct whoami              # show this session's CCT peer ID/name
 cct peers               # list registered peers
 cct pools               # list active pools with members
 cct pool create <name>  # create a pool
@@ -119,11 +120,12 @@ cct install              # register MCP + hooks (Claude Code + Codex)
 cct uninstall            # remove MCP + hooks from all runtimes
 ```
 
-## MCP Tools (15)
+## MCP Tools (16)
 
 | Tool | Description |
 |------|-------------|
 | `cct_check_messages` | Atomic read: polls + marks read in one transaction |
+| `cct_whoami` | Show this session's CCT peer ID/name |
 | `cct_send_message` | `@pool` = broadcast, `@pool/peer` = directed, peer name = DM |
 | `cct_list_peers` | All peers with cwd, branch, summary, pool memberships |
 | `cct_list_pools` | Active pools with members and purpose |
@@ -136,8 +138,8 @@ cct uninstall            # remove MCP + hooks from all runtimes
 | `cct_list_services` | Registered infrastructure services |
 | `cct_propose_release` | Propose releasing a peer (starts democratic vote) |
 | `cct_vote_release` | Vote yes/no on an active release proposal |
-| `cct_set_busy` | Signal busy status with estimated duration |
-| `cct_set_ready` | Clear busy status, notify peers to resume polling |
+| `cct_set_pool_idle` | Ask pool members to reduce polling during deep work |
+| `cct_clear_pool_idle` | Clear pool idle throttle early |
 
 ## LAN Mode
 
@@ -174,8 +176,8 @@ All sessions across all machines see each other. Create a pool, invite peers, an
 ```
 cct/
   broker.ts              HTTP broker + SQLite (32 endpoints, 8 tables)
-  server.ts              MCP stdio server (15 tools, runtime detection, orphan prevention)
-  cli.ts                 Human CLI (15 commands, unified installer)
+  server.ts              MCP stdio server (16 tools, runtime detection, orphan prevention)
+  cli.ts                 Human CLI (16 commands, unified installer)
   hook.sh                Claude Code PreToolUse hook (pure bash, <10ms)
   hook-codex.sh          Codex PreToolUse hook (JSON stdin/stdout, <10ms)
   prompt-codex.sh        Codex UserPromptSubmit hook (idle delivery)
@@ -191,6 +193,8 @@ cct/
 | **Codex CLI** | PreToolUse hook blocks (JSON) | UserPromptSubmit injects context | Session-ID based pidmap |
 
 `cct install` auto-detects both and installs for whichever is present. Cross-tool pools work — Claude and Codex peers communicate in the same pool.
+
+Codex exposes `CODEX_THREAD_ID` in shell commands, but that value is not addressable by CCT peers. Use `cct_whoami` inside the agent or `cct whoami` in a shell to get the CCT peer ID/name that other agents can invite or DM.
 
 ## Process Lifecycle
 
