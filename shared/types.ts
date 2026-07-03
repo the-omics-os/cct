@@ -6,6 +6,10 @@ export interface Peer {
   secret: string;
   pid: number;
   pid_start: string;
+  runtime: string;
+  session_key: string | null;
+  host_pid: number | null;
+  host_pid_start: string | null;
   cwd: string;
   git_root: string | null;
   git_branch: string | null;
@@ -62,8 +66,13 @@ export interface BrokerResponse<T = unknown> {
 export interface RegisterRequest {
   pid: number;
   pid_start: string;
+  runtime?: "claude" | "codex";
+  session_key?: string;
+  host_pid?: number;
+  host_pid_start?: string;
   cwd: string;
   name?: string;
+  name_is_explicit?: boolean;
   git_root?: string;
   git_branch?: string;
 }
@@ -77,11 +86,15 @@ export interface RegisterResponse {
 export interface HeartbeatRequest {
   peer_id: string;
   peer_secret: string;
+  pid?: number;
+  pid_start?: string;
 }
 
 export interface UnregisterRequest {
   peer_id: string;
   peer_secret: string;
+  pid?: number;
+  pid_start?: string;
 }
 
 export interface SetSummaryRequest {

@@ -92,7 +92,7 @@ cct install                           # propagates config to MCP env vars
 
 **Stale peer cleanup on LAN:** The broker can't check remote PIDs, so it uses heartbeat age. Peers not seen for 3× the heartbeat interval (45s) are marked dead. Local peers are also cleaned up via PID check after 1× heartbeat interval.
 
-## MCP Tools (16)
+## MCP Tools (17)
 
 | Tool | Description |
 |------|-------------|
@@ -112,13 +112,14 @@ cct install                           # propagates config to MCP env vars
 | `cct_vote_release` | Vote yes/no on release proposal. |
 | `cct_set_pool_idle` | Request pool throttle for deep work. Broker validates pool activity. |
 | `cct_clear_pool_idle` | Clear pool throttle (setter only). Auto-clears on expiry/leave/new-chat. |
+| `cct_self_terminate` | Kill own session (claude/codex). Shell survives. Requires reason. |
 
 ## Project Structure
 
 ```
 cct/
   broker.ts              HTTP broker + SQLite (29 endpoints, 7 tables, transactions)
-  server.ts              MCP stdio server (16 tools, runtime detection, deferred ack, orphan prevention)
+  server.ts              MCP stdio server (17 tools, runtime detection, deferred ack, orphan prevention)
   cli.ts                 CLI (16 commands, unified installer for Claude + Codex)
   hook.sh                Claude Code PreToolUse hook (pure bash, <10ms, stale detection)
   hook-codex.sh          Codex PreToolUse hook (JSON stdin/stdout, <10ms, session_id lookup)
@@ -166,6 +167,8 @@ The MCP server enforces this: join/create responses include the cron setup remin
 
 **Idle session limitation:** There is no way to push into an idle Claude Code session via MCP. CronCreate bottoms out at 60s. The PreToolUse hook only fires during tool calls. Phase 5 (PTY Launcher) will solve this with `cct claude` wrapping the session for sub-10s delivery.
 
+**Stable identity (both runtimes):** The CCT peer ID/name is anchored to a stable session key so it survives MCP restarts, `/mcp` reconnects, and network transitions (e.g. a Wi-Fi change that lets the broker mark the peer dead). Claude uses `CLAUDE_CODE_SESSION_ID`; Codex uses its session id. The broker de-dupes registrations on `(runtime, session_key)` and revives the same row (same id/secret/name) even if it was marked dead — **and restores the pool memberships that death dropped** (via `died_at`/`left_at` pairing), so the reclaimed peer isn't silently mute in its pools. `server.ts` recovers in place on a `peer not found` heartbeat instead of exiting, but only while the host process is alive (checked in `reregister`, so a genuine orphan is not resurrected). Peers with no session key fall back to legacy ephemeral (new id per registration). Limitations: a *dead* stdio MCP process still needs `/mcp` reconnect; two live sessions sharing one `CLAUDE_CODE_SESSION_ID` collapse to one row. See ARCHITECTURE **D11b**.
+
 ## Codex CLI Integration
 
 CCT supports OpenAI Codex CLI as a first-class runtime. `cct install` auto-detects Codex and configures it.
@@ -174,9 +177,9 @@ CCT supports OpenAI Codex CLI as a first-class runtime. `cct install` auto-detec
 
 **Peer naming:** Codex peers auto-name as `codex-XXXX` (vs `dirname-XXXX` for Claude).
 
-**Identity model:** Codex uses session_id-based pidmaps (`~/.cct/pidmaps/codex_{session_id}`) instead of PID-based. The installer propagates `CODEX_THREAD_ID`/`CODEX_SESSION_ID` into the MCP server when available, and the SessionStart/Prompt/PreToolUse hooks can self-heal the `session_id → peer_id` pidmap from the MCP marker (`codex_mcp_{pid}`). `CODEX_THREAD_ID` is never the CCT address; use `cct_whoami`, `cct whoami`, `cct_list_peers`, or the peer name/ID shown by those commands.
+**Identity model:** Codex uses session-keyed broker registration plus session_id-based pidmaps (`~/.cct/pidmaps/codex_{session_id}`) instead of PID-based identity. The installer propagates `CODEX_THREAD_ID`/`CODEX_SESSION_ID` into the MCP server when available. The broker treats that value as a stable session key and reuses the same CCT peer row on duplicate MCP starts or reconnects, while the SessionStart/Prompt/PreToolUse hooks keep the `session_id → peer_id` pidmap fresh from the MCP marker (`codex_mcp_{pid}`). `CODEX_THREAD_ID` is never the CCT address; use `cct_whoami`, `cct whoami`, `cct_list_peers`, or the peer name/ID shown by those commands.
 
-**Critical identity rule:** If a Codex agent is asked "what is your CCT ID?", it must call `cct_whoami` or `cct_list_peers` and report the CCT peer ID/name, for example `9a2b01d7` / `codex-vnni`. It must not inspect env vars and return `CODEX_THREAD_ID`; other peers cannot invite or DM that value. After upgrading an installed Codex integration, run `cct install` and restart Codex sessions so `env_vars` and the new hooks are active. Keep Codex pidmap/flag reads tolerant of files without trailing newlines, because CCT writes these marker files with `printf`/`writeFileSync` and no newline.
+**Critical identity rule:** If a Codex agent is asked "what is your CCT ID?", it must call `cct_whoami` or `cct_list_peers` and report the CCT peer ID/name, for example `9a2b01d7` / `codex-vnni`. It must not inspect env vars and return `CODEX_THREAD_ID`; other peers cannot invite or DM that value. After upgrading an installed Codex integration, run `cct install` and restart Codex sessions so `env_vars` and the new hooks are active. Keep Codex pidmap/flag reads tolerant of files without trailing newlines, because CCT writes these marker files with `printf`/`writeFileSync` and no newline. Duplicate MCP servers for one Codex session must converge on one peer row; stale duplicate processes must not unregister the current peer.
 
 **Message delivery:**
 
@@ -210,12 +213,12 @@ CCT state is exposed in the Claude Code status line (`~/.claude/statusline.sh`):
 
 ## Process Lifecycle (Orphan Prevention)
 
-MCP stdio servers are spawned per Claude Code session. When sessions end, the server must self-terminate. Three layers ensure no orphaned processes accumulate:
+MCP stdio servers are spawned per Claude Code/Codex session. When sessions end, the server must self-terminate. Codex registrations include both the MCP server PID and the host Codex PID so an orphaned MCP server cannot stay visible after Codex exits. Three layers ensure no orphaned processes accumulate:
 
 | Layer | Mechanism | Latency | Signal |
 |-------|-----------|---------|--------|
 | 1 | **stdin EOF/close** | Instant | Claude Code exits → pipe closes → `process.stdin.once('end'/'close')` |
-| 2 | **Parent death monitor** | ≤30s | `kill(claudePid, 0)` + PID start-time validation every 30s |
+| 2 | **Host death monitor** | ≤30s | `kill(hostPid, 0)` + PID start-time validation every 30s (`claude` for Claude Code, `codex` for Codex CLI) |
 | 3 | **Idle timeout** | Configurable | `CCT_IDLE_TIMEOUT_MS` env var, disabled by default (sessions can run for days) |
 
 All triggers route through `requestCleanup(reason)` — idempotent guard prevents double cleanup. A 5s force-exit deadline prevents hanging on broker I/O during cleanup. Cleanup unregisters from broker, clears pidmap/flag files, and exits.

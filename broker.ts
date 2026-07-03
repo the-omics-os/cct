@@ -1,8 +1,9 @@
 #!/usr/bin/env tsx
 import { DatabaseSync as Database } from "node:sqlite";
-import { mkdirSync, existsSync, statSync, chmodSync, unlinkSync, readdirSync } from "node:fs";
+import { mkdirSync, existsSync, statSync, chmodSync, unlinkSync, readdirSync, readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import {
   BROKER_PORT,
   BROKER_BIND_HOST,
@@ -81,6 +82,10 @@ CREATE TABLE IF NOT EXISTS peers (
   secret        TEXT NOT NULL,
   pid           INTEGER NOT NULL,
   pid_start     TEXT NOT NULL,
+  runtime       TEXT NOT NULL DEFAULT 'claude',
+  session_key   TEXT,
+  host_pid      INTEGER,
+  host_pid_start TEXT,
   cwd           TEXT NOT NULL,
   git_root      TEXT,
   git_branch    TEXT,
@@ -184,6 +189,19 @@ try { db.exec("ALTER TABLE pool_members ADD COLUMN busy_until TEXT"); } catch {}
 try { db.exec("ALTER TABLE pool_members ADD COLUMN busy_reason TEXT NOT NULL DEFAULT ''"); } catch {}
 try { db.exec("ALTER TABLE pool_releases ADD COLUMN quorum_needed INTEGER NOT NULL DEFAULT 0"); } catch {}
 try { db.exec("ALTER TABLE pool_releases ADD COLUMN eligible_voters TEXT NOT NULL DEFAULT '[]'"); } catch {}
+try { db.exec("ALTER TABLE peers ADD COLUMN runtime TEXT NOT NULL DEFAULT 'claude'"); } catch {}
+try { db.exec("ALTER TABLE peers ADD COLUMN session_key TEXT"); } catch {}
+try { db.exec("ALTER TABLE peers ADD COLUMN host_pid INTEGER"); } catch {}
+try { db.exec("ALTER TABLE peers ADD COLUMN host_pid_start TEXT"); } catch {}
+// died_at: when a peer was marked dead. Used to restore the exact pool
+// memberships that were dropped BY that death (not ones the peer explicitly
+// left earlier) when a session-keyed peer re-registers and reclaims its row.
+try { db.exec("ALTER TABLE peers ADD COLUMN died_at TEXT"); } catch {}
+
+db.exec(`
+CREATE INDEX IF NOT EXISTS idx_peers_session_key ON peers(runtime, session_key)
+  WHERE session_key IS NOT NULL;
+`);
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS pool_throttles (
@@ -224,13 +242,40 @@ function requireSecret(peerId: string, secret: string): string | null {
   return null;
 }
 
+function getPidStartForPid(pid: number): string {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf-8");
+    const fields = stat.split(" ");
+    if (fields[21]) return fields[21];
+  } catch {}
+  try {
+    const proc = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)]);
+    const out = proc.stdout?.toString().trim() ?? "";
+    if (out) return out.replace(/\s+/g, "_");
+  } catch {}
+  return "";
+}
+
+function pidStartMatches(pid: number, expectedStart: string): boolean {
+  if (!expectedStart) return true;
+  const currentStart = getPidStartForPid(pid);
+  if (!currentStart) return false;
+  if (currentStart === expectedStart) return true;
+
+  // Older tests and older clients sometimes sent epoch seconds on macOS,
+  // where the broker can only observe lstart. Treat that as legacy PID-only.
+  if (/^\d+$/.test(expectedStart) && !/^\d+$/.test(currentStart)) return true;
+
+  return false;
+}
+
 function pidIsAlive(pid: number, pidStart: string): boolean {
   try {
     process.kill(pid, 0);
-    return true;
   } catch {
     return false;
   }
+  return pidStartMatches(pid, pidStart);
 }
 
 function getNextSeq(poolId: string | null): number {
@@ -302,8 +347,117 @@ function handleHealth(): BrokerResponse {
   return ok({ status: "ok", peers: peers.cnt, pools: pools.cnt });
 }
 
-function handleRegister(body: RegisterRequest): BrokerResponse {
+// Restore pool memberships that were dropped when a peer was marked dead, so a
+// session-keyed re-register reclaims a fully-functional identity (not just the
+// same id). Only touches memberships whose left_at matches the death timestamp;
+// un-archives pools that were archived by that death. Runs inside the caller's
+// transaction (registerPeerTx). No system "rejoined" spam — the peer never
+// intended to leave; from the pool's view it just reconnected.
+function restoreMembershipsAfterRevive(peerId: string, diedAt: string): void {
+  const dropped = db.prepare(
+    "SELECT pool_id FROM pool_members WHERE peer_id = ? AND status = 'left' AND left_at = ?"
+  ).all(peerId, diedAt) as { pool_id: string }[];
+
+  for (const { pool_id } of dropped) {
+    // Only reactivate pools that still exist; un-archive if the death emptied them.
+    const pool = db.prepare("SELECT status FROM pools WHERE id = ?").get(pool_id) as { status: string } | null;
+    if (!pool) continue;
+    db.prepare(
+      "UPDATE pool_members SET status = 'active', left_at = NULL WHERE pool_id = ? AND peer_id = ?"
+    ).run(pool_id, peerId);
+    if (pool.status === "archived") {
+      db.prepare("UPDATE pools SET status = 'active' WHERE id = ?").run(pool_id);
+    }
+    const peer = db.prepare("SELECT name FROM peers WHERE id = ?").get(peerId) as { name: string } | null;
+    insertSystemMessage(pool_id, `Peer ${peer?.name ?? peerId} reconnected.`, undefined, peerId);
+  }
+}
+
+const registerPeerTx = transaction((body: RegisterRequest, id: string, secret: string) => {
   const { pid, pid_start, cwd, name, git_root, git_branch } = body;
+  const runtime = body.runtime ?? "claude";
+  const sessionKey = body.session_key || null;
+  const ts = now();
+
+  if (sessionKey) {
+    const existing = db.prepare(
+      `SELECT id, name, secret, status, died_at FROM peers
+       WHERE runtime = ? AND session_key = ?
+       ORDER BY status = 'active' DESC, registered_at DESC
+       LIMIT 1`
+    ).get(runtime, sessionKey) as { id: string; name: string; secret: string; status: string; died_at: string | null } | null;
+
+    if (existing) {
+      const nextName = body.name_is_explicit && name ? name : existing.name;
+      const wasDead = existing.status === "dead";
+      db.prepare(
+        `UPDATE peers
+         SET name = ?, pid = ?, pid_start = ?, host_pid = ?, host_pid_start = ?,
+             cwd = ?, git_root = ?, git_branch = ?, status = 'active', last_seen = ?, died_at = NULL
+         WHERE id = ?`
+      ).run(
+        nextName,
+        pid,
+        pid_start,
+        body.host_pid ?? null,
+        body.host_pid_start ?? null,
+        cwd,
+        git_root ?? null,
+        git_branch ?? null,
+        ts,
+        existing.id,
+      );
+
+      db.prepare(
+        `UPDATE peers
+         SET status = 'dead'
+         WHERE runtime = ? AND session_key = ? AND id != ? AND status = 'active'`
+      ).run(runtime, sessionKey, existing.id);
+
+      // Recovery: if this row had been marked dead (e.g. by stale cleanup during
+      // a network outage), stale cleanup also dropped its pool memberships and may
+      // have archived now-empty pools. Restore exactly the memberships that death
+      // removed (left_at == died_at) so the reclaimed identity is not silently mute
+      // in its pools. Memberships the peer left on its own have a different left_at
+      // and are left untouched.
+      if (wasDead && existing.died_at) {
+        restoreMembershipsAfterRevive(existing.id, existing.died_at);
+      }
+
+      return { id: existing.id, secret: existing.secret, name: nextName };
+    }
+  }
+
+  const peerName = name || `peer-${id}`;
+
+  db.prepare(
+    `INSERT INTO peers (
+       id, name, secret, pid, pid_start, runtime, session_key, host_pid, host_pid_start,
+       cwd, git_root, git_branch, summary, status, registered_at, last_seen
+     )
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 'active', ?, ?)`
+  ).run(
+    id,
+    peerName,
+    secret,
+    pid,
+    pid_start,
+    runtime,
+    sessionKey,
+    body.host_pid ?? null,
+    body.host_pid_start ?? null,
+    cwd,
+    git_root ?? null,
+    git_branch ?? null,
+    ts,
+    ts,
+  );
+
+  return { id, secret, name: peerName };
+});
+
+function handleRegister(body: RegisterRequest): BrokerResponse {
+  const { pid, pid_start, cwd } = body;
 
   if (!pid || !pid_start || !cwd) {
     return err("pid, pid_start, and cwd are required");
@@ -311,20 +465,21 @@ function handleRegister(body: RegisterRequest): BrokerResponse {
 
   const id = genId(PEER_ID_LENGTH);
   const secret = genSecret();
-  const peerName = name || `peer-${id}`;
-  const ts = now();
-
-  db.prepare(
-    `INSERT INTO peers (id, name, secret, pid, pid_start, cwd, git_root, git_branch, summary, status, registered_at, last_seen)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', 'active', ?, ?)`
-  ).run(id, peerName, secret, pid, pid_start, cwd, git_root ?? null, git_branch ?? null, ts, ts);
-
-  return ok({ id, secret, name: peerName });
+  return ok(registerPeerTx(body, id, secret));
 }
 
 function handleHeartbeat(body: HeartbeatRequest): BrokerResponse {
   const authErr = requireSecret(body.peer_id, body.peer_secret);
   if (authErr) return err(authErr);
+
+  if (body.pid) {
+    const row = db.prepare("SELECT pid, pid_start FROM peers WHERE id = ? AND status = 'active'").get(body.peer_id) as
+      { pid: number; pid_start: string } | null;
+    if (!row) return err("peer not found or not active");
+    if (row.pid !== body.pid || row.pid_start !== (body.pid_start ?? row.pid_start)) {
+      return ok({ acknowledged: false, stale_registration: true });
+    }
+  }
 
   db.prepare("UPDATE peers SET last_seen = ? WHERE id = ?").run(now(), body.peer_id);
   return ok({ acknowledged: true });
@@ -333,6 +488,14 @@ function handleHeartbeat(body: HeartbeatRequest): BrokerResponse {
 function handleUnregister(body: UnregisterRequest): BrokerResponse {
   const authErr = requireSecret(body.peer_id, body.peer_secret);
   if (authErr) return err(authErr);
+
+  if (body.pid) {
+    const row = db.prepare("SELECT pid, pid_start FROM peers WHERE id = ?").get(body.peer_id) as
+      { pid: number; pid_start: string } | null;
+    if (row && (row.pid !== body.pid || row.pid_start !== (body.pid_start ?? row.pid_start))) {
+      return ok({ unregistered: false, stale_registration: true });
+    }
+  }
 
   markPeerDead(body.peer_id);
   return ok({ unregistered: true });
@@ -350,7 +513,11 @@ function cancelOpenProposalsForPeer(peerId: string): void {
 }
 
 const markPeerDeadTx = transaction((peerId: string) => {
-  db.prepare("UPDATE peers SET status = 'dead' WHERE id = ?").run(peerId);
+  const deathTs = now();
+  // Stamp died_at with the SAME timestamp used for the membership left_at below,
+  // so a later session-keyed revive can identify exactly which memberships this
+  // death dropped (left_at == died_at) versus ones the peer left on its own.
+  db.prepare("UPDATE peers SET status = 'dead', died_at = ? WHERE id = ?").run(deathTs, peerId);
 
   const peer = db.prepare("SELECT name, cwd FROM peers WHERE id = ?").get(peerId) as { name: string; cwd: string } | null;
   const poolMemberships = db.prepare(
@@ -362,7 +529,7 @@ const markPeerDeadTx = transaction((peerId: string) => {
   for (const { pool_id } of poolMemberships) {
     db.prepare(
       "UPDATE pool_members SET status = 'left', left_at = ? WHERE pool_id = ? AND peer_id = ?"
-    ).run(now(), pool_id, peerId);
+    ).run(deathTs, pool_id, peerId);
     insertSystemMessage(pool_id, `Peer ${peer?.name ?? peerId} (${peer?.cwd ?? "unknown"}) disconnected.`);
     db.prepare("DELETE FROM pool_throttles WHERE pool_id = ? AND set_by_peer_id = ?").run(pool_id, peerId);
     archivePoolIfEmpty(pool_id);
@@ -1588,27 +1755,37 @@ function cleanupPeerArtifacts(peerId: string, pid: number): void {
   try {
     const files = readdirSync(PIDMAP_DIR);
     for (const f of files) {
-      if (f.startsWith(`${pid}_`)) {
-        try { unlinkSync(`${PIDMAP_DIR}/${f}`); } catch {}
+      let shouldDelete = f.startsWith(`${pid}_`) || f === `codex_mcp_${pid}`;
+      if (!shouldDelete && f.startsWith("codex_")) {
+        try {
+          const content = readFileSync(`${PIDMAP_DIR}/${f}`, "utf-8");
+          shouldDelete = content.split("|")[0] === peerId;
+        } catch {}
       }
+      if (shouldDelete) try { unlinkSync(`${PIDMAP_DIR}/${f}`); } catch {}
     }
   } catch {}
 }
 
 function cleanupStalePeers(): void {
-  const activePeers = db.prepare("SELECT id, pid, pid_start, last_seen FROM peers WHERE status = 'active'").all() as {
+  const activePeers = db.prepare(
+    "SELECT id, pid, pid_start, host_pid, host_pid_start, last_seen FROM peers WHERE status = 'active'"
+  ).all() as {
     id: string;
     pid: number;
     pid_start: string;
+    host_pid: number | null;
+    host_pid_start: string | null;
     last_seen: string;
   }[];
 
   for (const peer of activePeers) {
     const age = Date.now() - new Date(peer.last_seen).getTime();
     const pidDead = !pidIsAlive(peer.pid, peer.pid_start);
+    const hostDead = peer.host_pid != null && !pidIsAlive(peer.host_pid, peer.host_pid_start ?? "");
     const heartbeatStale = age > HEARTBEAT_INTERVAL_MS * 3;
 
-    if ((pidDead && age > HEARTBEAT_INTERVAL_MS) || heartbeatStale) {
+    if (hostDead || (pidDead && age > HEARTBEAT_INTERVAL_MS) || heartbeatStale) {
       markPeerDead(peer.id);
       cleanupPeerArtifacts(peer.id, peer.pid);
     }

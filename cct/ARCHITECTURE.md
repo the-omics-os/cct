@@ -80,6 +80,25 @@ When the last member exits (process dies or leaves), the pool status becomes `ar
 
 Broker checks PIDs every 30s. Dead peers are marked `status = 'dead'`. A system message is inserted into each pool the dead peer was in: "Peer X (cwd) disconnected." Pool members see it on their next check.
 
+### D11b: Stable peer identity across restarts and network changes
+**Decision: Anchor registration to a stable session key, for BOTH runtimes. Recover in place on reap, never mint a fresh id mid-session.**
+
+The CCT peer id/name must survive MCP-server restarts, `/mcp` reconnects, and network transitions (e.g. a Wi-Fi change that makes the broker unreachable long enough for stale-cleanup to mark the peer dead). To achieve this, `/register` is keyed on `session_key`:
+
+- **Codex** → the Codex session id (`CODEX_SESSION_ID` / `CODEX_THREAD_ID`).
+- **Claude** → `CLAUDE_CODE_SESSION_ID` (stable for the whole Claude Code session; inherited by the spawned `npx tsx` MCP server).
+
+When a `session_key` is present, the broker de-dupes on `(runtime, session_key)`: a re-register **revives the existing row** (even if `status='dead'`) and returns the **same id, secret, and name**, superseding any older duplicate. Peers with no session key fall back to the legacy ephemeral behavior (a fresh random id per registration).
+
+**Membership restore (critical).** Marking a peer dead does more than flip `peers.status` — `markPeerDeadTx` also drops every active `pool_members` row to `left` and archives now-empty pools. So reviving only the `peers` row would return the same id but leave the peer **mute**: excluded from pool broadcasts (fan-out selects only active members) and rejected on its own pool sends. To prevent this, `markPeerDeadTx` stamps `peers.died_at` with the same timestamp it writes to the dropped memberships' `left_at`. On a session-keyed revive of a row that `was dead`, `restoreMembershipsAfterRevive` reactivates exactly the memberships whose `left_at == died_at` (the ones *that death* dropped — not pools the peer left on its own earlier) and un-archives those pools, emitting a "reconnected" system message. `died_at` is cleared on revive.
+
+Recovery is proactive: `server.ts:sendHeartbeat` no longer exits when the broker reports `peer not found / not active`. If a `session_key` is set **and the host process is still alive** (`reregister` itself re-checks `isOriginalProcessAlive` — orphan prevention must not depend on the 30s monitor alone), it re-registers in place, reclaims the row, and rewrites the pidmap/flag. It still shuts down on `stale_registration` (a newer instance owns the row — we're the orphan) and on `invalid peer_secret` (a different holder). Deferred-ack ids are bound to the peer id they were peeked under (`pendingAckPeerId`); if recovery ever changes the id, stale acks are dropped rather than misfired. PID-reuse protection (D12) is unchanged: `pid`/`pid_start`/`host_pid` are refreshed on every register/heartbeat.
+
+**Known limitations (accepted, not bugs):**
+- **Dead stdio MCP server is not resurrected.** Claude Code does not auto-respawn a dead stdio MCP server. This fix removes the *self-inflicted* exit on `peer not found`, so an alive-but-network-blipped server recovers; but if the MCP process itself dies, recovery needs a `/mcp` reconnect or session restart. The session_key still guarantees the *same* id is reclaimed when it does come back.
+- **Two live sessions sharing one `CLAUDE_CODE_SESSION_ID` collapse to one peer row** (e.g. a resumed session in two terminals). This is inherent to session-keying — adding a per-process discriminator would reintroduce the original "new id on every restart" bug. Last registration wins the row; the older instance retires on its next heartbeat via `stale_registration`.
+- **`cli.ts` (`cct whoami` from a bare shell) still resolves identity via pidmap process-ancestry, not the session key.** Works for shells descended from the Claude host; a detached shell that only has the env var can't resolve the peer. Low impact — the MCP tools (`cct_whoami`) are authoritative.
+
 ### D12: Security model
 **Decision: Per-user private runtime directory. Peer secrets for broker auth.**
 
@@ -124,11 +143,16 @@ CREATE TABLE peers (
   secret        TEXT NOT NULL,            -- 32-char random, required for mutations
   pid           INTEGER NOT NULL,
   pid_start     TEXT NOT NULL,            -- process start time (prevents PID reuse)
+  runtime       TEXT NOT NULL DEFAULT 'claude',
+  session_key   TEXT,                     -- stable session id (Codex session id / CLAUDE_CODE_SESSION_ID); NULL for legacy PID-keyed peers
+  host_pid      INTEGER,                  -- Claude/Codex host process watched for orphan cleanup
+  host_pid_start TEXT,
   cwd           TEXT NOT NULL,
   git_root      TEXT,
   git_branch    TEXT,
   summary       TEXT NOT NULL DEFAULT '',
   status        TEXT NOT NULL DEFAULT 'active',  -- 'active', 'dead'
+  died_at       TEXT,                    -- when marked dead; matches dropped memberships' left_at for revive
   registered_at TEXT NOT NULL,
   last_seen     TEXT NOT NULL
 );

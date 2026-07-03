@@ -131,6 +131,167 @@ PEERS=$(post "/list-peers" "{}")
 check_contains "list-peers shows peer A" "peer-alpha" "$PEERS"
 check_contains "list-peers shows peer B" "peer-beta" "$PEERS"
 
+echo ""
+echo "=== Codex session identity ==="
+
+sleep 300 &
+SLEEP_PIDS+=($!)
+PID_CODEX_1=$!
+
+sleep 300 &
+SLEEP_PIDS+=($!)
+PID_CODEX_2=$!
+PIDSTART_CODEX_1=$(date +%s)
+PIDSTART_CODEX_2=$(date +%s)
+
+CODEX_REG_1=$(post "/register" "{\"pid\":$PID_CODEX_1,\"pid_start\":\"$PIDSTART_CODEX_1\",\"runtime\":\"codex\",\"session_key\":\"codex-session-1\",\"host_pid\":$PID_CODEX_1,\"host_pid_start\":\"$PIDSTART_CODEX_1\",\"cwd\":\"/tmp/codex\",\"name\":\"codex-first\",\"name_is_explicit\":false}")
+CODEX_ID_1=$(json_field "$CODEX_REG_1" "['data']['id']")
+CODEX_SECRET_1=$(json_field "$CODEX_REG_1" "['data']['secret']")
+CODEX_NAME_1=$(json_field "$CODEX_REG_1" "['data']['name']")
+check "Codex first registration name" "codex-first" "$CODEX_NAME_1"
+
+CODEX_REG_2=$(post "/register" "{\"pid\":$PID_CODEX_2,\"pid_start\":\"$PIDSTART_CODEX_2\",\"runtime\":\"codex\",\"session_key\":\"codex-session-1\",\"host_pid\":$PID_CODEX_2,\"host_pid_start\":\"$PIDSTART_CODEX_2\",\"cwd\":\"/tmp/codex\",\"name\":\"codex-second\",\"name_is_explicit\":false}")
+CODEX_ID_2=$(json_field "$CODEX_REG_2" "['data']['id']")
+CODEX_NAME_2=$(json_field "$CODEX_REG_2" "['data']['name']")
+check "Codex duplicate keeps same peer id" "$CODEX_ID_1" "$CODEX_ID_2"
+check "Codex duplicate keeps stable generated name" "codex-first" "$CODEX_NAME_2"
+CODEX_SECRET_2=$(json_field "$CODEX_REG_2" "['data']['secret']")
+check "Codex duplicate keeps logical peer secret" "$CODEX_SECRET_1" "$CODEX_SECRET_2"
+
+CODEX_STALE_UNREG=$(post "/unregister" "{\"peer_id\":\"$CODEX_ID_1\",\"peer_secret\":\"$CODEX_SECRET_1\",\"pid\":$PID_CODEX_1,\"pid_start\":\"$PIDSTART_CODEX_1\"}")
+check_contains "Old Codex duplicate process cannot unregister current peer" "stale_registration" "$CODEX_STALE_UNREG"
+
+CODEX_STILL_ACTIVE=$(post "/heartbeat" "{\"peer_id\":\"$CODEX_ID_2\",\"peer_secret\":\"$CODEX_SECRET_2\"}")
+check_contains "Codex peer remains active after stale unregister" "\"ok\":true" "$CODEX_STILL_ACTIVE"
+
+CODEX_STALE_HEARTBEAT=$(post "/heartbeat" "{\"peer_id\":\"$CODEX_ID_1\",\"peer_secret\":\"$CODEX_SECRET_1\",\"pid\":$PID_CODEX_1,\"pid_start\":\"$PIDSTART_CODEX_1\"}")
+check_contains "Old Codex duplicate process cannot heartbeat current peer" "stale_registration" "$CODEX_STALE_HEARTBEAT"
+
+CODEX_CURRENT_HEARTBEAT=$(post "/heartbeat" "{\"peer_id\":\"$CODEX_ID_2\",\"peer_secret\":\"$CODEX_SECRET_2\",\"pid\":$PID_CODEX_2,\"pid_start\":\"$PIDSTART_CODEX_2\"}")
+check_contains "Current Codex process heartbeat accepted" "\"acknowledged\":true" "$CODEX_CURRENT_HEARTBEAT"
+
+CODEX_CUR_UNREG=$(post "/unregister" "{\"peer_id\":\"$CODEX_ID_2\",\"peer_secret\":\"$CODEX_SECRET_2\",\"pid\":$PID_CODEX_2,\"pid_start\":\"$PIDSTART_CODEX_2\"}")
+if echo "$CODEX_CUR_UNREG" | grep -q "stale_registration"; then
+  fail "Current Codex process should be allowed to unregister"
+else
+  pass "Current Codex process can unregister"
+fi
+
+CODEX_REG_3=$(post "/register" "{\"pid\":$PID_CODEX_2,\"pid_start\":\"$PIDSTART_CODEX_2\",\"runtime\":\"codex\",\"session_key\":\"codex-session-1\",\"host_pid\":$PID_CODEX_2,\"host_pid_start\":\"$PIDSTART_CODEX_2\",\"cwd\":\"/tmp/codex\",\"name\":\"codex-third\",\"name_is_explicit\":false}")
+CODEX_ID_3=$(json_field "$CODEX_REG_3" "['data']['id']")
+check "Codex session reuses peer id after reconnect" "$CODEX_ID_1" "$CODEX_ID_3"
+
+PEERS_AFTER_CODEX=$(post "/list-peers" "{}")
+check_contains "list-peers shows canonical Codex peer" "codex-first" "$PEERS_AFTER_CODEX"
+check_not_contains "list-peers hides second Codex name" "codex-second" "$PEERS_AFTER_CODEX"
+check_not_contains "list-peers hides third Codex name" "codex-third" "$PEERS_AFTER_CODEX"
+
+echo ""
+echo "=== Claude session identity (stable ID across restarts / Wi-Fi changes) ==="
+
+sleep 300 &
+SLEEP_PIDS+=($!)
+PID_CL_1=$!
+sleep 300 &
+SLEEP_PIDS+=($!)
+PID_CL_2=$!
+PIDSTART_CL_1=$(date +%s)
+PIDSTART_CL_2=$(date +%s)
+
+# First register with a Claude session_key (CLAUDE_CODE_SESSION_ID)
+CL_REG_1=$(post "/register" "{\"pid\":$PID_CL_1,\"pid_start\":\"$PIDSTART_CL_1\",\"runtime\":\"claude\",\"session_key\":\"claude-session-1\",\"host_pid\":$PID_CL_1,\"host_pid_start\":\"$PIDSTART_CL_1\",\"cwd\":\"/tmp/claude\",\"name\":\"claude-first\",\"name_is_explicit\":false}")
+CL_ID_1=$(json_field "$CL_REG_1" "['data']['id']")
+CL_SECRET_1=$(json_field "$CL_REG_1" "['data']['secret']")
+check "Claude first registration name" "claude-first" "$(json_field "$CL_REG_1" "['data']['name']")"
+
+# MCP server restart (e.g. new host PID after reconnect) — same session_key.
+# Must reuse the SAME peer id/secret/name so the CCT identity is stable.
+CL_REG_2=$(post "/register" "{\"pid\":$PID_CL_2,\"pid_start\":\"$PIDSTART_CL_2\",\"runtime\":\"claude\",\"session_key\":\"claude-session-1\",\"host_pid\":$PID_CL_2,\"host_pid_start\":\"$PIDSTART_CL_2\",\"cwd\":\"/tmp/claude\",\"name\":\"claude-second\",\"name_is_explicit\":false}")
+check "Claude re-register keeps same peer id" "$CL_ID_1" "$(json_field "$CL_REG_2" "['data']['id']")"
+check "Claude re-register keeps stable name" "claude-first" "$(json_field "$CL_REG_2" "['data']['name']")"
+check "Claude re-register keeps same secret" "$CL_SECRET_1" "$(json_field "$CL_REG_2" "['data']['secret']")"
+
+# --- Wi-Fi outage recovery: identity AND pool membership must survive ---
+# The naive check (same id after a bare status='dead') is not enough: real stale
+# cleanup (markPeerDeadTx) also drops pool memberships and archives emptied pools.
+# The revived peer must reclaim BOTH its id and its pool memberships, or it comes
+# back mute (excluded from broadcasts, own sends rejected). Ref: Codex finding #1.
+
+# claude peer is in two pools before the outage:
+#   - claude-wifi-pool: shared with peer B (tests bidirectional delivery)
+#   - claude-solo-pool: claude only (tests archive → un-archive on revive)
+post "/pool/create" "{\"peer_id\":\"$CL_ID_1\",\"peer_secret\":\"$CL_SECRET_1\",\"name\":\"claude-wifi-pool\",\"purpose\":\"wifi test\"}" > /dev/null
+post "/pool/invite" "{\"peer_id\":\"$CL_ID_1\",\"peer_secret\":\"$CL_SECRET_1\",\"target_peer_id\":\"$PEER_B_ID\",\"pool_name\":\"claude-wifi-pool\"}" > /dev/null
+post "/pool/create" "{\"peer_id\":\"$CL_ID_1\",\"peer_secret\":\"$CL_SECRET_1\",\"name\":\"claude-solo-pool\",\"purpose\":\"solo test\"}" > /dev/null
+
+# Simulate the FULL effect of stale cleanup's markPeerDeadTx during the outage:
+# status='dead' + died_at=T, and every active membership marked left with left_at=T
+# (same timestamp — that pairing is how revive knows what death dropped). The solo
+# pool becomes empty, so it is archived, exactly like archivePoolIfEmpty would.
+python3 << PYEOF
+import sqlite3, os, datetime
+db = sqlite3.connect(os.environ['CCT_DIR'] + '/cct.db')
+t = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
+db.execute("UPDATE peers SET status='dead', died_at=? WHERE id=?", (t, '$CL_ID_1'))
+db.execute("UPDATE pool_members SET status='left', left_at=? WHERE peer_id=? AND status='active'", (t, '$CL_ID_1'))
+# solo pool now has no active members → archived (mirrors archivePoolIfEmpty)
+db.execute("""UPDATE pools SET status='archived' WHERE name='claude-solo-pool'
+              AND NOT EXISTS (SELECT 1 FROM pool_members pm WHERE pm.pool_id=pools.id AND pm.status='active')""")
+db.commit()
+db.close()
+PYEOF
+
+# While dead, the peer is mute: it is not an active member of its shared pool.
+STATUS_DEAD=$(post "/pool/status" "{\"pool_name\":\"claude-wifi-pool\"}")
+check_not_contains "Dead Claude peer dropped from shared pool" "claude-first" "$STATUS_DEAD"
+
+# Network returns → server re-registers with the same session_key.
+CL_REG_3=$(post "/register" "{\"pid\":$PID_CL_2,\"pid_start\":\"$PIDSTART_CL_2\",\"runtime\":\"claude\",\"session_key\":\"claude-session-1\",\"host_pid\":$PID_CL_2,\"host_pid_start\":\"$PIDSTART_CL_2\",\"cwd\":\"/tmp/claude\",\"name\":\"claude-third\",\"name_is_explicit\":false}")
+check "Claude reclaims same id after being marked dead" "$CL_ID_1" "$(json_field "$CL_REG_3" "['data']['id']")"
+CL_REVIVED=$(post "/heartbeat" "{\"peer_id\":\"$CL_ID_1\",\"peer_secret\":\"$CL_SECRET_1\",\"pid\":$PID_CL_2,\"pid_start\":\"$PIDSTART_CL_2\"}")
+check_contains "Revived Claude peer heartbeats OK" "\"acknowledged\":true" "$CL_REVIVED"
+
+# Membership must be restored: shared pool shows the peer again, solo pool un-archived.
+STATUS_ALIVE=$(post "/pool/status" "{\"pool_name\":\"claude-wifi-pool\"}")
+check_contains "Revived Claude peer restored to shared pool" "claude-first" "$STATUS_ALIVE"
+SOLO_LIST=$(post "/pool/list" "{\"peer_id\":\"$CL_ID_1\"}")
+check_contains "Revived Claude peer's solo pool un-archived" "claude-solo-pool" "$SOLO_LIST"
+
+# Bidirectional delivery works after recovery:
+#   B → pool, claude receives it
+post "/message/send" "{\"peer_id\":\"$PEER_B_ID\",\"peer_secret\":\"$PEER_B_SECRET\",\"pool_name\":\"claude-wifi-pool\",\"body\":\"welcome back\"}" > /dev/null
+CL_POLL=$(post "/message/poll" "{\"peer_id\":\"$CL_ID_1\"}")
+check_contains "Recovered Claude peer receives pool messages" "welcome back" "$CL_POLL"
+#   claude → pool, send accepted (not "not a member")
+CL_SEND=$(post "/message/send" "{\"peer_id\":\"$CL_ID_1\",\"peer_secret\":\"$CL_SECRET_1\",\"pool_name\":\"claude-wifi-pool\",\"body\":\"im back\"}")
+check_contains "Recovered Claude peer can send to its pool" "\"ok\":true" "$CL_SEND"
+
+# A Claude peer WITHOUT a session_key stays ephemeral (legacy behavior): two
+# registrations must produce DIFFERENT ids.
+CL_NOSESS_1=$(post "/register" "{\"pid\":$PID_CL_1,\"pid_start\":\"$PIDSTART_CL_1\",\"runtime\":\"claude\",\"cwd\":\"/tmp/claude-legacy\",\"name\":\"legacy-claude\"}")
+CL_NOSESS_2=$(post "/register" "{\"pid\":$PID_CL_2,\"pid_start\":\"$PIDSTART_CL_2\",\"runtime\":\"claude\",\"cwd\":\"/tmp/claude-legacy\",\"name\":\"legacy-claude\"}")
+NOSESS_ID_1=$(json_field "$CL_NOSESS_1" "['data']['id']")
+NOSESS_ID_2=$(json_field "$CL_NOSESS_2" "['data']['id']")
+if [ "$NOSESS_ID_1" != "$NOSESS_ID_2" ]; then
+  pass "Session-less Claude peers stay ephemeral (distinct ids)"
+else
+  fail "Session-less Claude peers should get distinct ids (got $NOSESS_ID_1 twice)"
+fi
+
+# Clean up Claude identity test peers/pools so they don't pollute later tests.
+# Peer B leaves the shared pool first (it lingers as an active member otherwise).
+post "/pool/leave" "{\"peer_id\":\"$PEER_B_ID\",\"peer_secret\":\"$PEER_B_SECRET\",\"pool_name\":\"claude-wifi-pool\"}" > /dev/null 2>&1 || true
+# Drain B's inbox of claude-pool traffic so later unread-count assertions are clean.
+post "/message/check" "{\"peer_id\":\"$PEER_B_ID\",\"peer_secret\":\"$PEER_B_SECRET\"}" > /dev/null 2>&1 || true
+python3 << PYEOF
+import sqlite3, os
+db = sqlite3.connect(os.environ['CCT_DIR'] + '/cct.db')
+db.execute("UPDATE peers SET status = 'dead' WHERE cwd IN ('/tmp/claude', '/tmp/claude-legacy')")
+db.execute("UPDATE pools SET status = 'archived' WHERE name IN ('claude-wifi-pool', 'claude-solo-pool')")
+db.commit()
+db.close()
+PYEOF
+
 # --- Pool tests ---
 
 echo ""

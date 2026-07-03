@@ -23,9 +23,6 @@ esac
 _CCT="${CCT_DIR:-$HOME/.cct}"
 PIDMAP_DIR="$_CCT/pidmaps"
 
-# Already mapped? Skip.
-[ -f "$PIDMAP_DIR/codex_${SESSION_ID}" ] && exit 0
-
 pid_has_ancestor() {
   local child=$1
   local ancestor=$2

@@ -620,7 +620,7 @@ async function cmdKill() {
     die("Can't kill a remote broker. Stop it on the host machine.");
   }
   try {
-    const proc = spawnSync("lsof", ["-ti", `:${BROKER_PORT}`]);
+    const proc = spawnSync("lsof", ["-nP", `-iTCP:${BROKER_PORT}`, "-sTCP:LISTEN", "-t"]);
     const output = proc.stdout?.toString().trim() ?? "";
     if (!output) {
       console.log(`No process found on port ${BROKER_PORT}.`);

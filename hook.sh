@@ -15,13 +15,13 @@ case "$TOOL_NAME" in *cct_*|ToolSearch) exit 0 ;; esac
 _CCT="${CCT_DIR:-$HOME/.cct}"
 PIDMAP="$_CCT/pidmaps/${PPID}_"*
 [ -f $PIDMAP ] || exit 0
-PEER_ID=$(cat $PIDMAP)
+IFS= read -r PEER_ID < $PIDMAP || exit 0
 PEER_ID="${PEER_ID%%|*}"
 
 # 4. Check unread flag
 FLAG="$_CCT/flags/${PEER_ID}.unread"
 [ -f "$FLAG" ] || exit 0
-RAW=$(cat "$FLAG")
+IFS= read -r RAW < "$FLAG" || exit 0
 [ -z "$RAW" ] && exit 0
 
 # 5. Parse count from first field (before |)
@@ -29,14 +29,19 @@ COUNT="${RAW%%|*}"
 [ "$COUNT" = "0" ] || [ -z "$COUNT" ] && exit 0
 
 # 6. Parse timestamp and check freshness (ignore if >30s stale)
-REST="${RAW#*|}"
-POOLS="${REST%%|*}"
-TS="${REST##*|}"
-if [ -n "$TS" ]; then
-  NOW_MS=$(($(date +%s) * 1000))
-  AGE=$(( NOW_MS - TS ))
-  [ "$AGE" -gt 30000 ] 2>/dev/null && exit 0
-fi
+POOLS=""
+case "$RAW" in
+  *"|"*"|"*)
+    REST="${RAW#*|}"
+    POOLS="${REST%%|*}"
+    TS="${REST##*|}"
+    if [ -n "$TS" ]; then
+      NOW_MS=$(($(date +%s) * 1000))
+      AGE=$(( NOW_MS - TS ))
+      [ "$AGE" -gt 30000 ] 2>/dev/null && exit 0
+    fi
+    ;;
+esac
 
 # 7. Build reason with pool names
 if [ -n "$POOLS" ]; then

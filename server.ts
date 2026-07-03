@@ -82,11 +82,22 @@ let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
 let parentMonitorInterval: ReturnType<typeof setInterval> | null = null;
 let idleCheckInterval: ReturnType<typeof setInterval> | null = null;
 let lastActivity = Date.now();
+let requestCleanupFn: ((reason: string) => void) | null = null;
+
+// Registration payload, stashed by main() so a heartbeat-rejection recovery can
+// re-register with identical parameters. Only used when `sessionKey` is set —
+// the broker de-dupes on (runtime, session_key) and returns the same peer row.
+let lastRegisterBody: Record<string, unknown> | null = null;
+let recovering = false;
 
 // Deferred ack: message IDs returned by the last handleCheckMessages call.
 // These get acked at the START of the next call, so if the cron result is
 // swallowed (never reaches the agent's conversation), messages stay unread.
+// Bound to the peer id/secret they were peeked under: if an in-flight recovery
+// changes our identity, acking them under a different peer id would silently
+// mark nothing read. On identity change we drop them rather than misfire.
 let pendingAckIds: number[] = [];
+let pendingAckPeerId = "";
 
 // --- Broker HTTP helpers ---
 
@@ -211,10 +222,42 @@ function findClaudePid(): number {
   return process.ppid;
 }
 
-// For Codex: use session_id env var as stable identity key.
-// For Claude: use PID-based identity (existing behavior).
+function getCommandForPid(pid: number): string {
+  try {
+    const proc = spawnSync("ps", ["-o", "command=", "-p", String(pid)]);
+    return proc.stdout?.toString().trim() ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function findCodexPid(): number | null {
+  let pid = process.ppid;
+  for (let i = 0; i < 12; i++) {
+    const cmd = getCommandForPid(pid);
+    if (cmd.includes("/codex") || cmd.endsWith(" codex") || cmd.includes("@openai/codex")) {
+      return pid;
+    }
+    const ppid = spawnSync("ps", ["-o", "ppid=", "-p", String(pid)]);
+    const parent = parseInt(ppid.stdout?.toString().trim() ?? "", 10);
+    if (!parent || parent === 1) break;
+    pid = parent;
+  }
+  return null;
+}
+
+// Stable session identity key, used as the broker `session_key`:
+//   Codex  → session_id env var (CODEX_*).
+//   Claude → CLAUDE_CODE_SESSION_ID (stable for the entire Claude Code session).
+// Anchoring registration to this key makes the broker REUSE the same peer row
+// on every re-register, so the CCT peer ID/name survive MCP restarts, /mcp
+// reconnects, and network transitions (e.g. Wi-Fi changes) instead of a fresh
+// random ID being minted each time the server re-registers. Falls back to the
+// legacy ephemeral behaviour when the session id is unavailable (older CLIs).
 const codexSessionId = process.env.CCT_CODEX_SESSION_ID ?? process.env.CODEX_SESSION_ID ?? process.env.CODEX_THREAD_ID;
-const hostPid = detectedRuntime === "codex" ? process.ppid : findClaudePid();
+const claudeSessionId = process.env.CLAUDE_CODE_SESSION_ID ?? process.env.CLAUDE_SESSION_ID;
+const sessionKey = detectedRuntime === "codex" ? codexSessionId : claudeSessionId;
+const hostPid = detectedRuntime === "codex" ? (findCodexPid() ?? process.ppid) : findClaudePid();
 const cachedPpidStart = getPidStartForPid(hostPid);
 
 function isOriginalProcessAlive(pid: number, expectedStart: string): boolean {
@@ -269,13 +312,15 @@ function writePidmap(): void {
   }
 }
 
-function deletePidmap(): void {
-  try { unlinkSync(myPidmapPath); } catch {}
+function deletePidmap(removeSessionMappings: boolean): void {
+  if (removeSessionMappings) {
+    try { unlinkSync(myPidmapPath); } catch {}
+  }
   if (codexMcpMarkerPath) {
     try { unlinkSync(codexMcpMarkerPath); } catch {}
   }
   // Clean up session-keyed pidmaps that point to our peer ID
-  if (detectedRuntime === "codex") {
+  if (detectedRuntime === "codex" && removeSessionMappings) {
     try {
       const files = readdirSync(PIDMAP_DIR);
       for (const f of files) {
@@ -335,9 +380,69 @@ async function pollUnread(): Promise<void> {
 
 // --- Heartbeat loop ---
 
+// Re-register with the broker after our peer row was reaped (e.g. the broker
+// marked us dead during a network outage). With a stable `session_key` the
+// broker revives the same row and returns the SAME id/secret/name, so the CCT
+// identity survives. Returns true if identity was recovered.
+async function reregister(reason: string): Promise<boolean> {
+  if (!sessionKey || !lastRegisterBody || recovering) return false;
+  // Never resurrect a genuine orphan: if our host process is gone, the broker
+  // correctly reaped us — don't undo that. Let the caller run cleanup instead.
+  // (Backs up the 30s host-death monitor; recovery must not depend on it.)
+  if (!isOriginalProcessAlive(hostPid, cachedPpidStart)) return false;
+  recovering = true;
+  try {
+    const regRes = await brokerPost<RegisterResponse>("/register", lastRegisterBody);
+    if (regRes.ok && regRes.data) {
+      const prevId = myId;
+      myId = regRes.data.id;
+      mySecret = regRes.data.secret;
+      myName = regRes.data.name;
+      // Pidmap/flag are keyed by peer id; rewrite so the hook & status line
+      // resolve the recovered identity. If the id changed (row was purged
+      // rather than revived), drop the stale flag and any pending acks that
+      // belonged to the old identity — they can't be acked under the new id.
+      if (prevId && prevId !== myId) {
+        try { unlinkSync(`${FLAGS_DIR}/${prevId}.unread`); } catch {}
+        if (pendingAckPeerId === prevId) {
+          pendingAckIds = [];
+          pendingAckPeerId = "";
+        }
+      }
+      writePidmap();
+      writeFlag(`0||${Date.now()}`);
+      process.stderr.write(`CCT recovered identity after ${reason}: ${myName} [${myId}]\n`);
+      return true;
+    }
+  } catch {}
+  finally {
+    recovering = false;
+  }
+  return false;
+}
+
 async function sendHeartbeat(): Promise<void> {
   try {
-    await brokerPost("/heartbeat", { peer_id: myId, peer_secret: mySecret });
+    const res = await brokerPost<{ acknowledged?: boolean; stale_registration?: boolean }>("/heartbeat", {
+      peer_id: myId,
+      peer_secret: mySecret,
+      pid: process.pid,
+      pid_start: cachedPidStart,
+    });
+    if (res.ok && res.data?.stale_registration) {
+      // A newer instance for this host/session has taken over the row — we are
+      // the orphan. Do not fight it; shut down.
+      requestCleanupFn?.("stale peer registration superseded");
+    } else if (!res.ok && (res.error === "peer not found" || res.error === "peer not found or not active")) {
+      // Our row was reaped (broker marked us dead during an outage) but our
+      // host process is still alive. Reclaim the same identity in place rather
+      // than exiting, so the CCT id is stable across network transitions.
+      const recovered = await reregister(res.error);
+      if (!recovered) requestCleanupFn?.(`heartbeat rejected: ${res.error}`);
+    } else if (!res.ok && res.error === "invalid peer_secret") {
+      // Different holder owns this id — never reclaim across a secret mismatch.
+      requestCleanupFn?.(`heartbeat rejected: ${res.error}`);
+    }
   } catch {}
 }
 
@@ -374,12 +479,18 @@ async function handleCheckMessages(): Promise<string> {
   // If the previous cron result was swallowed, pendingAckIds is still set,
   // but the agent is calling us again — meaning it DID process the output.
   if (pendingAckIds.length > 0) {
-    await brokerPost("/message/read", {
-      peer_id: myId,
-      peer_secret: mySecret,
-      message_ids: pendingAckIds,
-    });
+    // Only ack under the identity they were peeked with. If recovery changed
+    // our peer id since then, these ids belong to the old row — acking them
+    // under the new id marks nothing read, so drop them instead.
+    if (!pendingAckPeerId || pendingAckPeerId === myId) {
+      await brokerPost("/message/read", {
+        peer_id: myId,
+        peer_secret: mySecret,
+        message_ids: pendingAckIds,
+      });
+    }
     pendingAckIds = [];
+    pendingAckPeerId = "";
   }
 
   // Step 2: Peek at unread messages without marking them read.
@@ -395,8 +506,9 @@ async function handleCheckMessages(): Promise<string> {
 
   const { messages, unread, pool_throttles } = res.data as any;
 
-  // Step 3: Stash IDs for deferred ack on the next call.
+  // Step 3: Stash IDs for deferred ack on the next call, bound to this identity.
   pendingAckIds = messages.map((m: any) => m.message_id);
+  pendingAckPeerId = myId;
 
   // Update flag — count excludes messages we just peeked (they'll be acked next call)
   const poolSummary = unread.by_pool.map((p: any) => `${p.pool_name ?? "DM"}:${p.count}`).join(",");
@@ -732,14 +844,21 @@ async function main() {
 
   const { gitRoot, gitBranch } = await getGitInfo(myCwd);
 
-  const regRes = await brokerPost<RegisterResponse>("/register", {
+  lastRegisterBody = {
     pid: process.pid,
     pid_start: cachedPidStart,
+    runtime: detectedRuntime,
+    session_key: sessionKey,
+    host_pid: hostPid,
+    host_pid_start: cachedPpidStart,
     cwd: myCwd,
     name: requestedName,
+    name_is_explicit: Boolean(peerNameEnv),
     git_root: gitRoot,
     git_branch: gitBranch,
-  });
+  };
+
+  const regRes = await brokerPost<RegisterResponse>("/register", lastRegisterBody);
 
   if (!regRes.ok || !regRes.data) {
     process.stderr.write(`CCT registration failed: ${regRes.error}\n`);
@@ -958,6 +1077,17 @@ ${cronInstructions}`;
           required: ["pool_name"],
         },
       },
+      {
+        name: "cct_self_terminate",
+        description: "Terminate this session (claude/codex process). Use after completing work to free the terminal. The shell survives.",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            reason: { type: "string", description: "Why this session is terminating (logged)" },
+          },
+          required: ["reason"],
+        },
+      },
     ],
   }; });
 
@@ -1016,6 +1146,19 @@ ${cronInstructions}`;
         case "cct_clear_pool_idle":
           text = await handleClearPoolIdle(args as { pool_name: string });
           break;
+        case "cct_self_terminate": {
+          const reason = (args as { reason: string }).reason;
+          process.stderr.write(`CCT self-terminate requested: ${reason}\n`);
+          setTimeout(() => {
+            try {
+              process.kill(hostPid, "SIGTERM");
+            } catch {
+              requestCleanup("self-terminate (host kill failed)");
+            }
+          }, 150);
+          text = `Terminating session: ${reason}`;
+          break;
+        }
         default:
           text = `Unknown tool: ${name}`;
           return { content: [{ type: "text" as const, text }], isError: true };
@@ -1042,6 +1185,7 @@ ${cronInstructions}`;
     process.stderr.write(`CCT cleanup: ${reason}\n`);
     void cleanup();
   }
+  requestCleanupFn = requestCleanup;
 
   const cleanup = async () => {
     const forceExit = setTimeout(() => process.exit(0), 5_000);
@@ -1052,7 +1196,7 @@ ${cronInstructions}`;
     if (parentMonitorInterval) { clearInterval(parentMonitorInterval); parentMonitorInterval = null; }
     if (idleCheckInterval) { clearInterval(idleCheckInterval); idleCheckInterval = null; }
 
-    if (pendingAckIds.length > 0) {
+    if (pendingAckIds.length > 0 && (!pendingAckPeerId || pendingAckPeerId === myId)) {
       try {
         await brokerPost("/message/read", {
           peer_id: myId,
@@ -1060,13 +1204,20 @@ ${cronInstructions}`;
           message_ids: pendingAckIds,
         });
       } catch {}
-      pendingAckIds = [];
     }
+    pendingAckIds = [];
+    let unregistered = false;
     try {
-      await brokerPost("/unregister", { peer_id: myId, peer_secret: mySecret });
+      const res = await brokerPost<{ unregistered?: boolean }>("/unregister", {
+        peer_id: myId,
+        peer_secret: mySecret,
+        pid: process.pid,
+        pid_start: cachedPidStart,
+      });
+      unregistered = res.ok === true && res.data?.unregistered === true;
     } catch {}
-    deletePidmap();
-    deleteFlag();
+    deletePidmap(unregistered);
+    if (unregistered) deleteFlag();
     process.exit(0);
   };
 

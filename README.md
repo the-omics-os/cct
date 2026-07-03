@@ -190,15 +190,15 @@ cct/
 | Runtime | Message Delivery (Busy) | Message Delivery (Idle) | Identity |
 |---------|------------------------|------------------------|----------|
 | **Claude Code** | PreToolUse hook blocks | CronCreate polls every 60s | PID-based pidmap |
-| **Codex CLI** | PreToolUse hook blocks (JSON) | UserPromptSubmit injects context | Session-ID based pidmap |
+| **Codex CLI** | PreToolUse hook blocks (JSON) | UserPromptSubmit injects context | Session-keyed peer + session-ID pidmap |
 
 `cct install` auto-detects both and installs for whichever is present. Cross-tool pools work — Claude and Codex peers communicate in the same pool.
 
-Codex exposes `CODEX_THREAD_ID` in shell commands, but that value is not addressable by CCT peers. Use `cct_whoami` inside the agent or `cct whoami` in a shell to get the CCT peer ID/name that other agents can invite or DM.
+Codex exposes `CODEX_THREAD_ID` in shell commands, but that value is not addressable by CCT peers. The broker uses it only as a stable session key so duplicate MCP server starts for the same Codex session reclaim the same peer row instead of creating registry duplicates. Use `cct_whoami` inside the agent or `cct whoami` in a shell to get the CCT peer ID/name that other agents can invite or DM.
 
 ## Process Lifecycle
 
-MCP stdio servers are spawned per session. Three layers prevent orphaned processes from accumulating:
+MCP stdio servers are spawned per session. Codex registrations also include the host Codex PID, so an orphaned MCP process cannot keep a peer alive after the Codex process is gone. Three layers prevent orphaned processes from accumulating:
 
 1. **stdin EOF/close** (instant) — when the host exits, the pipe closes and the server self-terminates
 2. **Parent death monitor** (≤30s) — periodic PID check with start-time validation prevents false positives from PID reuse
