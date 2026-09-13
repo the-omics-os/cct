@@ -373,6 +373,19 @@ function restoreMembershipsAfterRevive(peerId: string, diedAt: string): void {
   }
 }
 
+// One codex process = one CCT peer. Codex respawns its MCP servers on session
+// fork/reconnect without always killing the old one, which used to leave two
+// live peer rows for a single session (both heartbeating, only one addressable).
+// The session_key dedupe below cannot catch that when the two rows carry
+// different keys, so reap by host process as well.
+function reapDuplicateCodexHostPeers(runtime: string, hostPid: number | null | undefined, keepId: string): void {
+  if (runtime !== "codex" || !hostPid) return;
+  db.prepare(
+    `UPDATE peers SET status = 'dead'
+     WHERE runtime = 'codex' AND host_pid = ? AND id != ? AND status = 'active'`
+  ).run(hostPid, keepId);
+}
+
 const registerPeerTx = transaction((body: RegisterRequest, id: string, secret: string) => {
   const { pid, pid_start, cwd, name, git_root, git_branch } = body;
   const runtime = body.runtime ?? "claude";
@@ -424,6 +437,8 @@ const registerPeerTx = transaction((body: RegisterRequest, id: string, secret: s
         restoreMembershipsAfterRevive(existing.id, existing.died_at);
       }
 
+      reapDuplicateCodexHostPeers(runtime, body.host_pid, existing.id);
+
       return { id: existing.id, secret: existing.secret, name: nextName };
     }
   }
@@ -452,6 +467,8 @@ const registerPeerTx = transaction((body: RegisterRequest, id: string, secret: s
     ts,
     ts,
   );
+
+  reapDuplicateCodexHostPeers(runtime, body.host_pid, id);
 
   return { id, secret, name: peerName };
 });

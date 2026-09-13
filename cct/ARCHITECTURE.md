@@ -85,7 +85,7 @@ Broker checks PIDs every 30s. Dead peers are marked `status = 'dead'`. A system 
 
 The CCT peer id/name must survive MCP-server restarts, `/mcp` reconnects, and network transitions (e.g. a Wi-Fi change that makes the broker unreachable long enough for stale-cleanup to mark the peer dead). To achieve this, `/register` is keyed on `session_key`:
 
-- **Codex** → the Codex session id (`CODEX_SESSION_ID` / `CODEX_THREAD_ID`).
+- **Codex** → `codex-root:<root session id>`, resolved from codex's own rollout transcripts (see **D11c**). The `CODEX_SESSION_ID` / `CODEX_THREAD_ID` env vars are read first but are **never set in an MCP server's environment** — codex only injects them into shell/exec tool environments.
 - **Claude** → `CLAUDE_CODE_SESSION_ID` (stable for the whole Claude Code session; inherited by the spawned `npx tsx` MCP server).
 
 When a `session_key` is present, the broker de-dupes on `(runtime, session_key)`: a re-register **revives the existing row** (even if `status='dead'`) and returns the **same id, secret, and name**, superseding any older duplicate. Peers with no session key fall back to the legacy ephemeral behavior (a fresh random id per registration).
@@ -98,6 +98,30 @@ Recovery is proactive: `server.ts:sendHeartbeat` no longer exits when the broker
 - **Dead stdio MCP server is not resurrected.** Claude Code does not auto-respawn a dead stdio MCP server. This fix removes the *self-inflicted* exit on `peer not found`, so an alive-but-network-blipped server recovers; but if the MCP process itself dies, recovery needs a `/mcp` reconnect or session restart. The session_key still guarantees the *same* id is reclaimed when it does come back.
 - **Two live sessions sharing one `CLAUDE_CODE_SESSION_ID` collapse to one peer row** (e.g. a resumed session in two terminals). This is inherent to session-keying — adding a per-process discriminator would reintroduce the original "new id on every restart" bug. Last registration wins the row; the older instance retires on its next heartbeat via `stale_registration`.
 - **`cli.ts` (`cct whoami` from a bare shell) still resolves identity via pidmap process-ancestry, not the session key.** Works for shells descended from the Claude host; a detached shell that only has the env var can't resolve the peer. Low impact — the MCP tools (`cct_whoami`) are authoritative.
+
+### D11c: Codex session key is the fork-chain root, resolved from rollout transcripts
+**Decision: Derive the codex session key from codex's own transcripts, keyed on the ROOT of the fork chain. Never trust env propagation, and never key on the current session id.**
+
+D11b assumed codex exports its session id to the MCP server. It does not — a live cct MCP server spawned by codex has only the `CCT_*` vars from `config.toml`, so `env_vars = ["CODEX_THREAD_ID", ...]` forwards nothing and **every codex peer row was written with `session_key = NULL`**. The whole stable-identity mechanism was inert for codex: each MCP respawn inserted a new row (new id, new `codex-XXXX` name), and `reregister()` bailed on the `!sessionKey` guard. Observed: 12 codex rows in one day for one conversation, all `NULL`.
+
+The id is recovered from `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<session_id>.jsonl`, whose first record is `session_meta` carrying `session_id`, `cwd`, and `forked_from_id`. Resolution order (`shared/codex-session.ts`, wired in `server.ts:initCodexIdentity`, retried for 500ms because a freshly started codex may not have flushed the file yet):
+
+1. `CCT_CODEX_SESSION_ID` / `CODEX_SESSION_ID` / `CODEX_THREAD_ID` — future-proofing only; unset in practice.
+2. `resume <uuid>` parsed off the host codex command line — exact, and the case that matters most.
+3. Newest rollout whose `session_meta.cwd` matches the session cwd (fresh start, bounded scan).
+4. Then follow `forked_from_id` to the **root** of the chain → `codex-root:<root_id>`.
+5. Fallback `codex-host:<host_pid>_<host_pid_start>` when nothing resolves — still survives MCP respawn and fork within one codex process.
+
+**Why the root and not the current id:** codex mints a NEW session id when it forks a session on compaction (`forked_from_id` + `forked_from_ordinal_exclusive`) and respawns its MCP servers, so keying on the current id would still churn the CCT identity mid-conversation. The root id is constant for the whole lineage, including across `codex resume`.
+
+The pidmap key stays the **current** session id (`codex_{session_id}`) — that is what the hooks receive on stdin — so the broker key and the pidmap key are deliberately different values.
+
+**Codex also gets host-scoped dedupe.** Codex respawns MCP servers without always killing the previous one, which left two live rows per session (both heartbeating; only one addressable). `session_key` dedupe cannot catch that when the two rows carry different keys, so `/register` additionally reaps active codex peers sharing `host_pid`.
+
+**Known limitations (accepted):**
+- **Two deliberate parallel forks of one lineage collapse to one row.** Sequential fork/resume is the real usage; simultaneous work in two forks of the same conversation is not supported (same trade-off as two Claude sessions sharing one session id, D11b).
+- **Rollout format coupling.** `session_meta` field names (`session_id`, `forked_from_id`, `cwd`) are codex-internal. All readers fail soft: an unparseable record degrades to the host-scoped key, never a crash. `session_meta` is already ~22KB in practice, so the reader must scan for the first newline instead of assuming a fixed head size — a truncated parse silently makes every forked session look like its own root.
+- **Unresolvable host process degrades the key.** If the codex ancestor is not discoverable, the key falls back to host scope. In practice codex outlives its MCP child, and if it doesn't the MCP server exits anyway.
 
 ### D12: Security model
 **Decision: Per-user private runtime directory. Peer secrets for broker auth.**

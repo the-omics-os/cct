@@ -38,6 +38,9 @@
   },
   "scripts": {
     "start": "tsx broker.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "./test-integration.sh",
+    "test:codex-session": "tsx test-codex-session.ts",
+    "test:codex-identity": "./test-codex-identity-e2e.sh"
   }
 }

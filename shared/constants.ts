@@ -6,6 +6,8 @@ export const BROKER_PORT = parseInt(process.env.CCT_PORT ?? "7888", 10);
 export const BROKER_BIND_HOST = process.env.CCT_HOST ?? "127.0.0.1";
 
 export const CCT_DIR = process.env.CCT_DIR ?? path.join(os.homedir(), ".cct");
+export const CODEX_HOME = process.env.CODEX_HOME ?? path.join(os.homedir(), ".codex");
+export const CODEX_SESSIONS_DIR = path.join(CODEX_HOME, "sessions");
 export const DB_PATH = path.join(CCT_DIR, "cct.db");
 export const PIDMAP_DIR = path.join(CCT_DIR, "pidmaps");
 export const FLAGS_DIR = path.join(CCT_DIR, "flags");

@@ -77,8 +77,18 @@ cleanup() {
 
 trap cleanup EXIT
 
+# --- Unit tests (no broker needed) ---
+
+echo "=== Codex session resolution unit tests ==="
+if npx tsx "$(cd "$(dirname "$0")" && pwd)/test-codex-session.ts"; then
+  pass "codex-session unit tests"
+else
+  fail "codex-session unit tests"
+fi
+
 # --- Start broker ---
 
+echo ""
 echo "=== Starting broker ==="
 
 # Kill any leftover test broker on the isolated port
@@ -185,6 +195,50 @@ PEERS_AFTER_CODEX=$(post "/list-peers" "{}")
 check_contains "list-peers shows canonical Codex peer" "codex-first" "$PEERS_AFTER_CODEX"
 check_not_contains "list-peers hides second Codex name" "codex-second" "$PEERS_AFTER_CODEX"
 check_not_contains "list-peers hides third Codex name" "codex-third" "$PEERS_AFTER_CODEX"
+
+echo ""
+echo "=== Codex duplicate MCP servers under one host process ==="
+
+# Codex respawns its MCP server on session fork/reconnect without always killing
+# the previous one. Two live rows for one codex process means the peer other
+# agents can address is not the one the agent believes it is.
+sleep 300 &
+SLEEP_PIDS+=($!)
+PID_DUP_HOST=$!
+sleep 300 &
+SLEEP_PIDS+=($!)
+PID_DUP_1=$!
+sleep 300 &
+SLEEP_PIDS+=($!)
+PID_DUP_2=$!
+sleep 300 &
+SLEEP_PIDS+=($!)
+PID_DUP_HOST_2=$!
+PIDSTART_DUP=$(date +%s)
+
+DUP_REG_1=$(post "/register" "{\"pid\":$PID_DUP_1,\"pid_start\":\"$PIDSTART_DUP\",\"runtime\":\"codex\",\"session_key\":\"codex-root:root-A\",\"host_pid\":$PID_DUP_HOST,\"host_pid_start\":\"$PIDSTART_DUP\",\"cwd\":\"/tmp/codex-dup\",\"name\":\"codex-dup-first\",\"name_is_explicit\":false}")
+DUP_ID_1=$(json_field "$DUP_REG_1" "['data']['id']")
+check "Codex host peer registered" "codex-dup-first" "$(json_field "$DUP_REG_1" "['data']['name']")"
+
+# Second MCP server for the SAME codex process, resolving only the weaker
+# host-scoped key (session id unresolvable) — a different session_key, so the
+# key-based dedupe cannot catch it.
+DUP_REG_2=$(post "/register" "{\"pid\":$PID_DUP_2,\"pid_start\":\"$PIDSTART_DUP\",\"runtime\":\"codex\",\"session_key\":\"codex-host:$PID_DUP_HOST\",\"host_pid\":$PID_DUP_HOST,\"host_pid_start\":\"$PIDSTART_DUP\",\"cwd\":\"/tmp/codex-dup\",\"name\":\"codex-dup-second\",\"name_is_explicit\":false}")
+DUP_ID_2=$(json_field "$DUP_REG_2" "['data']['id']")
+if [ "$DUP_ID_1" = "$DUP_ID_2" ]; then
+  fail "Different session keys should not share a peer row"
+else
+  pass "Different session keys get distinct peer rows"
+fi
+
+PEERS_DUP=$(post "/list-peers" "{}")
+check_contains "list-peers shows the current Codex MCP peer" "codex-dup-second" "$PEERS_DUP"
+check_not_contains "superseded Codex MCP peer for the same host is reaped" "codex-dup-first" "$PEERS_DUP"
+
+# `codex resume` → new codex process, new MCP server, same fork-chain root key.
+DUP_REG_3=$(post "/register" "{\"pid\":$PID_DUP_HOST_2,\"pid_start\":\"$PIDSTART_DUP\",\"runtime\":\"codex\",\"session_key\":\"codex-root:root-A\",\"host_pid\":$PID_DUP_HOST_2,\"host_pid_start\":\"$PIDSTART_DUP\",\"cwd\":\"/tmp/codex-dup\",\"name\":\"codex-dup-third\",\"name_is_explicit\":false}")
+check "Codex root key reclaims the same peer id after resume" "$DUP_ID_1" "$(json_field "$DUP_REG_3" "['data']['id']")"
+check "Codex root key reclaims the original peer name" "codex-dup-first" "$(json_field "$DUP_REG_3" "['data']['name']")"
 
 echo ""
 echo "=== Claude session identity (stable ID across restarts / Wi-Fi changes) ==="

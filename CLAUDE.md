@@ -125,11 +125,14 @@ cct/
   hook-codex.sh          Codex PreToolUse hook (JSON stdin/stdout, <10ms, session_id lookup)
   prompt-codex.sh        Codex UserPromptSubmit hook (idle delivery via additionalContext)
   session-start-codex.sh Codex SessionStart hook (identity bridge: session_id → peer_id)
-  test-integration.sh    Integration tests (78 tests, isolated on port 17888)
+  test-integration.sh    Integration tests (110 checks, isolated on port 17888; also runs the unit tests)
+  test-codex-session.ts  Unit tests for codex session/fork-chain resolution
+  test-codex-identity-e2e.sh  E2E: fake codex host + real server.ts, stable id across resume (port 17889)
   shared/
     types.ts             TypeScript interfaces
     constants.ts         Ports, paths, timeouts
     summarize.ts         Git-based summary generation
+    codex-session.ts     Codex session id + fork-chain root resolution from rollout transcripts
   package.json
   tsconfig.json
 ```
@@ -167,7 +170,7 @@ The MCP server enforces this: join/create responses include the cron setup remin
 
 **Idle session limitation:** There is no way to push into an idle Claude Code session via MCP. CronCreate bottoms out at 60s. The PreToolUse hook only fires during tool calls. Phase 5 (PTY Launcher) will solve this with `cct claude` wrapping the session for sub-10s delivery.
 
-**Stable identity (both runtimes):** The CCT peer ID/name is anchored to a stable session key so it survives MCP restarts, `/mcp` reconnects, and network transitions (e.g. a Wi-Fi change that lets the broker mark the peer dead). Claude uses `CLAUDE_CODE_SESSION_ID`; Codex uses its session id. The broker de-dupes registrations on `(runtime, session_key)` and revives the same row (same id/secret/name) even if it was marked dead — **and restores the pool memberships that death dropped** (via `died_at`/`left_at` pairing), so the reclaimed peer isn't silently mute in its pools. `server.ts` recovers in place on a `peer not found` heartbeat instead of exiting, but only while the host process is alive (checked in `reregister`, so a genuine orphan is not resurrected). Peers with no session key fall back to legacy ephemeral (new id per registration). Limitations: a *dead* stdio MCP process still needs `/mcp` reconnect; two live sessions sharing one `CLAUDE_CODE_SESSION_ID` collapse to one row. See ARCHITECTURE **D11b**.
+**Stable identity (both runtimes):** The CCT peer ID/name is anchored to a stable session key so it survives MCP restarts, `/mcp` reconnects, and network transitions (e.g. a Wi-Fi change that lets the broker mark the peer dead). Claude uses `CLAUDE_CODE_SESSION_ID`; Codex uses `codex-root:<root session id>`, resolved from codex's rollout transcripts because **codex never exports its session id into MCP server env** (see below and ARCHITECTURE **D11c**). The broker de-dupes registrations on `(runtime, session_key)` and revives the same row (same id/secret/name) even if it was marked dead — **and restores the pool memberships that death dropped** (via `died_at`/`left_at` pairing), so the reclaimed peer isn't silently mute in its pools. `server.ts` recovers in place on a `peer not found` heartbeat instead of exiting, but only while the host process is alive (checked in `reregister`, so a genuine orphan is not resurrected). Peers with no session key fall back to legacy ephemeral (new id per registration). Limitations: a *dead* stdio MCP process still needs `/mcp` reconnect; two live sessions sharing one `CLAUDE_CODE_SESSION_ID` collapse to one row. See ARCHITECTURE **D11b**.
 
 ## Codex CLI Integration
 
@@ -177,7 +180,7 @@ CCT supports OpenAI Codex CLI as a first-class runtime. `cct install` auto-detec
 
 **Peer naming:** Codex peers auto-name as `codex-XXXX` (vs `dirname-XXXX` for Claude).
 
-**Identity model:** Codex uses session-keyed broker registration plus session_id-based pidmaps (`~/.cct/pidmaps/codex_{session_id}`) instead of PID-based identity. The installer propagates `CODEX_THREAD_ID`/`CODEX_SESSION_ID` into the MCP server when available. The broker treats that value as a stable session key and reuses the same CCT peer row on duplicate MCP starts or reconnects, while the SessionStart/Prompt/PreToolUse hooks keep the `session_id → peer_id` pidmap fresh from the MCP marker (`codex_mcp_{pid}`). `CODEX_THREAD_ID` is never the CCT address; use `cct_whoami`, `cct whoami`, `cct_list_peers`, or the peer name/ID shown by those commands.
+**Identity model:** Codex uses session-keyed broker registration plus session_id-based pidmaps (`~/.cct/pidmaps/codex_{session_id}`) instead of PID-based identity. ⚠️ **Codex does not put `CODEX_THREAD_ID`/`CODEX_SESSION_ID` in an MCP server's environment** — it only injects them into shell/exec tool environments, so the `env_vars` list in `config.toml` forwards nothing and every codex peer used to register with `session_key = NULL` (fresh CCT id on every MCP respawn). The session id is therefore resolved from codex's own transcripts in `~/.codex/sessions/**/rollout-*.jsonl` (`shared/codex-session.ts`): env → `resume <uuid>` on the host command line → newest rollout matching the session cwd, then `forked_from_id` is followed to the **root** of the fork chain, giving `session_key = codex-root:<root_id>`. Root, not current id, because codex mints a new session id whenever it forks on compaction. Unresolvable → `codex-host:<host_pid>_<host_pid_start>`, which still survives MCP respawns within one codex process. `/register` also reaps active codex peers sharing a `host_pid`, since codex respawns MCP servers without always killing the old one. The pidmap key stays the **current** session id (what hooks see on stdin), while SessionStart/Prompt/PreToolUse hooks keep `session_id → peer_id` fresh from the MCP marker (`codex_mcp_{pid}`). `CODEX_THREAD_ID` is never the CCT address; use `cct_whoami`, `cct whoami`, `cct_list_peers`, or the peer name/ID shown by those commands.
 
 **Critical identity rule:** If a Codex agent is asked "what is your CCT ID?", it must call `cct_whoami` or `cct_list_peers` and report the CCT peer ID/name, for example `9a2b01d7` / `codex-vnni`. It must not inspect env vars and return `CODEX_THREAD_ID`; other peers cannot invite or DM that value. After upgrading an installed Codex integration, run `cct install` and restart Codex sessions so `env_vars` and the new hooks are active. Keep Codex pidmap/flag reads tolerant of files without trailing newlines, because CCT writes these marker files with `printf`/`writeFileSync` and no newline. Duplicate MCP servers for one Codex session must converge on one peer row; stale duplicate processes must not unregister the current peer.
 

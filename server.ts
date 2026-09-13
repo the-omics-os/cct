@@ -13,11 +13,13 @@ import {
   IS_REMOTE,
   BROKER_TOKEN,
   CCT_DIR,
+  CODEX_SESSIONS_DIR,
   PIDMAP_DIR,
   FLAGS_DIR,
   POLL_INTERVAL_MS,
   HEARTBEAT_INTERVAL_MS,
 } from "./shared/constants.ts";
+import { resolveCodexSessionIdentity, type CodexSessionIdentity } from "./shared/codex-session.ts";
 import type {
   BrokerResponse,
   RegisterResponse,
@@ -247,18 +249,25 @@ function findCodexPid(): number | null {
 }
 
 // Stable session identity key, used as the broker `session_key`:
-//   Codex  → session_id env var (CODEX_*).
+//   Codex  → root of the codex fork chain, resolved from codex's own rollout
+//            transcripts (see shared/codex-session.ts). Codex never exports its
+//            session id into MCP server env, so the CODEX_* vars below are only
+//            a future-proof first choice — in practice they are all unset.
 //   Claude → CLAUDE_CODE_SESSION_ID (stable for the entire Claude Code session).
 // Anchoring registration to this key makes the broker REUSE the same peer row
 // on every re-register, so the CCT peer ID/name survive MCP restarts, /mcp
-// reconnects, and network transitions (e.g. Wi-Fi changes) instead of a fresh
-// random ID being minted each time the server re-registers. Falls back to the
-// legacy ephemeral behaviour when the session id is unavailable (older CLIs).
-const codexSessionId = process.env.CCT_CODEX_SESSION_ID ?? process.env.CODEX_SESSION_ID ?? process.env.CODEX_THREAD_ID;
+// reconnects, codex compaction forks, `codex resume`, and network transitions
+// (e.g. Wi-Fi changes) instead of a fresh random ID being minted each time.
+const codexSessionIdEnv = process.env.CCT_CODEX_SESSION_ID ?? process.env.CODEX_SESSION_ID ?? process.env.CODEX_THREAD_ID;
 const claudeSessionId = process.env.CLAUDE_CODE_SESSION_ID ?? process.env.CLAUDE_SESSION_ID;
-const sessionKey = detectedRuntime === "codex" ? codexSessionId : claudeSessionId;
 const hostPid = detectedRuntime === "codex" ? (findCodexPid() ?? process.ppid) : findClaudePid();
 const cachedPpidStart = getPidStartForPid(hostPid);
+
+// Codex identity is resolved asynchronously in initCodexIdentity() before the
+// first registration: a freshly started codex may not have flushed its rollout
+// file yet, so resolution needs a short retry window.
+let codexIdentity: CodexSessionIdentity = { sessionId: null, rootSessionId: null, source: "unresolved" };
+let sessionKey: string | undefined = detectedRuntime === "codex" ? undefined : claudeSessionId;
 
 function isOriginalProcessAlive(pid: number, expectedStart: string): boolean {
   try {
@@ -292,13 +301,46 @@ async function getGitInfo(cwd: string): Promise<{ gitRoot: string | null; gitBra
 
 // --- Pidmap helpers ---
 // Codex uses session_id-based pidmap key; Claude uses PID-based key.
-// For Codex without explicit session_id: write a "codex_mcp_{pid}" marker
-// that the SessionStart hook will find and link to the session_id.
+// The codex key is the CURRENT session id (what the hooks receive on stdin),
+// not the fork-chain root used for the broker session_key. A "codex_mcp_{pid}"
+// marker is written too, so the hooks can still bridge by process ancestry when
+// the session id could not be resolved.
 
-const myPidmapKey = detectedRuntime === "codex" && codexSessionId
-  ? `codex_${codexSessionId}`
-  : `${hostPid}_${cachedPpidStart}`;
-const myPidmapPath = `${PIDMAP_DIR}/${myPidmapKey}`;
+let myPidmapKey = `${hostPid}_${cachedPpidStart}`;
+let myPidmapPath = `${PIDMAP_DIR}/${myPidmapKey}`;
+
+// Resolve the codex session identity and derive the broker session_key from it.
+// Falls back to a host-process key, which still survives MCP respawns and
+// compaction forks within one codex process (both keep the same host PID).
+async function initCodexIdentity(): Promise<void> {
+  if (detectedRuntime !== "codex") return;
+
+  const hostCommand = getCommandForPid(hostPid);
+  for (let attempt = 0; attempt < 5; attempt++) {
+    codexIdentity = resolveCodexSessionIdentity({
+      sessionsDir: CODEX_SESSIONS_DIR,
+      cwd: myCwd,
+      hostCommand,
+      envSessionId: codexSessionIdEnv,
+    });
+    if (codexIdentity.sessionId) break;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+
+  sessionKey = codexIdentity.rootSessionId
+    ? `codex-root:${codexIdentity.rootSessionId}`
+    : `codex-host:${hostPid}_${cachedPpidStart}`;
+
+  if (codexIdentity.sessionId) {
+    myPidmapKey = `codex_${codexIdentity.sessionId}`;
+    myPidmapPath = `${PIDMAP_DIR}/${myPidmapKey}`;
+  }
+
+  process.stderr.write(
+    `CCT codex identity: session=${codexIdentity.sessionId ?? "-"} root=${codexIdentity.rootSessionId ?? "-"} ` +
+    `source=${codexIdentity.source} host_pid=${hostPid} host_cmd=${JSON.stringify(hostCommand)} cwd=${myCwd} key=${sessionKey}\n`,
+  );
+}
 
 // Codex MCP marker — written alongside the main pidmap so SessionStart can find us
 const codexMcpMarkerPath = detectedRuntime === "codex"
@@ -632,7 +674,9 @@ async function handleListPeers(): Promise<string> {
 
 async function handleWhoAmI(): Promise<string> {
   const codexLine = detectedRuntime === "codex"
-    ? `\nCodex session/thread ID: ${codexSessionId || "(not propagated to MCP server)"}`
+    ? `\nCodex session ID: ${codexIdentity.sessionId ?? "(unresolved)"}` +
+      `\nCodex root session ID: ${codexIdentity.rootSessionId ?? "(unresolved)"} (source: ${codexIdentity.source})` +
+      `\nBroker session key: ${sessionKey ?? "(none)"}`
     : "";
   return `CCT identity for this session:
 Peer ID: ${myId}
@@ -835,6 +879,7 @@ async function handleClearPoolIdle(args: { pool_name: string }): Promise<string>
 async function main() {
   ensureDirs();
   cleanStalePidmaps();
+  await initCodexIdentity();
   await ensureBroker();
 
   const peerNameEnv = process.env.CCT_PEER_NAME;
