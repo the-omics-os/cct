@@ -8,6 +8,13 @@ export const BROKER_BIND_HOST = process.env.CCT_HOST ?? "127.0.0.1";
 export const CCT_DIR = process.env.CCT_DIR ?? path.join(os.homedir(), ".cct");
 export const CODEX_HOME = process.env.CODEX_HOME ?? path.join(os.homedir(), ".codex");
 export const CODEX_SESSIONS_DIR = path.join(CODEX_HOME, "sessions");
+// os and the MCP adapter have separate resolvers. This constant describes os;
+// the installer separately checks the adapter's PI_CODING_AGENT_DIR selection.
+const osAgentOverride = process.env.OS_CODING_AGENT_DIR;
+export const OS_AGENT_DIR = osAgentOverride
+  ? path.resolve(osAgentOverride === "~" ? os.homedir()
+    : osAgentOverride.startsWith("~/") ? path.join(os.homedir(), osAgentOverride.slice(2)) : osAgentOverride)
+  : path.join(os.homedir(), ".os", "agent");
 export const DB_PATH = path.join(CCT_DIR, "cct.db");
 export const PIDMAP_DIR = path.join(CCT_DIR, "pidmaps");
 export const FLAGS_DIR = path.join(CCT_DIR, "flags");

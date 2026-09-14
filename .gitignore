@@ -18,3 +18,5 @@ cct/codex_output/
 .DS_Store
 now
 .content/*.mp4
+*.tgz
+.claude.json.bak

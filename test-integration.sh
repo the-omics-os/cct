@@ -59,6 +59,19 @@ json_field() {
   echo "$json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d$field)" 2>/dev/null || echo ""
 }
 
+# Field of one peer inside a /list-peers response, by peer id.
+peer_field() {
+  local json="$1" peer_id="$2" field="$3"
+  echo "$json" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+for p in d.get('data') or []:
+    if p.get('id') == '$peer_id':
+        print(p.get('$field'))
+        break
+" 2>/dev/null || echo ""
+}
+
 cleanup() {
   echo ""
   echo "=== Cleanup ==="
@@ -105,6 +118,51 @@ sleep 1
 HEALTH=$(curl -s "$BROKER_URL/health")
 HEALTH_OK=$(json_field "$HEALTH" "['ok']")
 check "Broker health returns ok" "True" "$HEALTH_OK"
+
+# os uses the same broker registration protocol. Keep these checks isolated
+# from the existing Claude/Codex rows and use this driver's real process ID.
+echo ""
+echo "=== os session identity and membership recovery ==="
+if python3 - "$BROKER_URL" "$CCT_DIR/cct.db" <<'OS_INTEGRATION'
+import json, os, sqlite3, subprocess, sys, urllib.request
+url, dbpath = sys.argv[1:]
+pid = os.getpid()
+start = "_".join(subprocess.check_output(["ps", "-o", "lstart=", "-p", str(pid)], text=True).split())
+base = dict(pid=pid, pid_start=start, host_pid=pid, host_pid_start=start, cwd="/tmp/cct-os-integration")
+def call(path, **body):
+    req = urllib.request.Request(url+path, json.dumps(body).encode(), {"Content-Type": "application/json"})
+    with urllib.request.urlopen(req) as response:
+        result = json.load(response)
+    assert result["ok"], (path, result.get("error"))
+    return result.get("data")
+def register(runtime, key):
+    return call("/register", **base, runtime=runtime, session_key=key, name="os-control-"+key.replace(":", "-"))
+claude = register("claude", "os-claude-control")
+weak = register("os", "os-host:integration")
+strong = register("os", "os:integration")
+assert weak["id"] == strong["id"], "weak-to-marker transition changed identity"
+duplicate = register("os", "os:integration")
+assert duplicate == strong, "same-session registration changed peer credentials/name"
+other = register("os", "os:other-session")
+assert other["id"] != strong["id"], "different strong os sessions collapsed"
+auth = dict(peer_id=strong["id"], peer_secret=strong["secret"])
+call("/pool/create", **auth, name="os-recovery-control")
+call("/pool/invite", **auth, pool_name="os-recovery-control", target_peer_id=claude["id"])
+call("/unregister", **auth, pid=pid, pid_start=start)
+revived = register("os", "os:integration")
+assert revived == strong, "resume changed stable os identity"
+with sqlite3.connect(dbpath) as db:
+    assert db.execute("SELECT runtime,status,session_key FROM peers WHERE id=?", (claude["id"],)).fetchone() == ("claude","active","os-claude-control"), "os registration modified Claude"
+    assert db.execute("SELECT COUNT(*) FROM pool_members WHERE peer_id=? AND status='active'", (strong["id"],)).fetchone()[0] == 1, "revive lost os pool membership"
+for peer in (strong, other, claude):
+    call("/unregister", peer_id=peer["id"], peer_secret=peer["secret"], pid=pid, pid_start=start)
+print("  os checks: fallback upgrade, duplicate, separate sessions, resume, Claude isolation, pool restoration")
+OS_INTEGRATION
+then
+  pass "os identity and pool recovery controls"
+else
+  fail "os identity and pool recovery controls"
+fi
 
 # --- Spawn fake PIDs ---
 
@@ -168,24 +226,41 @@ check "Codex duplicate keeps stable generated name" "codex-first" "$CODEX_NAME_2
 CODEX_SECRET_2=$(json_field "$CODEX_REG_2" "['data']['secret']")
 check "Codex duplicate keeps logical peer secret" "$CODEX_SECRET_1" "$CODEX_SECRET_2"
 
-CODEX_STALE_UNREG=$(post "/unregister" "{\"peer_id\":\"$CODEX_ID_1\",\"peer_secret\":\"$CODEX_SECRET_1\",\"pid\":$PID_CODEX_1,\"pid_start\":\"$PIDSTART_CODEX_1\"}")
-check_contains "Old Codex duplicate process cannot unregister current peer" "stale_registration" "$CODEX_STALE_UNREG"
+# Both registrations describe LIVE MCP servers (codex parent thread + a
+# fork/subagent thread), so both are connections of one logical peer.
+CODEX_CONNS=$(post "/list-peers" "{}")
+check "Codex peer tracks both MCP connections" "2" "$(peer_field "$CODEX_CONNS" "$CODEX_ID_1" "connections")"
 
-CODEX_STILL_ACTIVE=$(post "/heartbeat" "{\"peer_id\":\"$CODEX_ID_2\",\"peer_secret\":\"$CODEX_SECRET_2\"}")
-check_contains "Codex peer remains active after stale unregister" "\"ok\":true" "$CODEX_STILL_ACTIVE"
-
-CODEX_STALE_HEARTBEAT=$(post "/heartbeat" "{\"peer_id\":\"$CODEX_ID_1\",\"peer_secret\":\"$CODEX_SECRET_1\",\"pid\":$PID_CODEX_1,\"pid_start\":\"$PIDSTART_CODEX_1\"}")
-check_contains "Old Codex duplicate process cannot heartbeat current peer" "stale_registration" "$CODEX_STALE_HEARTBEAT"
+# THE regression that broke live sessions: an instance that no longer owns
+# peers.pid must never be told it is superseded — it used to exit on that and
+# close a transport its agent still needed.
+CODEX_OLD_HEARTBEAT=$(post "/heartbeat" "{\"peer_id\":\"$CODEX_ID_1\",\"peer_secret\":\"$CODEX_SECRET_1\",\"pid\":$PID_CODEX_1,\"pid_start\":\"$PIDSTART_CODEX_1\"}")
+check_not_contains "Superseded Codex MCP instance is never told to shut down" "stale_registration" "$CODEX_OLD_HEARTBEAT"
+check_contains "Superseded Codex MCP instance heartbeat is acknowledged" "\"acknowledged\":true" "$CODEX_OLD_HEARTBEAT"
 
 CODEX_CURRENT_HEARTBEAT=$(post "/heartbeat" "{\"peer_id\":\"$CODEX_ID_2\",\"peer_secret\":\"$CODEX_SECRET_2\",\"pid\":$PID_CODEX_2,\"pid_start\":\"$PIDSTART_CODEX_2\"}")
 check_contains "Current Codex process heartbeat accepted" "\"acknowledged\":true" "$CODEX_CURRENT_HEARTBEAT"
 
+# A finished subagent's server exiting must not retire the shared identity.
+CODEX_CONN_UNREG=$(post "/unregister" "{\"peer_id\":\"$CODEX_ID_1\",\"peer_secret\":\"$CODEX_SECRET_1\",\"pid\":$PID_CODEX_1,\"pid_start\":\"$PIDSTART_CODEX_1\"}")
+check "One connection leaving does not retire the Codex peer" "False" "$(json_field "$CODEX_CONN_UNREG" "['data']['unregistered']")"
+check "Surviving connection keeps the Codex peer alive" "1" "$(json_field "$CODEX_CONN_UNREG" "['data']['connections_remaining']")"
+
+CODEX_STILL_ACTIVE=$(post "/heartbeat" "{\"peer_id\":\"$CODEX_ID_2\",\"peer_secret\":\"$CODEX_SECRET_2\"}")
+check_contains "Codex peer remains active after a sibling connection left" "\"ok\":true" "$CODEX_STILL_ACTIVE"
+
+# A process with no connection row cannot retire a peer others are using.
+CODEX_STALE_UNREG=$(post "/unregister" "{\"peer_id\":\"$CODEX_ID_1\",\"peer_secret\":\"$CODEX_SECRET_1\",\"pid\":$PID_CODEX_1,\"pid_start\":\"$PIDSTART_CODEX_1\"}")
+check_contains "Untracked process cannot unregister a peer with live connections" "stale_registration" "$CODEX_STALE_UNREG"
+
+# Its own heartbeat re-adds the dropped connection (broker restart / DB loss).
+CODEX_READD=$(post "/heartbeat" "{\"peer_id\":\"$CODEX_ID_1\",\"peer_secret\":\"$CODEX_SECRET_1\",\"pid\":$PID_CODEX_1,\"pid_start\":\"$PIDSTART_CODEX_1\"}")
+check_contains "Dropped connection is re-added by its own heartbeat" "\"readded\":true" "$CODEX_READD"
+
+# Last connection out retires the peer.
+post "/unregister" "{\"peer_id\":\"$CODEX_ID_1\",\"peer_secret\":\"$CODEX_SECRET_1\",\"pid\":$PID_CODEX_1,\"pid_start\":\"$PIDSTART_CODEX_1\"}" > /dev/null
 CODEX_CUR_UNREG=$(post "/unregister" "{\"peer_id\":\"$CODEX_ID_2\",\"peer_secret\":\"$CODEX_SECRET_2\",\"pid\":$PID_CODEX_2,\"pid_start\":\"$PIDSTART_CODEX_2\"}")
-if echo "$CODEX_CUR_UNREG" | grep -q "stale_registration"; then
-  fail "Current Codex process should be allowed to unregister"
-else
-  pass "Current Codex process can unregister"
-fi
+check "Last Codex connection retires the peer" "True" "$(json_field "$CODEX_CUR_UNREG" "['data']['unregistered']")"
 
 CODEX_REG_3=$(post "/register" "{\"pid\":$PID_CODEX_2,\"pid_start\":\"$PIDSTART_CODEX_2\",\"runtime\":\"codex\",\"session_key\":\"codex-session-1\",\"host_pid\":$PID_CODEX_2,\"host_pid_start\":\"$PIDSTART_CODEX_2\",\"cwd\":\"/tmp/codex\",\"name\":\"codex-third\",\"name_is_explicit\":false}")
 CODEX_ID_3=$(json_field "$CODEX_REG_3" "['data']['id']")
@@ -199,9 +274,11 @@ check_not_contains "list-peers hides third Codex name" "codex-third" "$PEERS_AFT
 echo ""
 echo "=== Codex duplicate MCP servers under one host process ==="
 
-# Codex respawns its MCP server on session fork/reconnect without always killing
-# the previous one. Two live rows for one codex process means the peer other
-# agents can address is not the one the agent believes it is.
+# Codex spawns an MCP server per thread inside one host process and does not
+# always kill the previous one. Two live rows for one codex process means the peer
+# other agents can address is not the one the agent believes it is — but the fix
+# is adoption, not reaping: reaping a LIVE row made its server re-register, which
+# reaped the other, forever (each flip spamming pool disconnect/reconnect).
 sleep 300 &
 SLEEP_PIDS+=($!)
 PID_DUP_HOST=$!
@@ -225,20 +302,56 @@ check "Codex host peer registered" "codex-dup-first" "$(json_field "$DUP_REG_1" 
 # key-based dedupe cannot catch it.
 DUP_REG_2=$(post "/register" "{\"pid\":$PID_DUP_2,\"pid_start\":\"$PIDSTART_DUP\",\"runtime\":\"codex\",\"session_key\":\"codex-host:$PID_DUP_HOST\",\"host_pid\":$PID_DUP_HOST,\"host_pid_start\":\"$PIDSTART_DUP\",\"cwd\":\"/tmp/codex-dup\",\"name\":\"codex-dup-second\",\"name_is_explicit\":false}")
 DUP_ID_2=$(json_field "$DUP_REG_2" "['data']['id']")
-if [ "$DUP_ID_1" = "$DUP_ID_2" ]; then
-  fail "Different session keys should not share a peer row"
-else
-  pass "Different session keys get distinct peer rows"
-fi
+check "Weaker key adopts the live peer of the same codex host" "$DUP_ID_1" "$DUP_ID_2"
+check "Adopted registration keeps the canonical name" "codex-dup-first" "$(json_field "$DUP_REG_2" "['data']['name']")"
+check "Adopted registration shares the logical peer secret" "$(json_field "$DUP_REG_1" "['data']['secret']")" "$(json_field "$DUP_REG_2" "['data']['secret']")"
 
 PEERS_DUP=$(post "/list-peers" "{}")
-check_contains "list-peers shows the current Codex MCP peer" "codex-dup-second" "$PEERS_DUP"
-check_not_contains "superseded Codex MCP peer for the same host is reaped" "codex-dup-first" "$PEERS_DUP"
+check_contains "list-peers shows one canonical Codex peer per host" "codex-dup-first" "$PEERS_DUP"
+check_not_contains "adopted registration does not create a second peer" "codex-dup-second" "$PEERS_DUP"
+check "Both MCP servers of the host are tracked as connections" "2" "$(peer_field "$PEERS_DUP" "$DUP_ID_1" "connections")"
+
+# No flip-flop: alternating registers/heartbeats from both live instances must
+# leave one stable identity, and neither may be told to shut down.
+DUP_FLIP_1=$(post "/register" "{\"pid\":$PID_DUP_1,\"pid_start\":\"$PIDSTART_DUP\",\"runtime\":\"codex\",\"session_key\":\"codex-root:root-A\",\"host_pid\":$PID_DUP_HOST,\"host_pid_start\":\"$PIDSTART_DUP\",\"cwd\":\"/tmp/codex-dup\",\"name\":\"codex-dup-first\",\"name_is_explicit\":false}")
+DUP_FLIP_2=$(post "/register" "{\"pid\":$PID_DUP_2,\"pid_start\":\"$PIDSTART_DUP\",\"runtime\":\"codex\",\"session_key\":\"codex-host:$PID_DUP_HOST\",\"host_pid\":$PID_DUP_HOST,\"host_pid_start\":\"$PIDSTART_DUP\",\"cwd\":\"/tmp/codex-dup\",\"name\":\"codex-dup-second\",\"name_is_explicit\":false}")
+check "Re-register from instance A keeps the identity" "$DUP_ID_1" "$(json_field "$DUP_FLIP_1" "['data']['id']")"
+check "Re-register from instance B keeps the identity" "$DUP_ID_1" "$(json_field "$DUP_FLIP_2" "['data']['id']")"
+DUP_SECRET_1=$(json_field "$DUP_REG_1" "['data']['secret']")
+DUP_HB_A=$(post "/heartbeat" "{\"peer_id\":\"$DUP_ID_1\",\"peer_secret\":\"$DUP_SECRET_1\",\"pid\":$PID_DUP_1,\"pid_start\":\"$PIDSTART_DUP\"}")
+DUP_HB_B=$(post "/heartbeat" "{\"peer_id\":\"$DUP_ID_1\",\"peer_secret\":\"$DUP_SECRET_1\",\"pid\":$PID_DUP_2,\"pid_start\":\"$PIDSTART_DUP\"}")
+check_not_contains "Instance A is never superseded" "stale_registration" "$DUP_HB_A"
+check_not_contains "Instance B is never superseded" "stale_registration" "$DUP_HB_B"
+PEERS_NOFLIP=$(post "/list-peers" "{}")
+check "Still exactly one peer for the host after the flip rounds" "2" "$(peer_field "$PEERS_NOFLIP" "$DUP_ID_1" "connections")"
 
 # `codex resume` → new codex process, new MCP server, same fork-chain root key.
 DUP_REG_3=$(post "/register" "{\"pid\":$PID_DUP_HOST_2,\"pid_start\":\"$PIDSTART_DUP\",\"runtime\":\"codex\",\"session_key\":\"codex-root:root-A\",\"host_pid\":$PID_DUP_HOST_2,\"host_pid_start\":\"$PIDSTART_DUP\",\"cwd\":\"/tmp/codex-dup\",\"name\":\"codex-dup-third\",\"name_is_explicit\":false}")
 check "Codex root key reclaims the same peer id after resume" "$DUP_ID_1" "$(json_field "$DUP_REG_3" "['data']['id']")"
 check "Codex root key reclaims the original peer name" "codex-dup-first" "$(json_field "$DUP_REG_3" "['data']['name']")"
+
+# A server that cannot resolve the rollout id registers under the weak
+# host-scoped key. When the strong root key shows up for the same host, the row
+# must upgrade to it — otherwise the identity is unreclaimable after `codex
+# resume`, which runs in a new host process.
+sleep 300 &
+SLEEP_PIDS+=($!)
+PID_UP_HOST=$!
+sleep 300 &
+SLEEP_PIDS+=($!)
+PID_UP_2=$!
+sleep 300 &
+SLEEP_PIDS+=($!)
+PID_UP_HOST_2=$!
+PIDSTART_UP=$(date +%s)
+
+UP_REG_1=$(post "/register" "{\"pid\":$PID_UP_HOST,\"pid_start\":\"$PIDSTART_UP\",\"runtime\":\"codex\",\"session_key\":\"codex-host:$PID_UP_HOST\",\"host_pid\":$PID_UP_HOST,\"host_pid_start\":\"$PIDSTART_UP\",\"cwd\":\"/tmp/codex-up\",\"name\":\"codex-up-first\",\"name_is_explicit\":false}")
+UP_ID_1=$(json_field "$UP_REG_1" "['data']['id']")
+UP_REG_2=$(post "/register" "{\"pid\":$PID_UP_2,\"pid_start\":\"$PIDSTART_UP\",\"runtime\":\"codex\",\"session_key\":\"codex-root:root-UP\",\"host_pid\":$PID_UP_HOST,\"host_pid_start\":\"$PIDSTART_UP\",\"cwd\":\"/tmp/codex-up\",\"name\":\"codex-up-second\",\"name_is_explicit\":false}")
+check "Strong root key adopts the same host's live peer" "$UP_ID_1" "$(json_field "$UP_REG_2" "['data']['id']")"
+
+UP_REG_3=$(post "/register" "{\"pid\":$PID_UP_HOST_2,\"pid_start\":\"$PIDSTART_UP\",\"runtime\":\"codex\",\"session_key\":\"codex-root:root-UP\",\"host_pid\":$PID_UP_HOST_2,\"host_pid_start\":\"$PIDSTART_UP\",\"cwd\":\"/tmp/codex-up\",\"name\":\"codex-up-third\",\"name_is_explicit\":false}")
+check "Upgraded root key reclaims the identity from a new host process" "$UP_ID_1" "$(json_field "$UP_REG_3" "['data']['id']")"
 
 echo ""
 echo "=== Claude session identity (stable ID across restarts / Wi-Fi changes) ==="
@@ -478,9 +591,37 @@ if [ "$B_PRE_IDS" != "[]" ]; then
   post "/message/read" "{\"peer_id\":\"$PEER_B_ID\",\"peer_secret\":\"$PEER_B_SECRET\",\"message_ids\":$B_PRE_IDS}" > /dev/null
 fi
 
+# Connection-set liveness: a peer survives while ANY of its MCP servers lives,
+# and dies when the last one is gone. Set up two peers before the (shared) stale
+# cleanup wait below so this costs no extra test time.
+sleep 300 &
+SLEEP_PIDS+=($!)
+PID_SURV_LIVE=$!
+sleep 300 &
+SLEEP_PIDS+=($!)
+PID_SURV_DEAD=$!
+sleep 300 &
+SLEEP_PIDS+=($!)
+PID_GONE=$!
+PIDSTART_CONN=$(date +%s)
+
+SURV_REG=$(post "/register" "{\"pid\":$PID_SURV_LIVE,\"pid_start\":\"$PIDSTART_CONN\",\"runtime\":\"codex\",\"session_key\":\"codex-root:surv\",\"host_pid\":$PID_SURV_LIVE,\"host_pid_start\":\"$PIDSTART_CONN\",\"cwd\":\"/tmp/codex-surv\",\"name\":\"codex-surv\",\"name_is_explicit\":true}")
+SURV_ID=$(json_field "$SURV_REG" "['data']['id']")
+SURV_SECRET=$(json_field "$SURV_REG" "['data']['secret']")
+post "/register" "{\"pid\":$PID_SURV_DEAD,\"pid_start\":\"$PIDSTART_CONN\",\"runtime\":\"codex\",\"session_key\":\"codex-root:surv\",\"host_pid\":$PID_SURV_LIVE,\"host_pid_start\":\"$PIDSTART_CONN\",\"cwd\":\"/tmp/codex-surv\",\"name\":\"codex-surv\",\"name_is_explicit\":true}" > /dev/null
+
+GONE_REG=$(post "/register" "{\"pid\":$PID_GONE,\"pid_start\":\"$PIDSTART_CONN\",\"runtime\":\"codex\",\"session_key\":\"codex-root:gone\",\"host_pid\":$PID_GONE,\"host_pid_start\":\"$PIDSTART_CONN\",\"cwd\":\"/tmp/codex-gone\",\"name\":\"codex-gone\",\"name_is_explicit\":true}")
+GONE_ID=$(json_field "$GONE_REG" "['data']['id']")
+
 # Kill peer A's sleep process to simulate crash
 kill "${SLEEP_PIDS[0]}" 2>/dev/null || true
 wait "${SLEEP_PIDS[0]}" 2>/dev/null || true
+
+# Kill one of the survivor's two MCP processes, and the lone process of the other.
+kill "$PID_SURV_DEAD" 2>/dev/null || true
+wait "$PID_SURV_DEAD" 2>/dev/null || true
+kill "$PID_GONE" 2>/dev/null || true
+wait "$PID_GONE" 2>/dev/null || true
 
 # Trigger stale peer cleanup (broker checks every 30s, we wait a bit or poke it)
 sleep 1
@@ -491,6 +632,8 @@ post "/heartbeat" "{\"peer_id\":\"$PEER_B_ID\",\"peer_secret\":\"$PEER_B_SECRET\
 echo "  Waiting for stale peer cleanup (up to 35s)..."
 for i in $(seq 1 35); do
   sleep 1
+  # Keep the survivor's live connection heartbeating, as a real MCP server would.
+  post "/heartbeat" "{\"peer_id\":\"$SURV_ID\",\"peer_secret\":\"$SURV_SECRET\",\"pid\":$PID_SURV_LIVE,\"pid_start\":\"$PIDSTART_CONN\"}" > /dev/null
   PEER_A_STATUS=$(post "/list-peers" "{}" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
@@ -506,6 +649,12 @@ done
 
 DEATH_MSGS=$(post "/message/poll" "{\"peer_id\":\"$PEER_B_ID\"}")
 check_contains "B received death notification" "disconnected" "$DEATH_MSGS"
+
+PEERS_AFTER_CLEANUP=$(post "/list-peers" "{}")
+check_contains "Peer with one live MCP connection survives cleanup" "codex-surv" "$PEERS_AFTER_CLEANUP"
+check "Dead connection row is reaped, live one kept" "1" "$(peer_field "$PEERS_AFTER_CLEANUP" "$SURV_ID" "connections")"
+check_not_contains "Peer whose last MCP connection died is retired" "codex-gone" "$PEERS_AFTER_CLEANUP"
+check "Retired peer is gone from list-peers" "" "$(peer_field "$PEERS_AFTER_CLEANUP" "$GONE_ID" "connections")"
 
 # --- Security tests ---
 

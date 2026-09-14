@@ -152,6 +152,137 @@ The hook reason text: "CCT: {N} unread message(s) in pool(s): {pool_names}. Call
 
 Instructions say: "Optionally, set up a recurring check every 2 minutes for idle periods." If Claude does it, great. If not, hook covers the busy path and messages wait until the next tool call.
 
+### D16: os runtime through pi-mcp-adapter and a local extension
+
+**Decision (2026-09-13):** os is the third runtime. pi-mcp-adapter runs the
+resident CCT MCP server; `os-extension.ts` supplies identity and delivery hooks.
+The implementation and measured decisions are tracked in
+`../.planning/os-runtime/STATE.md`. This entry specifies os behavior; earlier
+prototype descriptions above must not override these measured contracts.
+
+**Transport and ownership.** CCT's HTTP wire protocol does not require MCP:
+`cli.ts` is already a non-MCP client. A resident process sending heartbeats is
+required, because the broker reaps stale heartbeats even if the host PID exists.
+Path A was selected because os needs MCP independently and should expose
+`cct_check_messages` as a real tool. A CCT-owned broker client in the extension
+would introduce a second registrant whose identity could drift. Reproducing
+message reads without MCP would also require a CLI acknowledgement command and
+special handling of bash command strings. The extension therefore performs no
+broker calls and does not write unread flags or acknowledge messages.
+
+**Environment variables must be checked individually.** os's branding is
+intentionally inconsistent across variables. The measured installed bundle
+provides `PI_SESSION_ID` and `PI_SESSION_FILE` only in the local environment
+object passed to its bash child (`src/core/tools/bash.ts:174-183`). They are
+absent from the os host and adapter-spawned MCP process. Adapter `inheritEnv`
+cannot forward a variable absent from `process.env`.
+
+| Variable | Definition | os behavior |
+|---|---|---|
+| `PI_SESSION_ID`, `PI_SESSION_FILE` | Hardcoded in `bash.ts` | Remain `PI_*`, bash child only |
+| `ENV_AGENT_DIR`, `ENV_SESSION_DIR` | Computed from `APP_NAME`, `config.ts:516-517` | Become `OS_*` |
+| `PI_PACKAGE_DIR` | Hardcoded in `config.ts:399` | Remains `PI_*` |
+
+**Identity uses two files in the private CCT pidmap directory.**
+
+| File | Contents | Writer and cleanup owner |
+|---|---|---|
+| A: `os_session_<osHostPid>` | os session ID | Extension `session_start` / `session_shutdown` |
+| B: `os_<sessionId>` | CCT peer ID and PID-map metadata | `server.ts` registration / final connection cleanup |
+
+File A is mode 0600 in a 0700 directory. `server.ts` resolves the os ancestor,
+reads A with bounded retries, and registers `runtime: "os"` with
+`session_key: "os:<sessionId>"`. B follows the existing peer-ID pidmap contract
+used by CLI/hook/status consumers; combining A and B would mix an input owned
+by the host with an output owned by its MCP child. The extension removes only A.
+The CLI follows A → B even when a bash child has `PI_SESSION_ID`, and never
+falls through to an inherited Codex mapping when A identifies os but B is absent.
+
+Missing A produces `os-host:<pid>_<start>` and a `source=fallback` diagnostic;
+the server remains usable. `cct_whoami` reports the source even if adapter
+stderr forwarding is disabled (`debug: true` forwards it). Duplicate live MCP
+connections share one peer without retiring one another. A weak host key may
+adopt/upgrade a resolved key for the same live host; two different resolved
+`os:<sessionId>` keys never collapse merely because they share an ancestor.
+Stable-key revival reuses the existing membership restoration transaction.
+
+**Adapter settings are a functional requirement.**
+
+| Setting | Required value | Failure prevented |
+|---|---|---|
+| `lifecycle` | `lazy-keep-alive` | Default `lazy` disconnects after idle timeout; `keep-alive` raced `session_start` and produced two cold MCP launches in all five measurements |
+| `directTools` | `true` | Tools otherwise remain behind the `mcp` proxy |
+| `toolPrefix` | `"none"` | Default `"server"` exposes `cct_cct_check_messages`, making an unprefixed block reason unusable |
+| `env.CCT_RUNTIME` | `"os"` | Explicit runtime classification independent of inherited Codex environment |
+
+Cold direct-tool bootstrap connects after startup and makes the direct tool
+available in the same session. A warm metadata cache exposes the tool but waits
+for the first CCT call before connecting. Registration is therefore guaranteed
+after discovery/first use, not unconditionally at host startup. The original
+row-1 acceptance wording was changed explicitly in STATE D22/D23. No timeout is
+claimed to make every marker race impossible; delayed and absent-marker controls
+exercise the fallback.
+
+**Blocking returns a value.** os `tool_call` handlers must return
+`{ block: true, reason }` (`runner.ts:982-1003`). Throwing produces an extension
+error and does not establish this block contract. The handler exempts CCT tools
+and ToolSearch, reads B and the existing `count|pool_summary|timestamp` flag,
+and ignores stale or malformed flags. Both delivery handlers require the exact
+`cct_check_messages` tool to be active. Missing identity emits one diagnostic
+per session; missing identity or an unavailable direct tool allows work without
+acknowledging messages. This prevents first-install discovery from trapping the
+host behind a tool it cannot call.
+
+**Delivery is at the next tool or model turn.** Busy os sessions see a returned
+`tool_call` block. `context` appends an unread notification through
+`transformContext` (`src/core/sdk.ts:356-360`), which runs only on a model turn.
+It never wakes an idle session. This matches Codex's next-prompt timing; Claude
+cron can additionally trigger an idle check. The MCP process remains resident
+and heartbeats throughout an idle interval.
+
+Live testing exposed a second-message silence bug: the old polling path paused
+while a returned batch awaited deferred acknowledgement. Without a cron to
+issue another check, os could miss the next DM. os now peeks without acking,
+excludes the IDs already returned, and refreshes the flag for new messages.
+Read-generation and in-flight-read guards prevent an older poll from restoring
+a flag just cleared by `cct_check_messages`. Existing Claude/Codex polling is
+unchanged. The installed-runtime test sends a second DM after the first read.
+
+**Q7 binds all adapter state to os.** In measured adapter 2.33.0,
+`mcp.json`, `mcp-cache.json`, and `mcp-onboarding.json` share `getAgentPath()`.
+Only the config file has a separate override; relocating it alone leaves state
+elsewhere. With `PI_PACKAGE_DIR` unset, the adapter defaults to `~/.pi/agent`
+and may create it. The approved os launcher sets:
+
+```sh
+export PI_CODING_AGENT_DIR="${OS_CODING_AGENT_DIR:-$HOME/.os/agent}"
+export PI_MCP_CONFIG_MODE=exclusive
+```
+
+The installer must receive that same host environment. It resolves both os and
+adapter paths, prints them, and refuses writes under real or synthetic `.pi`,
+including symlink targets and backups. `exclusive` prevents automatic imports
+of other clients' MCP servers; it alone does not relocate cache/onboarding
+state. This preserves the OS_HARNESS `.pi`-absence requirement. `cct install`
+does not acquire/install the adapter. The user separately authorized this live
+adapter installation and launcher; the receipt documents its rollback.
+
+**Local structural types.** `os-extension.ts` imports only Node built-ins and
+declares minimal local types with citations to reviewed os source. The os loader
+alias is a runtime alias, unavailable to standalone CCT `tsc`; a type-only
+package import would disappear before a load test and conceal that mismatch.
+The accepted cost is no compiler-detected upstream API drift. Source citations,
+handler checks, and actual installed-bundle acceptance cover that risk.
+
+**Accepted limitations.** Sub-agent identity remains deferred. `--no-session`
+still assigns a session ID (`session-manager.ts:926-930`); the difficulty is
+inherited environment and process ancestry, not an absent ID. A lost marker
+race produces only a host-scoped identity, so a new host cannot recover that
+fallback peer by session ID. The adapter remains third-party software with a
+native dependency; pruning it belongs to its owner. There is no spontaneous
+idle wake-up. Package upgrades may replace the local launcher and require Q7
+to be reapplied. No os source edits are part of this integration.
+
 ---
 
 ## SQLite Schema

@@ -213,6 +213,42 @@ CREATE TABLE IF NOT EXISTS pool_throttles (
 )
 `);
 
+// One logical peer = one identity, N live MCP connections.
+//
+// Codex keeps several MCP clients alive inside a single host process (the parent
+// thread plus every fork/subagent thread), and each of them resolves the SAME
+// session_key — the host's argv is the only identity signal an MCP server can
+// see. So a peer row cannot be owned by one pid: registration used to overwrite
+// peers.pid, the pid fence on /heartbeat then told the older instance it was
+// superseded, and that instance exited — closing a stdio transport its agent
+// still needed, permanently (codex never respawns a server that exits
+// mid-session). Connections are tracked individually instead, and a connection's
+// liveness is decided ONLY by its own process, never by another registration.
+db.exec(`
+CREATE TABLE IF NOT EXISTS peer_connections (
+  peer_id        TEXT NOT NULL REFERENCES peers(id) ON DELETE CASCADE,
+  pid            INTEGER NOT NULL,
+  pid_start      TEXT NOT NULL,
+  host_pid       INTEGER,
+  host_pid_start TEXT,
+  registered_at  TEXT NOT NULL,
+  last_seen      TEXT NOT NULL,
+  PRIMARY KEY (peer_id, pid, pid_start)
+);
+
+CREATE INDEX IF NOT EXISTS idx_peer_connections_peer ON peer_connections(peer_id);
+`);
+
+// Backfill: peers registered before connection tracking have no connection row.
+// Seed one from the peer's own pid so liveness checks don't permanently fall
+// back to the legacy single-pid path for those rows.
+db.exec(`
+INSERT OR IGNORE INTO peer_connections
+  (peer_id, pid, pid_start, host_pid, host_pid_start, registered_at, last_seen)
+SELECT id, pid, pid_start, host_pid, host_pid_start, registered_at, last_seen
+FROM peers WHERE status = 'active'
+`);
+
 // --- Helpers ---
 
 function genId(len: number): string {
@@ -373,17 +409,126 @@ function restoreMembershipsAfterRevive(peerId: string, diedAt: string): void {
   }
 }
 
-// One codex process = one CCT peer. Codex respawns its MCP servers on session
-// fork/reconnect without always killing the old one, which used to leave two
-// live peer rows for a single session (both heartbeating, only one addressable).
-// The session_key dedupe below cannot catch that when the two rows carry
-// different keys, so reap by host process as well.
-function reapDuplicateCodexHostPeers(runtime: string, hostPid: number | null | undefined, keepId: string): void {
-  if (runtime !== "codex" || !hostPid) return;
+// --- Connection tracking (one logical peer, N live MCP connections) ---
+
+function upsertConnection(peerId: string, body: RegisterRequest, ts: string): void {
   db.prepare(
-    `UPDATE peers SET status = 'dead'
+    `INSERT INTO peer_connections
+       (peer_id, pid, pid_start, host_pid, host_pid_start, registered_at, last_seen)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(peer_id, pid, pid_start) DO UPDATE SET
+       host_pid = excluded.host_pid,
+       host_pid_start = excluded.host_pid_start,
+       last_seen = excluded.last_seen`
+  ).run(
+    peerId,
+    body.pid,
+    body.pid_start,
+    body.host_pid ?? null,
+    body.host_pid_start ?? null,
+    ts,
+    ts,
+  );
+}
+
+/** Connection ROWS, not verified processes. Used for "may this peer be retired?"
+ *  decisions, which must also hold for LAN peers whose pids are not checkable
+ *  from this machine. Process liveness is the stale reaper's job. */
+function connectionCount(peerId: string): number {
+  const row = db.prepare("SELECT COUNT(*) AS cnt FROM peer_connections WHERE peer_id = ?").get(peerId) as { cnt: number };
+  return row?.cnt ?? 0;
+}
+
+/** True if any tracked connection is a live local process. Peers with no
+ *  connection rows fall back to the peer's own pid (legacy rows). */
+function peerHasLiveConnection(peerId: string): boolean {
+  const conns = db.prepare("SELECT pid, pid_start FROM peer_connections WHERE peer_id = ?").all(peerId) as
+    { pid: number; pid_start: string }[];
+  if (conns.length === 0) {
+    const peer = db.prepare("SELECT pid, pid_start FROM peers WHERE id = ?").get(peerId) as
+      { pid: number; pid_start: string } | null;
+    return peer ? pidIsAlive(peer.pid, peer.pid_start) : false;
+  }
+  return conns.some((c) => pidIsAlive(c.pid, c.pid_start));
+}
+
+// One codex process = one CCT peer, but never at the cost of retiring a LIVE
+// peer. Codex spawns an MCP server per thread inside one host process, and a
+// server that cannot resolve the rollout session id falls back to a host-scoped
+// key — so two different keys can describe one codex process. Killing the row
+// that registered first made its server re-register (heartbeat recovery), which
+// killed the other, forever. One codex process is one user-facing session, so
+// adopt the existing identity instead of competing with it.
+function findAdoptableCodexHostPeer(
+  runtime: string,
+  hostPid: number | null | undefined,
+  hostPidStart: string | null | undefined,
+): { id: string; name: string; secret: string; session_key: string | null } | null {
+  if (runtime !== "codex" || !hostPid) return null;
+  const rows = db.prepare(
+    `SELECT id, name, secret, session_key, host_pid_start FROM peers
+     WHERE runtime = 'codex' AND host_pid = ? AND status = 'active'
+     ORDER BY registered_at ASC`
+  ).all(hostPid) as { id: string; name: string; secret: string; session_key: string | null; host_pid_start: string | null }[];
+
+  for (const row of rows) {
+    // Guard against PID recycling: a reused host pid is a different codex.
+    if (hostPidStart && row.host_pid_start && row.host_pid_start !== hostPidStart) continue;
+    if (peerHasLiveConnection(row.id)) return row;
+  }
+  return null;
+}
+
+// A rollout-derived root key survives host restarts; the host-scoped fallback
+// does not. When a stronger key shows up for an adopted row, upgrade to it so
+// the identity is reclaimable after `codex resume`.
+function maybeUpgradeSessionKey(peerId: string, storedKey: string | null, incomingKey: string | null): void {
+  if (!incomingKey || incomingKey === storedKey) return;
+  const incomingIsStrong = incomingKey.startsWith("codex-root:");
+  const storedIsWeak = !storedKey || storedKey.startsWith("codex-host:");
+  if (incomingIsStrong && storedIsWeak) {
+    db.prepare("UPDATE peers SET session_key = ? WHERE id = ?").run(incomingKey, peerId);
+  }
+}
+
+/** Retire same-host codex duplicates that hold no live connection. Never
+ *  touches a peer whose MCP process is still running. */
+function reapDeadCodexHostPeers(runtime: string, hostPid: number | null | undefined, keepId: string): void {
+  if (runtime !== "codex" || !hostPid) return;
+  const rows = db.prepare(
+    `SELECT id FROM peers
      WHERE runtime = 'codex' AND host_pid = ? AND id != ? AND status = 'active'`
-  ).run(hostPid, keepId);
+  ).all(hostPid, keepId) as { id: string }[];
+  for (const row of rows) {
+    if (peerHasLiveConnection(row.id)) continue;
+    db.prepare("UPDATE peers SET status = 'dead' WHERE id = ?").run(row.id);
+    db.prepare("DELETE FROM peer_connections WHERE peer_id = ?").run(row.id);
+  }
+}
+
+// Keep the Codex connection policy unchanged. Unlike Codex threads, two os
+// session IDs on one host are distinct sessions (/new or session switching).
+// Only a host fallback and its marker-derived key may share an os identity.
+function findAdoptableOsHostPeer(body: RegisterRequest): { id: string; name: string; secret: string; session_key: string | null } | null {
+  if (body.runtime !== "os" || !body.host_pid || !body.session_key) return null;
+  const rows = db.prepare(
+    `SELECT id, name, secret, session_key, host_pid_start FROM peers
+     WHERE runtime = 'os' AND host_pid = ? AND status = 'active'
+     ORDER BY registered_at ASC`
+  ).all(body.host_pid) as { id: string; name: string; secret: string; session_key: string | null; host_pid_start: string | null }[];
+  for (const row of rows) {
+    if (body.host_pid_start !== row.host_pid_start) continue;
+    if (!row.session_key) continue;
+    const storedWeak = row.session_key.startsWith("os-host:");
+    const incomingWeak = body.session_key.startsWith("os-host:");
+    if (!storedWeak && !incomingWeak) continue;
+    if (!peerHasLiveConnection(row.id)) continue;
+    if (storedWeak && body.session_key.startsWith("os:")) {
+      db.prepare("UPDATE peers SET session_key = ? WHERE id = ?").run(body.session_key, row.id);
+    }
+    return row;
+  }
+  return null;
 }
 
 const registerPeerTx = transaction((body: RegisterRequest, id: string, secret: string) => {
@@ -421,11 +566,20 @@ const registerPeerTx = transaction((body: RegisterRequest, id: string, secret: s
         existing.id,
       );
 
-      db.prepare(
-        `UPDATE peers
-         SET status = 'dead'
+      upsertConnection(existing.id, body, ts);
+
+      // A second row for the same key is an anomaly (legacy data, or a revive
+      // race). Retire it only when nothing live is attached — a live MCP process
+      // is never an orphan just because someone else registered.
+      const otherRows = db.prepare(
+        `SELECT id FROM peers
          WHERE runtime = ? AND session_key = ? AND id != ? AND status = 'active'`
-      ).run(runtime, sessionKey, existing.id);
+      ).all(runtime, sessionKey, existing.id) as { id: string }[];
+      for (const other of otherRows) {
+        if (peerHasLiveConnection(other.id)) continue;
+        db.prepare("UPDATE peers SET status = 'dead' WHERE id = ?").run(other.id);
+        db.prepare("DELETE FROM peer_connections WHERE peer_id = ?").run(other.id);
+      }
 
       // Recovery: if this row had been marked dead (e.g. by stale cleanup during
       // a network outage), stale cleanup also dropped its pool memberships and may
@@ -437,10 +591,38 @@ const registerPeerTx = transaction((body: RegisterRequest, id: string, secret: s
         restoreMembershipsAfterRevive(existing.id, existing.died_at);
       }
 
-      reapDuplicateCodexHostPeers(runtime, body.host_pid, existing.id);
+      reapDeadCodexHostPeers(runtime, body.host_pid, existing.id);
 
       return { id: existing.id, secret: existing.secret, name: nextName };
     }
+  }
+
+  // No row for this key: before minting a new identity, adopt the live peer of
+  // this codex host process if there is one (see findAdoptableCodexHostPeer).
+  const adoptable = findAdoptableCodexHostPeer(runtime, body.host_pid, body.host_pid_start)
+    ?? findAdoptableOsHostPeer(body);
+  if (adoptable) {
+    const nextName = body.name_is_explicit && name ? name : adoptable.name;
+    db.prepare(
+      `UPDATE peers
+       SET name = ?, pid = ?, pid_start = ?, host_pid = ?, host_pid_start = ?,
+           cwd = ?, git_root = ?, git_branch = ?, status = 'active', last_seen = ?, died_at = NULL
+       WHERE id = ?`
+    ).run(
+      nextName,
+      pid,
+      pid_start,
+      body.host_pid ?? null,
+      body.host_pid_start ?? null,
+      cwd,
+      git_root ?? null,
+      git_branch ?? null,
+      ts,
+      adoptable.id,
+    );
+    maybeUpgradeSessionKey(adoptable.id, adoptable.session_key, sessionKey);
+    upsertConnection(adoptable.id, body, ts);
+    return { id: adoptable.id, secret: adoptable.secret, name: nextName };
   }
 
   const peerName = name || `peer-${id}`;
@@ -468,7 +650,8 @@ const registerPeerTx = transaction((body: RegisterRequest, id: string, secret: s
     ts,
   );
 
-  reapDuplicateCodexHostPeers(runtime, body.host_pid, id);
+  upsertConnection(id, body, ts);
+  reapDeadCodexHostPeers(runtime, body.host_pid, id);
 
   return { id, secret, name: peerName };
 });
@@ -489,29 +672,69 @@ function handleHeartbeat(body: HeartbeatRequest): BrokerResponse {
   const authErr = requireSecret(body.peer_id, body.peer_secret);
   if (authErr) return err(authErr);
 
+  const ts = now();
+  let readded = false;
+
   if (body.pid) {
-    const row = db.prepare("SELECT pid, pid_start FROM peers WHERE id = ? AND status = 'active'").get(body.peer_id) as
-      { pid: number; pid_start: string } | null;
+    const row = db.prepare("SELECT id FROM peers WHERE id = ? AND status = 'active'").get(body.peer_id) as
+      { id: string } | null;
+    // Still the only rejection: the row is gone, which the server answers by
+    // re-registering under its session_key (identity survives). A heartbeat is
+    // NEVER rejected because another instance registered — the pid fence that
+    // used to do that is what killed live transports.
     if (!row) return err("peer not found or not active");
-    if (row.pid !== body.pid || row.pid_start !== (body.pid_start ?? row.pid_start)) {
-      return ok({ acknowledged: false, stale_registration: true });
+
+    if (body.pid_start) {
+      const updated = db.prepare(
+        "UPDATE peer_connections SET last_seen = ? WHERE peer_id = ? AND pid = ? AND pid_start = ?"
+      ).run(ts, body.peer_id, body.pid, body.pid_start);
+      if (updated.changes === 0) {
+        db.prepare(
+          `INSERT OR IGNORE INTO peer_connections
+             (peer_id, pid, pid_start, host_pid, host_pid_start, registered_at, last_seen)
+           VALUES (?, ?, ?, NULL, NULL, ?, ?)`
+        ).run(body.peer_id, body.pid, body.pid_start, ts, ts);
+        readded = true;
+      }
+    } else {
+      db.prepare(
+        "UPDATE peer_connections SET last_seen = ? WHERE peer_id = ? AND pid = ?"
+      ).run(ts, body.peer_id, body.pid);
     }
   }
 
-  db.prepare("UPDATE peers SET last_seen = ? WHERE id = ?").run(now(), body.peer_id);
-  return ok({ acknowledged: true });
+  db.prepare("UPDATE peers SET last_seen = ? WHERE id = ?").run(ts, body.peer_id);
+  return ok(readded ? { acknowledged: true, readded: true } : { acknowledged: true });
 }
+
+// Removing a connection is not the same as retiring the peer: the peer dies only
+// when its LAST connection goes. Otherwise a codex subagent's MCP server exiting
+// cleanly would drop the parent's pool memberships and force a revive round-trip
+// every single time.
+const removeConnectionTx = transaction((peerId: string, pid: number | undefined, pidStart: string | undefined) => {
+  if (!pid) {
+    db.prepare("DELETE FROM peer_connections WHERE peer_id = ?").run(peerId);
+    return { removed: true, remaining: 0 };
+  }
+  const removed = pidStart
+    ? db.prepare("DELETE FROM peer_connections WHERE peer_id = ? AND pid = ? AND pid_start = ?").run(peerId, pid, pidStart)
+    : db.prepare("DELETE FROM peer_connections WHERE peer_id = ? AND pid = ?").run(peerId, pid);
+  return { removed: removed.changes > 0, remaining: connectionCount(peerId) };
+});
 
 function handleUnregister(body: UnregisterRequest): BrokerResponse {
   const authErr = requireSecret(body.peer_id, body.peer_secret);
   if (authErr) return err(authErr);
 
-  if (body.pid) {
-    const row = db.prepare("SELECT pid, pid_start FROM peers WHERE id = ?").get(body.peer_id) as
-      { pid: number; pid_start: string } | null;
-    if (row && (row.pid !== body.pid || row.pid_start !== (body.pid_start ?? row.pid_start))) {
-      return ok({ unregistered: false, stale_registration: true });
-    }
+  const { removed, remaining } = removeConnectionTx(body.peer_id, body.pid, body.pid_start);
+
+  // A caller holding no connection was already retired; it must not be able to
+  // kill a peer other processes are still using.
+  if (!removed && remaining > 0) {
+    return ok({ unregistered: false, stale_registration: true, connections_remaining: remaining });
+  }
+  if (remaining > 0) {
+    return ok({ unregistered: false, connections_remaining: remaining });
   }
 
   markPeerDead(body.peer_id);
@@ -535,6 +758,7 @@ const markPeerDeadTx = transaction((peerId: string) => {
   // so a later session-keyed revive can identify exactly which memberships this
   // death dropped (left_at == died_at) versus ones the peer left on its own.
   db.prepare("UPDATE peers SET status = 'dead', died_at = ? WHERE id = ?").run(deathTs, peerId);
+  db.prepare("DELETE FROM peer_connections WHERE peer_id = ?").run(peerId);
 
   const peer = db.prepare("SELECT name, cwd FROM peers WHERE id = ?").get(peerId) as { name: string; cwd: string } | null;
   const poolMemberships = db.prepare(
@@ -583,8 +807,16 @@ function handleListPeers(_body: any): BrokerResponse {
     poolsByPeer.set(m.peer_id, arr);
   }
 
+  const connCounts = new Map<string, number>();
+  for (const row of db.prepare(
+    "SELECT peer_id, COUNT(*) AS cnt FROM peer_connections GROUP BY peer_id"
+  ).all() as { peer_id: string; cnt: number }[]) {
+    connCounts.set(row.peer_id, row.cnt);
+  }
+
   const result = peers.map((p) => ({
     ...p,
+    connections: connCounts.get(p.id) ?? 0,
     pools: (poolsByPeer.get(p.id) ?? []).map(({ pool_id, pool_name, role }) => ({ pool_id, pool_name, role })),
   }));
 
@@ -1798,11 +2030,35 @@ function cleanupStalePeers(): void {
 
   for (const peer of activePeers) {
     const age = Date.now() - new Date(peer.last_seen).getTime();
-    const pidDead = !pidIsAlive(peer.pid, peer.pid_start);
     const hostDead = peer.host_pid != null && !pidIsAlive(peer.host_pid, peer.host_pid_start ?? "");
     const heartbeatStale = age > HEARTBEAT_INTERVAL_MS * 3;
 
-    if (hostDead || (pidDead && age > HEARTBEAT_INTERVAL_MS) || heartbeatStale) {
+    // Process liveness is decided per connection: a peer stays alive while ANY
+    // of its MCP servers is running. Dead connection rows are reaped on their
+    // own clock so a finished subagent's row doesn't linger.
+    const conns = db.prepare(
+      "SELECT pid, pid_start, last_seen FROM peer_connections WHERE peer_id = ?"
+    ).all(peer.id) as { pid: number; pid_start: string; last_seen: string }[];
+
+    let anyLive = false;
+    if (conns.length === 0) {
+      anyLive = pidIsAlive(peer.pid, peer.pid_start);
+    } else {
+      for (const conn of conns) {
+        if (pidIsAlive(conn.pid, conn.pid_start)) {
+          anyLive = true;
+          continue;
+        }
+        const connAge = Date.now() - new Date(conn.last_seen).getTime();
+        if (connAge > HEARTBEAT_INTERVAL_MS) {
+          db.prepare(
+            "DELETE FROM peer_connections WHERE peer_id = ? AND pid = ? AND pid_start = ?"
+          ).run(peer.id, conn.pid, conn.pid_start);
+        }
+      }
+    }
+
+    if (hostDead || (!anyLive && age > HEARTBEAT_INTERVAL_MS) || heartbeatStale) {
       markPeerDead(peer.id);
       cleanupPeerArtifacts(peer.id, peer.pid);
     }

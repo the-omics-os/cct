@@ -1,8 +1,8 @@
 #!/usr/bin/env tsx
-import { existsSync, readFileSync, writeFileSync, chmodSync, mkdirSync, copyFileSync, readdirSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { existsSync, readFileSync, writeFileSync, chmodSync, mkdirSync, copyFileSync, readdirSync, realpathSync, lstatSync, readlinkSync } from "node:fs";
+import { join, dirname, resolve, basename, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { homedir } from "node:os";
+import { homedir, userInfo } from "node:os";
 import { spawn as nodeSpawn, spawnSync } from "node:child_process";
 import {
   BROKER_PORT,
@@ -32,6 +32,7 @@ const BROKER_PATH = join(CCT_DIR, "broker.ts");
 const GLOBAL_CLAUDE_JSON = join(homedir(), ".claude.json");
 const GLOBAL_CLAUDE_SETTINGS = join(homedir(), ".claude", "settings.json");
 const CODEX_CONFIG_PATH = join(homedir(), ".codex", "config.toml");
+const OS_EXTENSION_PATH = join(CCT_DIR, "os-extension.ts");
 
 function resolveTargetPaths(projectMode: boolean): { claudeJson: string; claudeSettings: string } {
   if (!projectMode) return { claudeJson: GLOBAL_CLAUDE_JSON, claudeSettings: GLOBAL_CLAUDE_SETTINGS };
@@ -204,6 +205,25 @@ function findCodexMarkerByAncestry(codexPid: number): LocalIdentity | null {
   return null;
 }
 
+function findOsIdentityByAncestry(): LocalIdentity | null | undefined {
+  // PI_SESSION_ID is usually present in os bash children, but is conditional.
+  // Use the host-owned A -> server-owned B handoff even when that env var exists.
+  let pid: number | null = process.ppid;
+  for (let i = 0; pid && i < 12; i++) {
+    const marker = join(PIDMAP_DIR, `os_session_${pid}`);
+    try {
+      const sessionId = readFileSync(marker, "utf8").trim();
+      if (/^[\w-]+$/.test(sessionId)) {
+        const identity = readPidmap(join(PIDMAP_DIR, `os_${sessionId}`));
+        // The nearest os host owns this invocation; never borrow an outer peer.
+        return identity ? { ...identity, source: `${marker} -> ${identity.source}` } : null;
+      }
+    } catch {}
+    pid = getParentPid(pid);
+  }
+  return undefined;
+}
+
 function resolveLocalIdentity(): LocalIdentity | null {
   if (process.env.CCT_PEER_ID) {
     return {
@@ -212,6 +232,9 @@ function resolveLocalIdentity(): LocalIdentity | null {
       source: "CCT_PEER_ID",
     };
   }
+
+  const osIdentity = findOsIdentityByAncestry();
+  if (osIdentity !== undefined) return osIdentity;
 
   const codexSessionId = process.env.CCT_CODEX_SESSION_ID ?? process.env.CODEX_SESSION_ID ?? process.env.CODEX_THREAD_ID;
   if (codexSessionId) {
@@ -270,9 +293,13 @@ Commands:
   lan-start                    Start the broker on 0.0.0.0 (LAN mode)
   kill                         Stop the broker
   config                       Show or set persistent config
-  install [--project]          Register MCP + hooks (auto-detects Claude Code & Codex)
-  uninstall [--project]        Remove MCP + hooks (auto-detects Claude Code & Codex)
+  install [--project] [--claude|--codex|--os]    Register MCP + delivery integration
+  uninstall [--project] [--claude|--codex|--os]  Remove MCP + delivery integration
   help                         Show this help
+
+Installation scope:
+  No runtime flags: Claude Code plus detected Codex and os.
+  Runtime flags may be combined. --project scopes only Claude; os uses global settings.
 
 LAN mode:
   Host the broker:   cct lan-start --token <shared-secret>
@@ -320,6 +347,7 @@ async function cmdWhoami() {
     die(`No CCT identity found for this process.
 
 If you are in Codex, restart the session after running "cct install", or ask the agent to call the cct_whoami MCP tool.
+If you are in os, configure "cct install --os", restart os, and call a CCT tool to register.
 Do not use CODEX_THREAD_ID as a CCT address; it is only the Codex session/thread ID.`);
   }
 
@@ -653,7 +681,31 @@ function backupFile(path: string): void {
   }
 }
 
-async function cmdInstall(projectMode: boolean) {
+type InstallRuntime = "claude" | "codex" | "os";
+
+function selectInstallRuntimes(args: string[]): InstallRuntime[] {
+  const runtimes: InstallRuntime[] = ["claude", "codex", "os"];
+  for (const arg of args) {
+    if (arg !== "--project" && !runtimes.some((runtime) => arg === `--${runtime}`)) {
+      die(`Unknown install/uninstall option: ${arg}`);
+    }
+  }
+  const selected = runtimes.filter((runtime) => args.includes(`--${runtime}`));
+  if (selected.length) return selected;
+  return ["claude", ...(detectCodex() ? ["codex" as const] : []), ...(detectOs() ? ["os" as const] : [])];
+}
+
+async function cmdInstall(args: string[]) {
+  // Select before entering any runtime's config reader/writer.
+  const runtimes = selectInstallRuntimes(args);
+  for (const runtime of runtimes) {
+    if (runtime === "claude") installClaude(args.includes("--project"));
+    if (runtime === "codex") installCodex();
+    if (runtime === "os") installOs();
+  }
+}
+
+function installClaude(projectMode: boolean) {
   const { claudeJson: CLAUDE_JSON, claudeSettings: CLAUDE_SETTINGS } = resolveTargetPaths(projectMode);
   const scope = projectMode ? "project" : "global";
 
@@ -704,16 +756,196 @@ async function cmdInstall(projectMode: boolean) {
 
   console.log(`\nCCT installed for Claude Code (${scope}). Restart sessions to activate.`);
   console.log("Start the broker with: cct start");
-
-  // --- Auto-detect Codex and install there too ---
-  if (detectCodex()) {
-    installCodex();
-  }
 }
 
 function detectCodex(): boolean {
   const codexBin = spawnSync("which", ["codex"]);
   return codexBin.status === 0 && existsSync(join(homedir(), ".codex"));
+}
+
+function isOsPackage(dir: string): boolean {
+  try {
+    const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
+    return pkg.name === "@the-omics-os/os" && typeof pkg.bin?.os === "string"
+      && existsSync(resolve(dir, pkg.bin.os));
+  } catch {
+    return false;
+  }
+}
+
+function findOsPackage(): string | undefined {
+  const bin = spawnSync("which", ["os"], { encoding: "utf8" });
+  if (bin.status !== 0 || !bin.stdout.trim()) return;
+  try {
+    let dir = dirname(realpathSync(bin.stdout.trim()));
+    while (dirname(dir) !== dir) {
+      if (isOsPackage(dir)) return dir;
+      dir = dirname(dir);
+    }
+  } catch {}
+  // Q7 launchers may live in ~/.os/bin and exec the global bundle. Verify the
+  // actual installed package, rather than requiring the launcher to live in it.
+  const npmRoot = spawnSync("npm", ["root", "-g"], { encoding: "utf8", timeout: 10_000 });
+  if (npmRoot.status === 0 && npmRoot.stdout.trim()) {
+    const dir = join(npmRoot.stdout.trim(), "@the-omics-os", "os");
+    if (isOsPackage(dir)) return dir;
+  }
+}
+
+function detectOs(): boolean {
+  return existsSync(join(homedir(), ".os")) && findOsPackage() !== undefined;
+}
+
+function resolveAdapterAgentDir(): string {
+  // Mirrors pi-mcp-adapter@2.33.0 agent-dir.ts:5-24,43-55. PI_PACKAGE_DIR is
+  // resolved literally (no tilde expansion); its piConfig selects the env key.
+  let piConfig: { name?: unknown; configDir?: unknown } | undefined;
+  const packageDir = process.env.PI_PACKAGE_DIR?.trim();
+  if (packageDir) {
+    try {
+      piConfig = JSON.parse(readFileSync(join(resolve(packageDir), "package.json"), "utf8")).piConfig;
+    } catch {}
+  }
+  const appName = typeof piConfig?.name === "string" && piConfig.name.trim() ? piConfig.name.trim() : "pi";
+  const configDir = typeof piConfig?.configDir === "string" && piConfig.configDir.trim() ? piConfig.configDir.trim() : ".pi";
+  const configured = process.env[`${appName.toUpperCase()}_CODING_AGENT_DIR`]?.trim();
+  if (!configured) return resolve(join(homedir(), configDir, "agent"));
+  if (configured === "~") return homedir();
+  if (configured.startsWith("~/")) return resolve(homedir(), configured.slice(2));
+  return resolve(configured);
+}
+
+function resolveOsAgentDir(): string {
+  // os/src/config.ts:516,519-521,532-537 and src/utils/paths.ts:77-103.
+  // Keep local until PHASE_1's shared directory constant is available.
+  const configured = process.env.OS_CODING_AGENT_DIR;
+  if (!configured) return join(homedir(), ".os", "agent");
+  if (configured === "~") return homedir();
+  if (configured.startsWith("~/")) return resolve(homedir(), configured.slice(2));
+  if (configured.startsWith("file://")) return fileURLToPath(configured);
+  return resolve(configured);
+}
+
+function canonicalWritePath(path: string, depth = 0): string {
+  if (depth > 64) die(`Cannot safely resolve config path: ${path}`);
+  const absolute = resolve(path);
+  try {
+    if (lstatSync(absolute).isSymbolicLink()) {
+      return canonicalWritePath(resolve(dirname(absolute), readlinkSync(absolute)), depth + 1);
+    }
+    return realpathSync(absolute);
+  } catch (error: any) {
+    if (error.code !== "ENOENT") throw error;
+    // Resolve existing ancestors even when the file or symlink target is new.
+    const parent = dirname(absolute);
+    if (parent === absolute) return absolute;
+    return join(canonicalWritePath(parent, depth + 1), basename(absolute));
+  }
+}
+
+function assertOsWritePaths(paths: string[]): void {
+  // homedir() follows synthetic HOME; userInfo() still identifies the real home.
+  const protectedRoots = [...new Set([homedir(), userInfo().homedir])]
+    .map((home) => join(home, ".pi"));
+  for (const path of paths) {
+    const absolute = resolve(path);
+    const canonical = canonicalWritePath(path);
+    for (const root of protectedRoots) {
+      const realRoot = canonicalWritePath(root);
+      if ([root, realRoot].some((protectedPath) =>
+        [absolute, canonical].some((candidate) => candidate === protectedPath || candidate.startsWith(protectedPath + sep)))) {
+        die(`Refusing os configuration write: ${path} resolves to ${canonical}, under protected ${root}. Set PI_CODING_AGENT_DIR in the os host environment (Q7), normally to the same directory as OS_CODING_AGENT_DIR or ~/.os/agent. PI_PACKAGE_DIR can select a different adapter env key; check the resolved paths.`);
+      }
+    }
+  }
+}
+
+function osConfigPaths(): { settings: string; mcp: string } {
+  const settings = join(resolveOsAgentDir(), "settings.json");
+  const adapterDir = resolveAdapterAgentDir();
+  const mcp = join(adapterDir, "mcp.json");
+  console.log(`os settings: ${settings}`);
+  console.log(`os adapter config: ${mcp}`);
+  console.log(`os adapter state (cache/onboarding): ${adapterDir}`);
+  // Check all write and backup destinations before reading or changing configs.
+  assertOsWritePaths([settings, settings + ".bak", mcp, mcp + ".bak"]);
+  return { settings, mcp };
+}
+
+function readOsJson(path: string): Record<string, any> {
+  const value = readJsonFile(path);
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    die(`Expected a JSON object in ${path}; no os configs changed.`);
+  }
+  return value;
+}
+
+function readOsConfigs(paths: { settings: string; mcp: string }) {
+  const settings = readOsJson(paths.settings);
+  const mcp = readOsJson(paths.mcp);
+  if (settings.extensions !== undefined && !Array.isArray(settings.extensions)) {
+    die(`Expected extensions[] in ${paths.settings}; no os configs changed.`);
+  }
+  if (mcp.mcpServers !== undefined && (!mcp.mcpServers || typeof mcp.mcpServers !== "object" || Array.isArray(mcp.mcpServers))) {
+    die(`Expected mcpServers object in ${paths.mcp}; no os configs changed.`);
+  }
+  return { settings, mcp };
+}
+
+function writeOsJsonIfChanged(path: string, value: Record<string, any>): void {
+  const next = JSON.stringify(value, null, 2) + "\n";
+  if (existsSync(path) && readFileSync(path, "utf8") === next) return;
+  mkdirSync(dirname(path), { recursive: true });
+  backupFile(path);
+  writeFileSync(path, next, { mode: 0o600 });
+}
+
+function installOs(): void {
+  const paths = osConfigPaths();
+  if (!findOsPackage()) die("Cannot verify an installed @the-omics-os/os package for the os executable; no os configs changed.");
+  const { settings, mcp } = readOsConfigs(paths);
+  const cfg = readJsonFile(CONFIG_PATH);
+  const tsx = join(CCT_DIR, "node_modules", ".bin", "tsx");
+  if (!existsSync(tsx)) die(`Missing CCT dependency: ${tsx}; install CCT dependencies before configuring os.`);
+  const previous = mcp.mcpServers?.cct;
+  const env: Record<string, string> = { ...previous?.env, CCT_RUNTIME: "os" };
+  const broker = process.env.CCT_BROKER ?? cfg.broker;
+  const token = process.env.CCT_TOKEN ?? cfg.token;
+  if (broker) env.CCT_BROKER = broker;
+  if (token) env.CCT_TOKEN = token;
+  mcp.mcpServers = {
+    ...mcp.mcpServers,
+    cct: {
+      ...previous,
+      command: tsx,
+      args: [SERVER_PATH],
+      env,
+      lifecycle: "lazy-keep-alive",
+      directTools: true,
+      toolPrefix: "none",
+    },
+  };
+  const extensions: unknown[] = settings.extensions ?? [];
+  if (!extensions.includes(OS_EXTENSION_PATH)) settings.extensions = [...extensions, OS_EXTENSION_PATH];
+  writeOsJsonIfChanged(paths.mcp, mcp);
+  writeOsJsonIfChanged(paths.settings, settings);
+  console.log("CCT installed for os (global). Restart os to activate.");
+  console.log("Requirement: install/enable pi-mcp-adapter separately in os; CCT does not install it.");
+  console.log("Requirement: the os host must retain this adapter directory environment; Q7 normally sets PI_CODING_AGENT_DIR=${OS_CODING_AGENT_DIR:-$HOME/.os/agent}.");
+}
+
+function uninstallOs(): void {
+  const paths = osConfigPaths();
+  const { settings, mcp } = readOsConfigs(paths);
+  if (mcp.mcpServers && Object.hasOwn(mcp.mcpServers, "cct")) {
+    delete mcp.mcpServers.cct;
+    writeOsJsonIfChanged(paths.mcp, mcp);
+  }
+  if (settings.extensions?.includes(OS_EXTENSION_PATH)) {
+    settings.extensions = settings.extensions.filter((entry: unknown) => entry !== OS_EXTENSION_PATH);
+    writeOsJsonIfChanged(paths.settings, settings);
+  }
+  console.log("CCT uninstalled from os (global). Restart os to deactivate.");
 }
 
 function readTomlFile(path: string): string {
@@ -866,7 +1098,16 @@ function uninstallCodex(): void {
   }
 }
 
-async function cmdUninstall(projectMode: boolean) {
+async function cmdUninstall(args: string[]) {
+  const runtimes = selectInstallRuntimes(args);
+  for (const runtime of runtimes) {
+    if (runtime === "claude") uninstallClaude(args.includes("--project"));
+    if (runtime === "codex") uninstallCodex();
+    if (runtime === "os") uninstallOs();
+  }
+}
+
+function uninstallClaude(projectMode: boolean) {
   const { claudeJson: CLAUDE_JSON, claudeSettings: CLAUDE_SETTINGS } = resolveTargetPaths(projectMode);
   const scope = projectMode ? "project" : "global";
 
@@ -907,11 +1148,6 @@ async function cmdUninstall(projectMode: boolean) {
   }
 
   console.log(`\nCCT uninstalled from Claude Code (${scope}). Restart sessions to deactivate.`);
-
-  // --- Auto-detect Codex and uninstall there too ---
-  if (detectCodex()) {
-    uninstallCodex();
-  }
 }
 
 // --- Main ---
@@ -983,10 +1219,10 @@ try {
       await cmdConfig(subArgs);
       break;
     case "install":
-      await cmdInstall(subArgs.includes("--project"));
+      await cmdInstall(subArgs);
       break;
     case "uninstall":
-      await cmdUninstall(subArgs.includes("--project"));
+      await cmdUninstall(subArgs);
       break;
     default:
       die(`Unknown command: ${cmd}. Run "cct help" for usage.`);

@@ -18,6 +18,7 @@
     "broker.ts",
     "server.ts",
     "cli.ts",
+    "os-extension.ts",
     "hook.sh",
     "hook-codex.sh",
     "prompt-codex.sh",
@@ -41,6 +42,8 @@
     "typecheck": "tsc --noEmit",
     "test": "./test-integration.sh",
     "test:codex-session": "tsx test-codex-session.ts",
-    "test:codex-identity": "./test-codex-identity-e2e.sh"
+    "test:codex-identity": "./test-codex-identity-e2e.sh",
+    "test:codex-concurrent": "./test-codex-concurrent-mcp-e2e.sh",
+    "test:os-identity": "./test-os-identity-e2e.sh"
   }
 }

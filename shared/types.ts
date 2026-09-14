@@ -66,7 +66,7 @@ export interface BrokerResponse<T = unknown> {
 export interface RegisterRequest {
   pid: number;
   pid_start: string;
-  runtime?: "claude" | "codex";
+  runtime?: "claude" | "codex" | "os";
   session_key?: string;
   host_pid?: number;
   host_pid_start?: string;
@@ -118,6 +118,9 @@ export interface PeerInfo {
   status: string;
   registered_at: string;
   last_seen: string;
+  /** Live MCP connections sharing this logical peer (codex parent + fork/subagent
+   *  threads each hold their own). Absent on pre-connection-tracking brokers. */
+  connections?: number;
   pools: { pool_id: string; pool_name: string; role: string }[];
 }
 

@@ -39,10 +39,10 @@ import { generateSummary } from "./shared/summarize.ts";
 
 // --- Runtime detection ---
 // Codex sets CODEX_HOME; explicit CCT_RUNTIME overrides auto-detection.
-type AgentRuntime = "claude" | "codex";
+type AgentRuntime = "claude" | "codex" | "os";
 const detectedRuntime: AgentRuntime =
   (process.env.CCT_RUNTIME as AgentRuntime) ??
-  (process.env.CODEX_HOME ? "codex" : "claude");
+  (process.env.CODEX_HOME ? "codex" : process.env.AI_AGENT === "os" ? "os" : "claude");
 
 // For Codex: process.cwd() returns CCT's dir (forced via config.toml cwd field).
 // Resolve actual session CWD by reading parent Codex process's working directory.
@@ -91,6 +91,8 @@ let requestCleanupFn: ((reason: string) => void) | null = null;
 // the broker de-dupes on (runtime, session_key) and returns the same peer row.
 let lastRegisterBody: Record<string, unknown> | null = null;
 let recovering = false;
+// Log the "superseded" notice from a legacy broker once, not every 15s.
+let warnedSuperseded = false;
 
 // Deferred ack: message IDs returned by the last handleCheckMessages call.
 // These get acked at the START of the next call, so if the cron result is
@@ -100,6 +102,8 @@ let recovering = false;
 // mark nothing read. On identity change we drop them rather than misfire.
 let pendingAckIds: number[] = [];
 let pendingAckPeerId = "";
+let osReadGeneration = 0;
+let osReadsInFlight = 0;
 
 // --- Broker HTTP helpers ---
 
@@ -248,6 +252,22 @@ function findCodexPid(): number | null {
   return null;
 }
 
+// os sets process.title to "os", including when launched through its wrapper.
+// The adapter may have node/tsx wrappers between the MCP child and that host.
+function findOsPid(): number | null {
+  let pid = process.ppid;
+  for (let i = 0; i < 8 && pid > 1; i++) {
+    const comm = spawnSync("ps", ["-o", "comm=", "-p", String(pid)]);
+    const name = comm.stdout?.toString().trim() ?? "";
+    if (name === "os" || name.endsWith("/os")) return pid;
+    const ppid = spawnSync("ps", ["-o", "ppid=", "-p", String(pid)]);
+    const parent = parseInt(ppid.stdout?.toString().trim() ?? "", 10);
+    if (!parent || parent === pid) break;
+    pid = parent;
+  }
+  return null;
+}
+
 // Stable session identity key, used as the broker `session_key`:
 //   Codex  → root of the codex fork chain, resolved from codex's own rollout
 //            transcripts (see shared/codex-session.ts). Codex never exports its
@@ -260,14 +280,16 @@ function findCodexPid(): number | null {
 // (e.g. Wi-Fi changes) instead of a fresh random ID being minted each time.
 const codexSessionIdEnv = process.env.CCT_CODEX_SESSION_ID ?? process.env.CODEX_SESSION_ID ?? process.env.CODEX_THREAD_ID;
 const claudeSessionId = process.env.CLAUDE_CODE_SESSION_ID ?? process.env.CLAUDE_SESSION_ID;
-const hostPid = detectedRuntime === "codex" ? (findCodexPid() ?? process.ppid) : findClaudePid();
+const hostPid = detectedRuntime === "codex" ? (findCodexPid() ?? process.ppid)
+  : detectedRuntime === "os" ? (findOsPid() ?? process.ppid) : findClaudePid();
 const cachedPpidStart = getPidStartForPid(hostPid);
 
 // Codex identity is resolved asynchronously in initCodexIdentity() before the
 // first registration: a freshly started codex may not have flushed its rollout
 // file yet, so resolution needs a short retry window.
 let codexIdentity: CodexSessionIdentity = { sessionId: null, rootSessionId: null, source: "unresolved" };
-let sessionKey: string | undefined = detectedRuntime === "codex" ? undefined : claudeSessionId;
+let sessionKey: string | undefined = detectedRuntime === "claude" ? claudeSessionId : undefined;
+let osSessionId: string | null = null;
 
 function isOriginalProcessAlive(pid: number, expectedStart: string): boolean {
   try {
@@ -342,6 +364,29 @@ async function initCodexIdentity(): Promise<void> {
   );
 }
 
+async function initOsIdentity(): Promise<void> {
+  if (detectedRuntime !== "os") return;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      const marker = readFileSync(join(PIDMAP_DIR, `os_session_${hostPid}`), "utf8").trim();
+      // The marker becomes a filename and diagnostic: reject path separators
+      // and control characters instead of following a malformed marker.
+      if (/^[a-zA-Z0-9_-]{1,200}$/.test(marker)) {
+        osSessionId = marker;
+        break;
+      }
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  sessionKey = osSessionId ? `os:${osSessionId}` : `os-host:${hostPid}_${cachedPpidStart}`;
+  myPidmapKey = osSessionId ? `os_${osSessionId}` : `os-host_${hostPid}_${cachedPpidStart}`;
+  myPidmapPath = join(PIDMAP_DIR, myPidmapKey);
+  process.stderr.write(
+    `CCT os identity: session=${osSessionId ?? "-"} host_pid=${hostPid} ` +
+    `source=${osSessionId ? "marker" : "fallback"} key=${sessionKey} cwd=${myCwd}\n`,
+  );
+}
+
 // Codex MCP marker — written alongside the main pidmap so SessionStart can find us
 const codexMcpMarkerPath = detectedRuntime === "codex"
   ? `${PIDMAP_DIR}/codex_mcp_${process.pid}`
@@ -397,7 +442,37 @@ function deleteFlag(): void {
 
 let pollFailures = 0;
 
+async function pollOsUnread(): Promise<void> {
+  if (osReadsInFlight > 0) return;
+  const generation = osReadGeneration;
+  const peerId = myId;
+  try {
+    // Deferred acknowledgement must suppress the delivered batch, not future
+    // messages. os has no idle cron to force the next read/ack round trip.
+    const res = await brokerPost<{ messages: PollMessage[] }>("/message/peek", {
+      peer_id: peerId, peer_secret: mySecret,
+    });
+    // A read or identity recovery may finish while this request is in flight.
+    // Its updated flag is newer than this snapshot.
+    if (generation !== osReadGeneration || osReadsInFlight > 0 || peerId !== myId) return;
+    if (!res.ok || !res.data) throw new Error("Unread peek failed");
+    const pending = new Set(pendingAckPeerId === peerId ? pendingAckIds : []);
+    const unread = res.data.messages.filter((message) => !pending.has(message.message_id));
+    const pools = new Map<string, number>();
+    for (const message of unread) {
+      const pool = message.pool_name ?? "DM";
+      pools.set(pool, (pools.get(pool) ?? 0) + 1);
+    }
+    pollFailures = 0;
+    writeFlag(`${unread.length}|${[...pools].map(([name, count]) => `${name}:${count}`).join(",")}|${Date.now()}`);
+  } catch {
+    if (generation !== osReadGeneration || peerId !== myId) return;
+    if (++pollFailures >= 3) writeFlag(`0||${Date.now()}`);
+  }
+}
+
 async function pollUnread(): Promise<void> {
+  if (detectedRuntime === "os") return pollOsUnread();
   // Skip flag writes while deferred ack is pending — handleCheckMessages owns
   // the flag during that window. Without this guard, pollUnread overwrites the
   // adjusted count with the raw DB count, causing the hook to block incorrectly.
@@ -472,9 +547,21 @@ async function sendHeartbeat(): Promise<void> {
       pid_start: cachedPidStart,
     });
     if (res.ok && res.data?.stale_registration) {
-      // A newer instance for this host/session has taken over the row — we are
-      // the orphan. Do not fight it; shut down.
-      requestCleanupFn?.("stale peer registration superseded");
+      // Only a pre-connection-tracking broker still answers this. Exiting here is
+      // what killed live agents: codex keeps one MCP client per thread inside one
+      // host process, every one of them resolves the SAME session_key, so the
+      // first duplicate registration used to evict the parent's server — and
+      // codex never respawns a server that exits mid-session, so that session's
+      // CCT tools were dead for good ("Transport closed"). A duplicate
+      // registration is not evidence that WE are an orphan. Real orphans are
+      // still caught by stdin EOF/close, the host SIGTERM, the host-death
+      // monitor, and the broker's stale reaper. Keep serving.
+      if (!warnedSuperseded) {
+        warnedSuperseded = true;
+        process.stderr.write(
+          "CCT: broker reports another MCP instance registered for this session; continuing to serve the shared peer row\n",
+        );
+      }
     } else if (!res.ok && (res.error === "peer not found" || res.error === "peer not found or not active")) {
       // Our row was reaped (broker marked us dead during an outage) but our
       // host process is still alive. Reclaim the same identity in place rather
@@ -574,6 +661,8 @@ async function handleCheckMessages(): Promise<string> {
     if (messages.some((m: any) => m.msg_type === "pool_invite")) {
       output += detectedRuntime === "claude"
         ? `\n\n🚨 ACTION REQUIRED: You were added to a pool. You MUST set up message polling NOW or you will miss all future messages.\nRun CronCreate with cron "*/1 * * * *" and prompt "Call the cct_check_messages tool to check for incoming peer messages. If there are any, read and respond to them."\nThis is not optional — without it you are deaf to messages when idle.`
+        : detectedRuntime === "os"
+          ? `\n\nYou were added to a pool. Unread messages appear at the next tool call or model turn; they do not wake an idle os session.`
         : `\n\n🚨 You were added to a pool. Messages will arrive automatically via hooks — no action needed.`;
     }
 
@@ -677,7 +766,10 @@ async function handleWhoAmI(): Promise<string> {
     ? `\nCodex session ID: ${codexIdentity.sessionId ?? "(unresolved)"}` +
       `\nCodex root session ID: ${codexIdentity.rootSessionId ?? "(unresolved)"} (source: ${codexIdentity.source})` +
       `\nBroker session key: ${sessionKey ?? "(none)"}`
-    : "";
+    : detectedRuntime === "os"
+      ? `\nos session ID: ${osSessionId ?? "(unresolved)"} (source: ${osSessionId ? "marker" : "fallback"})` +
+        `\nBroker session key: ${sessionKey ?? "(none)"}`
+      : "";
   return `CCT identity for this session:
 Peer ID: ${myId}
 Peer name: ${myName}
@@ -685,7 +777,7 @@ Runtime: ${detectedRuntime}
 CWD: ${myCwd}
 Pidmap key: ${myPidmapKey}${codexLine}
 
-Use the peer ID or peer name above for CCT addressing. CODEX_THREAD_ID is a Codex session/thread identifier, not an addressable CCT peer ID.`;
+Use the peer ID or peer name above for CCT addressing. CODEX_THREAD_ID is a Codex session/thread identifier, not an addressable CCT peer ID.${detectedRuntime === "os" ? " PI_SESSION_ID is also a session identifier, not a CCT address." : ""}`;
 }
 
 async function handleListPools(): Promise<string> {
@@ -711,6 +803,8 @@ async function handleCreatePool(args: { name: string; purpose?: string }): Promi
   if (!res.ok) return `Failed: ${res.error}`;
   const cronReminder = detectedRuntime === "claude"
     ? `\n\n⚠️ IMPORTANT: Set up message polling NOW if you haven't already. Use CronCreate with cron "*/1 * * * *" and prompt "Call the cct_check_messages tool to check for incoming peer messages. If there are any, read and respond to them." This is required to receive messages when idle.`
+    : detectedRuntime === "os"
+      ? `\n\nUnread messages appear at the next tool call or model turn. os does not wake spontaneously while idle.`
     : `\n\nMessages will be delivered automatically via PreToolUse hook (busy) or UserPromptSubmit hook (idle).`;
   return `Pool "${args.name}" created (id: ${res.data!.pool_id}). You are the creator.${cronReminder}`;
 }
@@ -724,6 +818,8 @@ async function handleJoinPool(args: { pool_name: string }): Promise<string> {
   if (!res.ok) return `Failed: ${res.error}`;
   const joinCronReminder = detectedRuntime === "claude"
     ? `\n\n⚠️ IMPORTANT: Set up message polling NOW if you haven't already. Use CronCreate with cron "*/1 * * * *" and prompt "Call the cct_check_messages tool to check for incoming peer messages. If there are any, read and respond to them." This is required to receive messages when idle.`
+    : detectedRuntime === "os"
+      ? `\n\nUnread messages appear at the next tool call or model turn. os does not wake spontaneously while idle.`
     : `\n\nMessages will be delivered automatically via PreToolUse hook (busy) or UserPromptSubmit hook (idle).`;
   return `Joined pool "${args.pool_name}".${joinCronReminder}`;
 }
@@ -741,6 +837,9 @@ async function handleLeavePool(args: { pool_name: string }): Promise<string> {
   const me = peersRes.data?.find((p) => p.id === myId);
   const remainingPools = me?.pools?.length ?? 0;
 
+  if (detectedRuntime === "os") {
+    return `Left pool "${args.pool_name}". ${remainingPools === 0 ? "You are no longer in any pools." : `Still in ${remainingPools} other pool(s).`}`;
+  }
   if (remainingPools === 0) {
     return `Left pool "${args.pool_name}". You are no longer in any pools.\n\n⚠️ CLEANUP: You should now cancel your CCT message polling cron using CronDelete (use CronList to find the job ID). The cron is only needed while you are in a pool. If you join another pool later, set it up again.`;
   }
@@ -880,10 +979,11 @@ async function main() {
   ensureDirs();
   cleanStalePidmaps();
   await initCodexIdentity();
+  await initOsIdentity();
   await ensureBroker();
 
   const peerNameEnv = process.env.CCT_PEER_NAME;
-  const prefix = detectedRuntime === "codex" ? "codex" : basename(myCwd);
+  const prefix = detectedRuntime === "codex" ? "codex" : detectedRuntime === "os" ? "os" : basename(myCwd);
   const defaultName = `${prefix}-${Math.random().toString(36).slice(2, 6)}`;
   const requestedName = peerNameEnv || defaultName;
 
@@ -934,6 +1034,12 @@ POOL LIFECYCLE — follow this exactly:
 2. ACTIVE: The cron polls every 60s when idle. The PreToolUse hook catches messages instantly when busy.
 3. LEAVE: When you leave your LAST pool (no pools remaining), cancel the cron via CronList + CronDelete.
    If you still have other pools, keep the cron running.`
+    : detectedRuntime === "os" ? `
+MESSAGE DELIVERY (os):
+- Unread messages block the next ordinary tool call after CCT tools are available.
+- Unread context is delivered on the next model turn; it does not wake an idle session.
+- Call cct_check_messages to read messages, then retry the blocked action.
+- No cron setup is required. The os extension handles delivery.`
     : `
 MESSAGE DELIVERY (Codex):
 - BUSY: The PreToolUse hook blocks your next tool call when unread messages exist.
@@ -1144,7 +1250,14 @@ ${cronInstructions}`;
     try {
       switch (name) {
         case "cct_check_messages":
-          text = await handleCheckMessages();
+          osReadGeneration++;
+          osReadsInFlight++;
+          try {
+            text = await handleCheckMessages();
+          } finally {
+            osReadsInFlight--;
+            osReadGeneration++;
+          }
           break;
         case "cct_whoami":
           text = await handleWhoAmI();
@@ -1253,13 +1366,20 @@ ${cronInstructions}`;
     pendingAckIds = [];
     let unregistered = false;
     try {
-      const res = await brokerPost<{ unregistered?: boolean }>("/unregister", {
+      const res = await brokerPost<{ unregistered?: boolean; connections_remaining?: number }>("/unregister", {
         peer_id: myId,
         peer_secret: mySecret,
         pid: process.pid,
         pid_start: cachedPidStart,
       });
       unregistered = res.ok === true && res.data?.unregistered === true;
+      // Sibling MCP connections (codex parent/fork/subagent threads) still hold
+      // this peer. Drop only our own process marker — the session pidmap and the
+      // unread flag belong to the identity, which is still alive and addressable.
+      const remaining = res.data?.connections_remaining ?? 0;
+      if (!unregistered && remaining > 0) {
+        process.stderr.write(`CCT: peer ${myId} kept alive by ${remaining} other MCP connection(s)\n`);
+      }
     } catch {}
     deletePidmap(unregistered);
     if (unregistered) deleteFlag();

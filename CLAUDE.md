@@ -1,6 +1,6 @@
 # CCT (Claude Code Talk)
 
-Real-time inter-session communication for AI coding agents. Supports **Claude Code** and **OpenAI Codex CLI**. Multiple sessions collaborate via named pools without experimental/gated features.
+Real-time inter-session communication for AI coding agents. Supports **Claude Code**, **OpenAI Codex CLI**, and **os**. Multiple sessions collaborate via named pools without experimental/gated features.
 
 ## How It Works
 
@@ -11,6 +11,11 @@ Real-time inter-session communication for AI coding agents. Supports **Claude Co
 **Codex CLI:**
 1. **PreToolUse hook** (busy sessions) — JSON stdin/stdout hook blocks tool calls when unread messages exist. Same mechanism, different wire format.
 2. **UserPromptSubmit hook** (idle sessions) — Injects unread message context on every user prompt. No cron needed.
+
+**os:**
+1. **pi-mcp-adapter** runs the resident CCT MCP server. Cold metadata discovery connects automatically; a warm cache connects on the first CCT call.
+2. **`os-extension.ts`** returns `{ block: true, reason }` at the next ordinary tool call while messages are unread. `cct_check_messages` remains callable and clears the block.
+3. **`context`** adds an unread notification on the next model turn. It does not wake an idle session.
 
 ```
 Claude A ──► MCP Server ──► Broker (SQLite) ◄── MCP Server ◄── Codex B
@@ -28,7 +33,7 @@ Machine 1                          Machine 2
 
 ## Key Concepts
 
-- **Peer**: A Claude Code session with CCT connected. Has a name, ID, summary, cwd, branch.
+- **Peer**: An agent session with CCT connected. Has a name, ID, runtime, summary, cwd, branch.
 - **Pool**: A named group of peers. Has a purpose and optional metadata. Messages broadcast to all members.
 - **Service**: An infrastructure component (e.g., CCP browser server) registered with the broker for discovery.
 - **Peer Name**: Set via `CCT_PEER_NAME=backend claude` or auto-generated as `{dirname}-{4char}`.
@@ -39,6 +44,8 @@ Machine 1                          Machine 2
 ```bash
 cct install          # Register MCP + hook (one-time setup)
 cct uninstall        # Remove MCP + hook
+cct install --os     # Configure only os; adapter and matching host environment required
+cct uninstall --os   # Remove only CCT's os config entry and extension
 cct status           # Broker health, peers, pools
 cct whoami           # Show this session's CCT peer ID/name
 cct peers            # List all registered peers
@@ -120,14 +127,18 @@ cct install                           # propagates config to MCP env vars
 cct/
   broker.ts              HTTP broker + SQLite (29 endpoints, 7 tables, transactions)
   server.ts              MCP stdio server (17 tools, runtime detection, deferred ack, orphan prevention)
-  cli.ts                 CLI (16 commands, unified installer for Claude + Codex)
+  cli.ts                 CLI (runtime-scoped installer for Claude, Codex, and os)
+  os-extension.ts        os session marker, returned tool block, next-turn notification
   hook.sh                Claude Code PreToolUse hook (pure bash, <10ms, stale detection)
   hook-codex.sh          Codex PreToolUse hook (JSON stdin/stdout, <10ms, session_id lookup)
   prompt-codex.sh        Codex UserPromptSubmit hook (idle delivery via additionalContext)
   session-start-codex.sh Codex SessionStart hook (identity bridge: session_id → peer_id)
-  test-integration.sh    Integration tests (110 checks, isolated on port 17888; also runs the unit tests)
+  test-integration.sh    Integration tests (130 checks, isolated on port 17888; also runs the unit tests)
   test-codex-session.ts  Unit tests for codex session/fork-chain resolution
   test-codex-identity-e2e.sh  E2E: fake codex host + real server.ts, stable id across resume (port 17889)
+  test-os-identity-e2e.sh E2E: os marker, fallback, MCP siblings and resume (default port 17890)
+  test-os-runtime-live.py Installed os acceptance with a local synthetic provider (15-minute idle check)
+  test-fixtures/os/      Local provider and safe runtime observations for installed-os acceptance
   shared/
     types.ts             TypeScript interfaces
     constants.ts         Ports, paths, timeouts
@@ -148,12 +159,15 @@ cct/
 
 ## Design Documents
 
-All design authority lives in `/Users/tyo/Omics-OS/.planning/cct/`:
-- `ARCHITECTURE.md` — **Frozen design decisions (D1-D15).** Source of truth.
+Core design documents live in `/Users/tyo/Omics-OS/cct/cct/`:
+- `ARCHITECTURE.md` — **Design decisions D1-D16.** D16 records the os runtime contract.
 - `ROADMAP.md` — 5 build phases (1-4 complete, 5 = PTY Launcher scoped)
 - `STATE.md` — Current progress
 - `REQUIREMENTS.md` — User flows and constraints
 - `codex_output/` — Research + implementation review
+
+The os initiative and measured acceptance evidence live in
+`/Users/tyo/Omics-OS/cct/.planning/os-runtime/`. Read its `STATE.md` for current decisions.
 
 ## Pool Lifecycle
 
@@ -170,7 +184,7 @@ The MCP server enforces this: join/create responses include the cron setup remin
 
 **Idle session limitation:** There is no way to push into an idle Claude Code session via MCP. CronCreate bottoms out at 60s. The PreToolUse hook only fires during tool calls. Phase 5 (PTY Launcher) will solve this with `cct claude` wrapping the session for sub-10s delivery.
 
-**Stable identity (both runtimes):** The CCT peer ID/name is anchored to a stable session key so it survives MCP restarts, `/mcp` reconnects, and network transitions (e.g. a Wi-Fi change that lets the broker mark the peer dead). Claude uses `CLAUDE_CODE_SESSION_ID`; Codex uses `codex-root:<root session id>`, resolved from codex's rollout transcripts because **codex never exports its session id into MCP server env** (see below and ARCHITECTURE **D11c**). The broker de-dupes registrations on `(runtime, session_key)` and revives the same row (same id/secret/name) even if it was marked dead — **and restores the pool memberships that death dropped** (via `died_at`/`left_at` pairing), so the reclaimed peer isn't silently mute in its pools. `server.ts` recovers in place on a `peer not found` heartbeat instead of exiting, but only while the host process is alive (checked in `reregister`, so a genuine orphan is not resurrected). Peers with no session key fall back to legacy ephemeral (new id per registration). Limitations: a *dead* stdio MCP process still needs `/mcp` reconnect; two live sessions sharing one `CLAUDE_CODE_SESSION_ID` collapse to one row. See ARCHITECTURE **D11b**.
+**Stable identity (all three runtimes):** The CCT peer ID/name is anchored to a stable session key so it survives MCP restarts, `/mcp` reconnects, and network transitions (e.g. a Wi-Fi change that lets the broker mark the peer dead). Claude uses `CLAUDE_CODE_SESSION_ID`; Codex uses `codex-root:<root session id>`, resolved from codex's rollout transcripts because **codex never exports its session id into MCP server env** (see below and ARCHITECTURE **D11c**). os uses `os:<session id>` from its extension-owned marker (D16). The broker de-dupes registrations on `(runtime, session_key)` and revives the same row (same id/secret/name) even if it was marked dead — **and restores the pool memberships that death dropped** (via `died_at`/`left_at` pairing), so the reclaimed peer isn't silently mute in its pools. `server.ts` recovers in place on a `peer not found` heartbeat instead of exiting, but only while the host process is alive (checked in `reregister`, so a genuine orphan is not resurrected). Peers with no session key fall back to legacy ephemeral (new id per registration). Limitations: a *dead* stdio MCP process still needs its runtime to reconnect; two live sessions sharing one `CLAUDE_CODE_SESSION_ID` collapse to one row. See ARCHITECTURE **D11b**.
 
 ## Codex CLI Integration
 
@@ -186,14 +200,73 @@ CCT supports OpenAI Codex CLI as a first-class runtime. `cct install` auto-detec
 
 **Message delivery:**
 
-| State | Claude Code | Codex CLI |
-|-------|-------------|-----------|
-| Busy (tool calls) | `hook.sh` blocks, text output | `hook-codex.sh` blocks, JSON output |
-| Idle | CronCreate 60s polling | `prompt-codex.sh` injects on next prompt |
+| State | Claude Code | Codex CLI | os |
+|-------|-------------|-----------|----|
+| Busy (tool calls) | `hook.sh` blocks, text output | `hook-codex.sh` blocks, JSON output | Extension returns a `tool_call` block |
+| No current turn | CronCreate 60s polling | `prompt-codex.sh` injects on next prompt | Extension `context` notification on next model turn |
 
 **Config location:** `~/.codex/config.toml` — `[mcp_servers.cct]` + `[[hooks.*]]` sections.
 
 **No cron in Codex:** Codex has no CronCreate equivalent. The server instructions are conditionalized — Codex agents are told messages arrive via hooks automatically.
+
+## os Integration
+
+Install pi-mcp-adapter separately into os, then use the same environment for the os
+host and the CCT installer:
+
+```bash
+export PI_CODING_AGENT_DIR="${OS_CODING_AGENT_DIR:-$HOME/.os/agent}"
+export PI_MCP_CONFIG_MODE=exclusive
+cct install --os
+os
+```
+
+The approved local launcher establishes these values automatically for `os`. It
+does not export them back to the shell running `cct install --os`. The installer
+prints the resolved settings, config, cache, and onboarding paths and refuses
+writes under `.pi`. Runtime flags can be combined; without flags, installation
+still selects Claude plus detected Codex/os. `--project` applies only to Claude.
+
+Required CCT adapter settings are `lifecycle: "lazy-keep-alive"`,
+`directTools: true`, `toolPrefix: "none"`, and `env.CCT_RUNTIME: "os"`.
+`PI_MCP_CONFIG_MODE=exclusive` avoids importing other clients' MCP configurations.
+After installation, start a new os session and call `cct_whoami`. With an empty
+cache, direct tools become available after discovery; a warm cache waits for the
+first CCT call before registration. The extension only blocks when
+`cct_check_messages` is active. Before that it allows tools without acknowledging messages.
+
+**Identity model:** `PI_SESSION_ID` exists in os's bash child environment, but is
+absent from the host and MCP child environments. The extension writes
+`~/.cct/pidmaps/os_session_<hostPid>` → session ID (file A); the MCP server writes
+`os_<sessionId>` → peer ID (file B). Extension shutdown removes only A; MCP
+cleanup owns B. The CLI walks this ancestry even when a bash child has
+`PI_SESSION_ID`. Neither `PI_SESSION_ID` nor `CODEX_THREAD_ID` is a CCT address:
+use `cct_whoami` or `cct whoami`.
+
+Missing markers degrade to `os-host:<pid>_<start>` with a diagnostic. `cct_whoami`
+reports the source and key; adapter `debug: true` also forwards the child's
+stderr diagnostic. Without B, the extension emits one diagnostic per session
+and allows tools. Distinct resolved os session IDs remain distinct; a weak host
+key may be upgraded when the marker becomes available.
+
+The os extension provides no spontaneous idle wake-up. The resident server keeps
+heartbeating and refreshes the unread flag, including messages arriving after a
+previous deferred-ack read. Notifications become visible at the next turn/tool.
+
+Run `npm run test:os-identity` for source identity checks. Installed-runtime
+acceptance requires an installed os launcher and adapter:
+
+```bash
+CCT_OS_ADAPTER=/absolute/path/to/pi-mcp-adapter/index.ts \
+  python3 test-os-runtime-live.py
+```
+
+The default idle interval is 900 seconds; setting `OS_IDLE_SECONDS` lower is only
+a calibration run. The harness uses an isolated broker and synthetic HOME,
+records the actual flags and peer rows, and sends only local fixture messages.
+Use distinct `CCT_OS_TEST_PORT` values when running alongside other E2E tests.
+An npm upgrade can replace the local os launcher symlink; reapply the launcher
+and verify its Q7 environment after upgrading.
 
 ## Peer Resolution
 
@@ -216,7 +289,7 @@ CCT state is exposed in the Claude Code status line (`~/.claude/statusline.sh`):
 
 ## Process Lifecycle (Orphan Prevention)
 
-MCP stdio servers are spawned per Claude Code/Codex session. When sessions end, the server must self-terminate. Codex registrations include both the MCP server PID and the host Codex PID so an orphaned MCP server cannot stay visible after Codex exits. Three layers ensure no orphaned processes accumulate:
+MCP stdio servers are spawned per Claude Code/Codex/os session. When sessions end, the server must self-terminate. Codex and os registrations include both the MCP server PID and the host PID so an orphaned MCP server cannot stay visible after its host exits. Three layers ensure no orphaned processes accumulate:
 
 | Layer | Mechanism | Latency | Signal |
 |-------|-----------|---------|--------|
