@@ -18,12 +18,14 @@ export default function (pi: any) {
   pi.on("tool_result",(event:any)=>{log("tool_result",{toolName:event.toolName,isError:event.isError});});
   pi.registerCommand("probe-tools",{description:"Record synthetic tool inventory",handler:async()=>tools("command")});
   let savedTools: string[] = [];
-  pi.registerCommand("probe-disable-cct",{description:"Temporarily hide direct CCT tools",handler:async()=>{savedTools=pi.getActiveTools();pi.setActiveTools(savedTools.filter((n:string)=>!n.startsWith("cct_")));}});
+  pi.registerCommand("probe-disable-cct",{description:"Temporarily hide direct CCT tools",handler:async()=>{savedTools=pi.getActiveTools();pi.setActiveTools(savedTools.filter((n:string)=>n !== "cct" && !n.startsWith("cct_")));}});
   pi.registerCommand("probe-enable-cct",{description:"Restore direct CCT tools",handler:async()=>{pi.setActiveTools(savedTools);}});
   pi.registerProvider("cct-probe", {
     baseUrl:"http://127.0.0.1:1", apiKey:"synthetic-local", api:"cct-probe-api",
     models:[{id:"local",name:"Local synthetic probe",reasoning:false,input:["text"],cost:{input:0,output:0,cacheRead:0,cacheWrite:0},contextWindow:100000,maxTokens:1000}],
     streamSimple(model:any,context:any) {
+      const providerContextBytes = Buffer.byteLength(JSON.stringify({messages:context.messages}));
+      log("provider_input", {providerContextBytes});
       const stream = createAssistantMessageEventStream();
       const last = context.messages.at(-1);
       const text = typeof last?.content === "string" ? last.content : last?.content?.filter((c:any)=>c.type==="text").map((c:any)=>c.text).join("") ?? "";

@@ -78,7 +78,7 @@ export default function cctExtension(pi: OsExtensionAPI): void {
   pi.on("tool_call", (event, ctx) => {
     try {
       // Match hook.sh's *cct_* exclusion, including prefixed MCP tool names.
-      if (event.toolName.includes("cct_") || event.toolName === "ToolSearch") return;
+      if (event.toolName === "cct" || event.toolName.includes("cct_") || event.toolName === "ToolSearch") return;
       const reason = unreadReason(ctx);
       if (reason) return { block: true, reason };
     } catch {}

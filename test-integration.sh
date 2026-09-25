@@ -99,6 +99,12 @@ else
   fail "codex-session unit tests"
 fi
 
+if npx tsx "$(cd "$(dirname "$0")" && pwd)/test-compact-surface.ts"; then
+  pass "compact-surface unit tests"
+else
+  fail "compact-surface unit tests"
+fi
+
 # --- Start broker ---
 
 echo ""
@@ -118,6 +124,14 @@ sleep 1
 HEALTH=$(curl -s "$BROKER_URL/health")
 HEALTH_OK=$(json_field "$HEALTH" "['ok']")
 check "Broker health returns ok" "True" "$HEALTH_OK"
+
+echo ""
+echo "=== Compact server surface ==="
+if CCT_PORT="$BROKER_PORT" CCT_DIR="$CCT_DIR" CCT_TOKEN="" npx tsx "$(cd "$(dirname "$0")" && pwd)/test-compact-surface.ts" --integration; then
+  pass "compact surface end-to-end against isolated broker"
+else
+  fail "compact surface end-to-end against isolated broker"
+fi
 
 # os uses the same broker registration protocol. Keep these checks isolated
 # from the existing Claude/Codex rows and use this driver's real process ID.

@@ -347,7 +347,7 @@ async function cmdWhoami() {
     die(`No CCT identity found for this process.
 
 If you are in Codex, restart the session after running "cct install", or ask the agent to call the cct_whoami MCP tool.
-If you are in os, configure "cct install --os", restart os, and call a CCT tool to register.
+If you are in os, configure "cct install --os", restart os, and call "cct" with action "status" to register.
 Do not use CODEX_THREAD_ID as a CCT address; it is only the Codex session/thread ID.`);
   }
 
@@ -908,7 +908,7 @@ function installOs(): void {
   const tsx = join(CCT_DIR, "node_modules", ".bin", "tsx");
   if (!existsSync(tsx)) die(`Missing CCT dependency: ${tsx}; install CCT dependencies before configuring os.`);
   const previous = mcp.mcpServers?.cct;
-  const env: Record<string, string> = { ...previous?.env, CCT_RUNTIME: "os" };
+  const env: Record<string, string> = { ...previous?.env, CCT_RUNTIME: "os", CCT_TOOL_SURFACE: "compact" };
   const broker = process.env.CCT_BROKER ?? cfg.broker;
   const token = process.env.CCT_TOKEN ?? cfg.token;
   if (broker) env.CCT_BROKER = broker;

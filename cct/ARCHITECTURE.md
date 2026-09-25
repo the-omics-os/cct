@@ -46,9 +46,13 @@ This resolves the contradiction: peers are discoverable (for invitation) but not
 ### D5: Message state machine
 **Decision: Two states only: `unread` and `read_at`. No `delivered`, no `ack`.**
 
-When `cct_check_messages` is called, all unread messages for that peer are returned and marked with `read_at = now()`. The hook checks the unread count, not delivery state. Simple, no ambiguity.
-
-The schema stores `read_at` (nullable). Unread = `read_at IS NULL`. This is forward-compatible: if we add delivery receipts later, we add `delivered_at` without changing the read path.
+The database stores `read_at` (nullable); unread = `read_at IS NULL`. The MCP
+recovery tool uses deferred acknowledgement: on a successful check, it marks
+messages returned by the prior check as read, then peeks and returns currently
+unread messages. If a prior check result was not consumed by the agent, those
+messages remain unread until the next check. The hook checks the unread count,
+not delivery state. This keeps durable message state simple while avoiding
+lost reads when a tool result is swallowed.
 
 ### D6: Pool broadcasts
 **Decision: Fan-out at the broker. One `message_recipients` row per recipient.**
@@ -97,7 +101,7 @@ Recovery is proactive: `server.ts:sendHeartbeat` no longer exits when the broker
 **Known limitations (accepted, not bugs):**
 - **Dead stdio MCP server is not resurrected.** Claude Code does not auto-respawn a dead stdio MCP server. This fix removes the *self-inflicted* exit on `peer not found`, so an alive-but-network-blipped server recovers; but if the MCP process itself dies, recovery needs a `/mcp` reconnect or session restart. The session_key still guarantees the *same* id is reclaimed when it does come back.
 - **Two live sessions sharing one `CLAUDE_CODE_SESSION_ID` collapse to one peer row** (e.g. a resumed session in two terminals). This is inherent to session-keying — adding a per-process discriminator would reintroduce the original "new id on every restart" bug. Last registration wins the row; the older instance retires on its next heartbeat via `stale_registration`.
-- **`cli.ts` (`cct whoami` from a bare shell) still resolves identity via pidmap process-ancestry, not the session key.** Works for shells descended from the Claude host; a detached shell that only has the env var can't resolve the peer. Low impact — the MCP tools (`cct_whoami`) are authoritative.
+- **`cli.ts` (`cct whoami` from a bare shell) still resolves identity via pidmap process-ancestry, not the session key.** Works for shells descended from the Claude host; a detached shell that only has the env var can't resolve the peer. Low impact — `cct_whoami` and `cct_list_peers` are authoritative for Claude/Codex; os compact sessions use `cct` with `action: status` for their identity.
 
 ### D11c: Codex session key is the fork-chain root, resolved from rollout transcripts
 **Decision: Derive the codex session key from codex's own transcripts, keyed on the ROOT of the fork chain. Never trust env propagation, and never key on the current session id.**
@@ -199,7 +203,8 @@ The CLI follows A → B even when a bash child has `PI_SESSION_ID`, and never
 falls through to an inherited Codex mapping when A identifies os but B is absent.
 
 Missing A produces `os-host:<pid>_<start>` and a `source=fallback` diagnostic;
-the server remains usable. `cct_whoami` reports the source even if adapter
+the server remains usable. Identity is available through `cct` action `status`
+on the compact os surface (or `cct_whoami` on legacy surfaces), even if adapter
 stderr forwarding is disabled (`debug: true` forwards it). Duplicate live MCP
 connections share one peer without retiring one another. A weak host key may
 adopt/upgrade a resolved key for the same live host; two different resolved
@@ -214,6 +219,7 @@ Stable-key revival reuses the existing membership restoration transaction.
 | `directTools` | `true` | Tools otherwise remain behind the `mcp` proxy |
 | `toolPrefix` | `"none"` | Default `"server"` exposes `cct_cct_check_messages`, making an unprefixed block reason unusable |
 | `env.CCT_RUNTIME` | `"os"` | Explicit runtime classification independent of inherited Codex environment |
+| `env.CCT_TOOL_SURFACE` | `"compact"` | Selects the two-tool os surface; the unset/default surface remains legacy |
 
 **Lifecycle revision (2026-09-18):** Kevin approved automatic connection.
 The original `lazy-keep-alive` decision in STATE D22/D23 left warm sessions
@@ -233,8 +239,7 @@ delayed and absent-marker controls exercise the fallback.
 
 **Blocking returns a value.** os `tool_call` handlers must return
 `{ block: true, reason }` (`runner.ts:982-1003`). Throwing produces an extension
-error and does not establish this block contract. The handler exempts CCT tools
-and ToolSearch, reads B and the existing `count|pool_summary|timestamp` flag,
+error and does not establish this block contract. The handler exempts exact `cct`, all `cct_*` tools, and ToolSearch, reads B and the existing `count|pool_summary|timestamp` flag,
 and ignores stale or malformed flags. Both delivery handlers require the exact
 `cct_check_messages` tool to be active. Missing identity emits one diagnostic
 per session; missing identity or an unavailable direct tool allows work without
@@ -290,6 +295,50 @@ fallback peer by session ID. The adapter remains third-party software with a
 native dependency; pruning it belongs to its owner. There is no spontaneous
 idle wake-up. Package upgrades may replace the local launcher and require Q7
 to be reapplied. No os source edits are part of this integration.
+
+---
+
+### D17: Compact os tool surface
+
+**Decision (2026-09-25):** `cct install --os` selects a compact two-tool MCP
+surface for os with `CCT_TOOL_SURFACE=compact`. `CCT_TOOL_SURFACE` is the
+server-side switch: exact value `compact` selects compact; unset or any other
+value retains the legacy surface. Claude Code and Codex remain on the legacy
+17-tool surface. This reduces tool-selection overhead while preserving all
+operations by moving variability from tool names into action inputs (fewer
+tools, more variable inputs per tool).
+
+The compact surface consists of:
+
+- `cct_check_messages`: the exact-named, zero-argument, always-eager recovery
+tool. It remains the active tool named by unread-block reasons, cannot be
+called with malformed arguments, and its description is static on both compact
+and legacy surfaces. Its output starts with `you: <id>/<name>`.
+- `cct`: a flat-schema dispatcher with required `action` and optional independent
+fields. It covers `send`, `status`, `peers`, `pools`, `create`, `join`, `leave`,
+`invite`, `summary`, `idle`, `resume`, `release`, `vote`, `services`, and
+`terminate`. Server-side validation strictly rejects unknown fields, fields
+irrelevant to the selected action, missing required fields, and invalid types
+or values. See `.planning/COMPACT_TOOLS/CONTRACT.md` for the full field contract
+and exact errors.
+
+The schema is a flat object with no top-level `oneOf`/`anyOf` combinators,
+including for Anthropic/Bedrock compatibility. Tool descriptions and compact
+instructions are static because adapter tool metadata/instructions are cached
+across sessions; neither may contain session-specific peer identity. The
+compact identity path is `cct` with `action: status`, whose output includes the
+caller identity first. The recovery description is static on both surfaces.
+The os extension exempts bare `cct`, `cct_*`, and ToolSearch so the action tool
+cannot be trapped by the unread guard.
+
+The 17 legacy tools remain available unchanged to Claude Code and Codex, with
+`cct_check_messages`'s now-static description as the intentional shared fix.
+The compact surface is a facade over existing handlers and broker APIs: no
+broker endpoints, tables, or storage change. The default surface remains
+legacy, making rollback a change of the installer-provided environment value.
+PHASE_3 measured 1,244 B of compact eager schemas versus 5,441 B for legacy;
+the first synthetic-provider request was 15,100 B compact versus 20,730 B
+legacy, and a status response for a 25-member pool was 456 B.
 
 ---
 
@@ -386,15 +435,23 @@ CREATE INDEX idx_peers_status ON peers(status)
   hook.sh                              PreToolUse hook (pure bash)
   shared/
     types.ts                           TypeScript interfaces
-    constants.ts                       Ports, paths, timeouts
+    constants.ts                       Ports, paths, timeouts, compact actions
+    compact.ts                         Compact schemas, validation, dispatch, status formatting
     summarize.ts                       Local git-based summary
 ```
 
-## MCP Tools (16)
+## MCP Tools — legacy surface (17 tools)
+
+The legacy tool surface is used by Claude Code and Codex. The os installer
+selects the compact surface documented in D17 (two tools: `cct_check_messages`
+and `cct`). The server selects compact only for `CCT_TOOL_SURFACE=compact`;
+unset or other values retain legacy. `cct_check_messages` has a static
+description on both surfaces; the compact recovery result begins with
+`you: <id>/<name>`.
 
 | Tool | Description |
 |------|-------------|
-| `cct_check_messages` | Read all unread messages (all pools + DMs). Marks as read. |
+| `cct_check_messages` | Deferred-ack read: acknowledges the previous successful check, then returns currently unread messages. |
 | `cct_whoami` | Show this session's CCT peer ID/name. `CODEX_THREAD_ID` is not a CCT peer ID. |
 | `cct_send_message` | Send DM (to: "peer-name") or pool broadcast (to: "@pool-name") or directed pool msg (to: "@pool-name/peer-name") |
 | `cct_list_peers` | List all registered peers with name, cwd, branch, summary, pool memberships |
@@ -429,7 +486,7 @@ read -r INPUT
 TOOL_NAME="${INPUT##*\"tool_name\":\"}"
 TOOL_NAME="${TOOL_NAME%%\"*}"
 
-# 2. Skip CCT tools and ToolSearch
+# 2. Skip CCT tools and ToolSearch (legacy Claude hook)
 case "$TOOL_NAME" in *cct_*|ToolSearch) exit 0 ;; esac
 
 # 3. Find peer ID via pidmap

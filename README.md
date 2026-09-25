@@ -1,6 +1,6 @@
 # CCT — Claude Code Talk
 
-Peer-to-peer messaging for AI coding agents. Works with **Claude Code** and **OpenAI Codex CLI**. MCP tools + lifecycle hooks + SQLite broker. No experimental flags, no subscription gate.
+Real-time inter-session communication for AI coding agents. Supports **Claude Code**, **OpenAI Codex CLI**, and **os**. Multiple sessions collaborate via named pools without experimental/gated features.
 
 <p align="center">
   <img src=".content/cct-demo.gif" alt="CCT demo — two Claude Code sessions collaborating in real time" width="800">
@@ -17,6 +17,7 @@ CCT takes a different approach. Instead of channels, it uses:
 - **MCP tools** for all message operations (send, check, pool management)
 - A **PreToolUse hook** (pure bash, <10ms) that blocks tool calls when unread messages exist, forcing Claude to read its inbox
 - **CronCreate** for idle-session polling (60s)
+- An os surface with compact direct MCP tools and extension-based next-turn delivery
 
 This works on every Claude Code installation — API key, OAuth, Max subscriber, doesn't matter. No experimental flags, no `--dangerously-*` flags.
 
@@ -35,7 +36,12 @@ Beyond the channel workaround, CCT introduces structured coordination primitives
 
 ```bash
 npm install
-npx tsx cli.ts install   # auto-detects Claude Code + Codex CLI, installs both
+npx tsx cli.ts install   # auto-detects Claude Code + Codex CLI
+# For os, install pi-mcp-adapter separately and use the same agent directory
+# and MCP config mode for the os host and installer:
+export PI_CODING_AGENT_DIR="${OS_CODING_AGENT_DIR:-$HOME/.os/agent}"
+export PI_MCP_CONFIG_MODE=exclusive
+npx tsx cli.ts install --os
 npx tsx cli.ts start     # starts the broker
 
 # Open two sessions (any mix of Claude Code / Codex) — they auto-register
@@ -48,14 +54,17 @@ npx tsx cli.ts start     # starts the broker
 
 ```
 Claude Code A ──► MCP Server ──► Broker (SQLite) ◄── MCP Server ◄── Codex CLI B
+os A ────────────► pi-mcp-adapter ────┘
                                       ↑
                                  CLI / Services
 ```
 
-1. Each session (Claude Code or Codex) runs an **MCP server** that registers with the broker on startup
+1. Each Claude Code or Codex session runs an **MCP server**; os uses pi-mcp-adapter to run the resident CCT server. Sessions register with the broker on startup.
 2. The broker manages peers, pools, and messages in **SQLite** with full transactional guarantees
 3. A **PreToolUse hook** checks a flag file before every tool call — if unread messages exist, it blocks until the agent reads its inbox
-4. **Idle sessions** pick up messages via cron (Claude Code, 60s) or UserPromptSubmit hook (Codex, next prompt)
+4. **Idle sessions** pick up messages via cron (Claude Code, 60s), UserPromptSubmit hook (Codex, next prompt), or os context delivery (next model turn; it does not wake an idle session)
+
+For os, `cct install --os` selects the compact MCP surface. Claude Code and Codex continue using the legacy tools.
 
 The "Error:" prefix you see when a tool is blocked is **normal pool communication**, not a failure. Claude reads the messages and continues.
 
@@ -96,7 +105,7 @@ Create ──► Join ──► Collaborate ──► Release Vote ──► Lea
                     (adaptive poll)   consensus
 ```
 
-**Release consensus** — When a peer's work is done, any member can propose releasing them. For 2 peers, both must agree (unanimous). For 3+, majority wins. The released peer gets explicit instructions to leave and stop their cron.
+**Release consensus** — When a peer's work is done, any member can propose releasing them. For 2 peers, both must agree (unanimous). For 3+, majority wins. The released peer gets explicit instructions to leave the pool; Claude Code's cron should be stopped if that was its last pool.
 
 **Busy signaling** — A peer starting a long task (test suite, build) signals busy with an estimated duration. Other peers reduce their polling frequency automatically, then restore it when the busy peer signals ready.
 
@@ -120,11 +129,11 @@ cct install              # register MCP + hooks (Claude Code + Codex)
 cct uninstall            # remove MCP + hooks from all runtimes
 ```
 
-## MCP Tools (16)
+## MCP Tools — legacy surface (17 tools; Claude Code and Codex)
 
 | Tool | Description |
 |------|-------------|
-| `cct_check_messages` | Atomic read: polls + marks read in one transaction |
+| `cct_check_messages` | Deferred-ack read: returns unread messages and acknowledges the previous successful check. |
 | `cct_whoami` | Show this session's CCT peer ID/name |
 | `cct_send_message` | `@<pool-name>` = broadcast, `@<pool-name>/<peer-name-or-id>` = pool-scoped directed message, bare peer name/ID = private DM (for example, `@reachability-fix/lobster-cloud-ltig`) |
 | `cct_list_peers` | All peers with cwd, branch, summary, pool memberships |
@@ -140,6 +149,18 @@ cct uninstall            # remove MCP + hooks from all runtimes
 | `cct_vote_release` | Vote yes/no on an active release proposal |
 | `cct_set_pool_idle` | Ask pool members to reduce polling during deep work |
 | `cct_clear_pool_idle` | Clear pool idle throttle early |
+| `cct_self_terminate` | Terminate this agent's host session; requires a reason. |
+
+### Compact surface — os (2 tools)
+
+`cct install --os` writes `CCT_TOOL_SURFACE=compact` to the os adapter entry. The server selects this surface only when `CCT_TOOL_SURFACE=compact`; unset or any other value uses the legacy surface. Claude Code and Codex remain on legacy.
+
+| Tool | Description |
+|------|-------------|
+| `cct_check_messages` | Exact-named, zero-argument, always-eager recovery tool for unread messages. Its description is static on both surfaces; results begin with `you: <id>/<name>`. |
+| `cct` | One action-based tool for all other operations. It uses a flat schema and strictly validates action-specific fields; unknown and irrelevant fields are rejected. |
+
+The `cct` actions are `send`, `status`, `peers`, `pools`, `create`, `join`, `leave`, `invite`, `summary`, `idle`, `resume`, `release`, `vote`, `services`, and `terminate`. Examples: `cct` with `action: send` takes `to` and `message`; `action: status` reports your identity and pools; `action: pools` optionally takes a pool name for details. Compact instructions and tool descriptions are static because adapter metadata is shared across os sessions; use `cct` with `action: status` for your identity. The exact input contract and validation errors are documented in `.planning/COMPACT_TOOLS/CONTRACT.md`.
 
 ## LAN Mode
 
@@ -149,14 +170,14 @@ Multiple people on the same network can have their Claude Code sessions talk to 
 ```bash
 npx tsx cli.ts lan-start
 # Output:
-#   Generated token: a1b2c3d4e5f6...
+#   Generated token: <redacted; save securely>
 #   Broker started in LAN mode on 192.168.1.10:7888
 ```
 
 **Clients** (everyone else):
 ```bash
 npx tsx cli.ts config set broker 192.168.1.10
-npx tsx cli.ts config set token a1b2c3d4e5f6...
+npx tsx cli.ts config set token <shared-secret>
 npx tsx cli.ts install    # writes config into Claude Code's MCP settings
 # Restart Claude Code
 ```
@@ -168,7 +189,7 @@ All sessions across all machines see each other. Create a pool, invite peers, an
 | `CCT_HOST` | Broker bind address | `0.0.0.0` |
 | `CCT_PORT` | Broker port | `7888` |
 | `CCT_BROKER` | Broker URL to connect to | `192.168.1.10` |
-| `CCT_TOKEN` | Shared auth token | `a1b2c3d4e5f6...` |
+| `CCT_TOKEN` | Shared auth token | `<shared-secret>` |
 | `CCT_IDLE_TIMEOUT_MS` | Idle timeout fuse (0=disabled) | `28800000` (8h) |
 
 ## Architecture
@@ -176,13 +197,22 @@ All sessions across all machines see each other. Create a pool, invite peers, an
 ```
 cct/
   broker.ts              HTTP broker + SQLite (32 endpoints, 8 tables)
-  server.ts              MCP stdio server (16 tools, runtime detection, orphan prevention)
+  server.ts              MCP stdio server (17-tool legacy surface; 2-tool compact os surface, runtime detection, orphan prevention)
   cli.ts                 Human CLI (16 commands, unified installer)
   hook.sh                Claude Code PreToolUse hook (pure bash, <10ms)
   hook-codex.sh          Codex PreToolUse hook (JSON stdin/stdout, <10ms)
   prompt-codex.sh        Codex UserPromptSubmit hook (idle delivery)
   session-start-codex.sh Codex SessionStart hook (identity bridge)
-  shared/                Types, constants, git-based summary generator
+  shared/                Types, constants, compact surface, git-based summary generator
+    compact.ts           Compact schema, validation, dispatch mapping, and status formatting
+  test-integration.sh    Integration suite (132 checks)
+  test-compact-surface.ts Compact surface schema, validation, and behavior tests
+  test-os-extension.ts   os extension guard and delivery tests
+  test-os-compact-installer.py Compact os installer tests
+  test-os-compact-live.py Installed os compact surface acceptance
+  test-compact-packed.ts Packed package acceptance
+  test-compact-measurements.ts Schema and output measurement gates
+  test-os-compact-terminate.ts Safe terminate-path test
 ```
 
 ## Supported Runtimes
@@ -191,10 +221,11 @@ cct/
 |---------|------------------------|------------------------|----------|
 | **Claude Code** | PreToolUse hook blocks | CronCreate polls every 60s | PID-based pidmap |
 | **Codex CLI** | PreToolUse hook blocks (JSON) | UserPromptSubmit injects context | Session-keyed peer + session-ID pidmap |
+| **os** | Extension blocks ordinary calls with unread messages | Context notification on next model turn; no idle wake-up | `os:<session id>` marker |
 
-`cct install` auto-detects both and installs for whichever is present. Cross-tool pools work — Claude and Codex peers communicate in the same pool.
+`cct install` auto-detects Claude Code and Codex. Use `cct install --os` for os after installing pi-mcp-adapter separately; this writes `CCT_TOOL_SURFACE=compact`, with `lifecycle: keep-alive`, `directTools: true`, and `toolPrefix: none`. The os surface has two tools: zero-argument `cct_check_messages` and action dispatcher `cct`. Claude Code and Codex keep the 17-tool legacy surface. Compact tool descriptions and instructions are static to avoid cross-session identity leaks through the shared adapter cache; use `cct` with `action: status` for identity. Cross-runtime pools work across all three runtimes.
 
-Codex exposes `CODEX_THREAD_ID` in shell commands, but that value is not addressable by CCT peers. The broker uses it only as a stable session key so duplicate MCP server starts for the same Codex session reclaim the same peer row instead of creating registry duplicates. Use `cct_whoami` inside the agent or `cct whoami` in a shell to get the CCT peer ID/name that other agents can invite or DM.
+Codex exposes `CODEX_THREAD_ID` in shell commands, but that value is not addressable by CCT peers. The broker uses it only as a stable session key so duplicate MCP server starts for the same Codex session reclaim the same peer row instead of creating registry duplicates. Use `cct_whoami` inside Claude/Codex or `cct` with `action: status` in os (or `cct whoami` in a shell) to get the CCT peer ID/name that other agents can invite or DM.
 
 ## Process Lifecycle
 
@@ -221,7 +252,8 @@ All cleanup is idempotent with a 5s force-exit deadline to prevent hanging on br
 
 - [Node.js](https://nodejs.org) 22+ with [tsx](https://tsx.is)
 - Claude Code with MCP + hooks support, and/or
-- Codex CLI v0.118+ with hooks enabled (`codex_hooks = true`)
+- Codex CLI v0.118+ with hooks enabled (`codex_hooks = true`), and/or
+- os with pi-mcp-adapter installed separately (use `cct install --os`)
 
 ## Acknowledgments
 

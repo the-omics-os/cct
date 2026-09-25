@@ -2,6 +2,8 @@
 set -euo pipefail
 # Source identity regression; the installed-runtime delivery/idle harness is separate.
 export CCT_TEST_REPO="$(cd "$(dirname "$0")" && pwd)"
+npx tsx "$CCT_TEST_REPO/test-os-extension.ts"
+python3 "$CCT_TEST_REPO/test-os-compact-installer.py"
 OS_TEST_WORK=$(mktemp -d /tmp/cct-os-e2e.XXXXXX)
 trap 'if [ "${CCT_OS_KEEP_EVIDENCE:-0}" != 1 ]; then rm -rf "$OS_TEST_WORK"; else echo "Evidence: $OS_TEST_WORK"; fi' EXIT
 cat > "$OS_TEST_WORK/identity-host.mjs" <<'OS_HOST_EOF'

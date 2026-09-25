@@ -19,6 +19,13 @@ import {
   POLL_INTERVAL_MS,
   HEARTBEAT_INTERVAL_MS,
 } from "./shared/constants.ts";
+import {
+  buildCompactTool,
+  CHECK_MESSAGES_TOOL,
+  dispatchCompactAction,
+  formatCompactStatus,
+  toolRef as compactToolRef,
+} from "./shared/compact.ts";
 import { resolveCodexSessionIdentity, type CodexSessionIdentity } from "./shared/codex-session.ts";
 import type {
   BrokerResponse,
@@ -75,6 +82,8 @@ function resolveSessionCwd(): string {
 }
 
 const myCwd = resolveSessionCwd();
+const toolSurface = process.env.CCT_TOOL_SURFACE === "compact" ? "compact" : "legacy";
+const toolRef = (legacyName: string, detail?: string) => compactToolRef(legacyName, toolSurface, detail);
 
 let myId = "";
 let mySecret = "";
@@ -630,7 +639,7 @@ async function handleCheckMessages(): Promise<string> {
 
   if (!res.ok || !res.data) {
     writeFlag(`0||${Date.now()}`);
-    return "No unread messages.";
+    return `you: ${myId}/${myName}\nNo unread messages.`;
   }
 
   const { messages, unread, pool_throttles } = res.data as any;
@@ -668,8 +677,8 @@ async function handleCheckMessages(): Promise<string> {
 
     if (messages.some((m: any) => m.msg_type === "release_approved")) {
       output += detectedRuntime === "claude"
-        ? `\n\n🎯 ACTION REQUIRED: You have been released from the pool. Please:\n1. Call cct_leave_pool for the pool\n2. If you have no other pools, cancel your CCT cron via CronList + CronDelete`
-        : `\n\n🎯 ACTION REQUIRED: You have been released from the pool. Call cct_leave_pool for the pool.`;
+        ? `\n\n🎯 ACTION REQUIRED: You have been released from the pool. Please:\n1. Call ${toolRef("cct_leave_pool", `pool "${messages.find((m: any) => m.msg_type === "release_approved")?.pool_name ?? ""}"`)}${toolSurface === "legacy" ? " for the pool" : ""}\n2. If you have no other pools, cancel your CCT cron via CronList + CronDelete`
+        : `\n\n🎯 ACTION REQUIRED: You have been released from the pool. Call ${toolRef("cct_leave_pool", `pool "${messages.find((m: any) => m.msg_type === "release_approved")?.pool_name ?? ""}"`)}${toolSurface === "legacy" ? " for the pool" : ""}.`;
     }
 
     if (messages.some((m: any) => m.msg_type === "pool_idle") && detectedRuntime === "claude") {
@@ -688,13 +697,13 @@ async function handleCheckMessages(): Promise<string> {
     output += `\n\nActive pool throttles:\n${tLines.join("\n")}`;
   }
 
-  return output;
+  return `you: ${myId}/${myName}\n${output}`;
 }
 
 function formatStaleWarning(data: MessageSendResponse): string {
   if (!data.stale_recipients || data.stale_recipients.length === 0) return "";
   const names = data.stale_recipients.map((s) => `${s.peer_name} (last seen ${s.age_seconds}s ago)`);
-  return `\n\n⚠️ WARNING: ${data.stale_recipients.length} recipient(s) may be OFFLINE and unlikely to respond:\n${names.map((n) => `  - ${n}`).join("\n")}\nDo NOT wait for a reply from these peers. They may have disconnected (e.g., worktree agent finished). Consider proceeding without their input or checking cct_list_peers to confirm peer status.`;
+  return `\n\n⚠️ WARNING: ${data.stale_recipients.length} recipient(s) may be OFFLINE and unlikely to respond:\n${names.map((n) => `  - ${n}`).join("\n")}\nDo NOT wait for a reply from these peers. They may have disconnected (e.g., worktree agent finished). Consider proceeding without their input or checking ${toolRef("cct_list_peers")} to confirm peer status.`;
 }
 
 async function handleSendMessage(args: { to: string; message: string }): Promise<string> {
@@ -791,6 +800,36 @@ async function handleListPools(): Promise<string> {
   });
 
   return `${res.data.length} pool(s):\n\n${lines.join("\n")}`;
+}
+
+async function handleStatus(): Promise<string> {
+  const [poolsRes, unreadRes, peekRes] = await Promise.all([
+    brokerPost<PoolInfo[]>("/pool/list", { peer_id: myId }),
+    brokerPost<UnreadCountResponse>("/message/unread-count", { peer_id: myId }),
+    brokerPost<any>("/message/peek", { peer_id: myId, peer_secret: mySecret }),
+  ]);
+  if (!poolsRes.ok || !poolsRes.data) return `Failed: ${poolsRes.error}`;
+  if (!unreadRes.ok || !unreadRes.data) return `Failed: ${unreadRes.error}`;
+  const keySource = detectedRuntime === "os"
+    ? (osSessionId ? "marker" : "fallback")
+    : detectedRuntime === "codex" ? codexIdentity.source
+      : (claudeSessionId ? "session" : "fallback");
+  const poolThrottles = Array.isArray(peekRes.data?.pool_throttles) ? peekRes.data.pool_throttles : [];
+  return formatCompactStatus({
+    id: myId,
+    name: myName,
+    runtime: detectedRuntime,
+    keySource,
+    pools: poolsRes.data.map((pool) => ({
+      name: pool.name,
+      purpose: pool.purpose,
+      status: pool.status,
+      members: pool.members.map((member) => ({ peer_name: member.peer_name, peer_id: member.peer_id })),
+    })),
+    unread: unreadRes.data.total,
+    unreadByPool: unreadRes.data.by_pool,
+    poolThrottles,
+  });
 }
 
 async function handleCreatePool(args: { name: string; purpose?: string }): Promise<string> {
@@ -916,7 +955,7 @@ async function handleProposeRelease(args: { pool_name: string; target: string; r
   });
   if (!res.ok) return `Failed: ${res.error}`;
   const d = res.data!;
-  return `Release proposal created (id: ${d.release_id}). Quorum rule: ${d.quorum_rule} (need votes from ${d.members_count} member(s)). Your "yes" vote has been auto-cast. Other pool members need to vote using cct_vote_release.`;
+  return `Release proposal created (id: ${d.release_id}). Quorum rule: ${d.quorum_rule} (need votes from ${d.members_count} member(s)). Your "yes" vote has been auto-cast. Other pool members need to vote using ${toolRef("cct_vote_release", `release_id "${d.release_id}"`)}.`;
 }
 
 async function handleVoteRelease(args: { release_id: string; vote: "yes" | "no" }): Promise<string> {
@@ -960,7 +999,7 @@ async function handleSetPoolIdle(args: { pool_name: string; minutes: number; rea
     detail += `\nUse force=true to override this check.`;
     return detail;
   }
-  return `Pool "${args.pool_name}" throttled for ~${args.minutes} min${args.reason ? `: ${args.reason}` : ""}. Idle until ${d.idle_until}. Other peers notified to reduce polling. Call cct_clear_pool_idle when done.`;
+  return `Pool "${args.pool_name}" throttled for ~${args.minutes} min${args.reason ? `: ${args.reason}` : ""}. Idle until ${d.idle_until}. Other peers notified to reduce polling. Call ${toolRef("cct_clear_pool_idle", `pool "${args.pool_name}"`)} when done.`;
 }
 
 async function handleClearPoolIdle(args: { pool_name: string }): Promise<string> {
@@ -1046,7 +1085,13 @@ MESSAGE DELIVERY (Codex):
 - IDLE: Messages are injected as context on your next user prompt via UserPromptSubmit hook.
 - No cron setup needed. Delivery is automatic via hooks.`;
 
-  const instructions = `You are connected to CCT (Claude Code Talk) — a peer communication system.
+  const compactInstructions = `You are connected to CCT, a peer communication system.
+Identity is returned by cct with action="status"; do not infer it from a shared tool description.
+
+Use cct with action="status" for your identity and pool status. Use action="peers" to list peers, action="pools" to list pools or action="pools" with a pool name for details. Use action="send" with to and message to communicate; destinations are @pool-name for broadcasts, @pool-name/peer for directed pool messages, or peer name/ID for a DM.
+
+When unread messages block an ordinary tool call, call cct_check_messages to read them, then retry. After reading messages, respond naturally using cct action="send". ${detectedRuntime === "os" ? "Unread messages are delivered on the next tool call or model turn; no cron is required." : cronInstructions}`;
+  const instructions = toolSurface === "compact" ? compactInstructions : `You are connected to CCT (Claude Code Talk) — a peer communication system.
 Your peer ID: ${myId} | Your name: ${myName} | CWD: ${myCwd} | Runtime: ${detectedRuntime}
 
 If the user asks for your CCT ID, CCT peer ID, or CCT identity, call cct_whoami.
@@ -1065,16 +1110,16 @@ Use cct_list_pools or cct_pool_status if you do not know the active pool name.
 ${cronInstructions}`;
 
   const server = new Server(
-    { name: "cct", version: "0.1.0" },
+    { name: "cct", version: "0.2.0" },
     { capabilities: { tools: {} }, instructions }
   );
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     lastActivity = Date.now();
-    return { tools: [
+    const legacyTools = [
       {
         name: "cct_check_messages",
-        description: `Check and read all unread messages (pools + DMs). Your peer ID: ${myId}, peer name: ${myName}`,
+        description: CHECK_MESSAGES_TOOL.description,
         inputSchema: { type: "object" as const, properties: {} },
       },
       {
@@ -1243,8 +1288,9 @@ ${cronInstructions}`;
           required: ["reason"],
         },
       },
-    ],
-  }; });
+    ];
+    return { tools: toolSurface === "compact" ? [CHECK_MESSAGES_TOOL, buildCompactTool()] : legacyTools };
+  });
 
   server.setRequestHandler(CallToolRequestSchema, async (req) => {
     lastActivity = Date.now();
@@ -1253,6 +1299,37 @@ ${cronInstructions}`;
 
     try {
       switch (name) {
+        case "cct": {
+          const dispatched = await dispatchCompactAction(args, {
+            send: (a) => handleSendMessage(a as { to: string; message: string }),
+            status: () => handleStatus(),
+            peers: () => handleListPeers(),
+            listPools: () => handleListPools(),
+            poolStatus: (a) => handlePoolStatus(a as { pool_name: string }),
+            create: (a) => handleCreatePool(a as { name: string; purpose?: string }),
+            join: (a) => handleJoinPool(a as { pool_name: string }),
+            leave: (a) => handleLeavePool(a as { pool_name: string }),
+            invite: (a) => handleInviteToPool(a as { pool_name: string; peer: string }),
+            summary: (a) => handleSetSummary(a as { summary: string }),
+            idle: (a) => handleSetPoolIdle(a as { pool_name: string; minutes: number; reason?: string; force?: boolean }),
+            resume: (a) => handleClearPoolIdle(a as { pool_name: string }),
+            release: (a) => handleProposeRelease(a as { pool_name: string; target: string; reason?: string }),
+            vote: (a) => handleVoteRelease(a as { release_id: string; vote: "yes" | "no" }),
+            services: (a) => handleListServices(a as { service_id?: string }),
+            terminate: (a) => {
+              const reason = a.reason as string;
+              process.stderr.write(`CCT self-terminate requested: ${reason}\n`);
+              setTimeout(() => {
+                try { process.kill(hostPid, "SIGTERM"); }
+                catch { requestCleanup("self-terminate (host kill failed)"); }
+              }, 150);
+              return `Terminating session: ${reason}`;
+            },
+          });
+          text = dispatched.text;
+          if (dispatched.isError) return { content: [{ type: "text" as const, text }], isError: true };
+          break;
+        }
         case "cct_check_messages":
           osReadGeneration++;
           osReadsInFlight++;

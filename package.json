@@ -1,6 +1,6 @@
 {
   "name": "@omicsos/cct",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Claude Code Talk — real-time inter-session communication for Claude Code",
   "author": "Kevin Yar <kevin.yar@omics-os.com>",
   "license": "MIT",
@@ -8,7 +8,12 @@
     "type": "git",
     "url": "https://github.com/the-omics-os/cct.git"
   },
-  "keywords": ["claude-code", "mcp", "agent-communication", "multi-agent"],
+  "keywords": [
+    "claude-code",
+    "mcp",
+    "agent-communication",
+    "multi-agent"
+  ],
   "type": "module",
   "bin": {
     "cct": "bin/cct.mjs"
