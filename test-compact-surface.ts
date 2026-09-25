@@ -39,7 +39,7 @@ for (const entry of CCT_COMPACT_ACTIONS) {
     for (const field of action.required) delete missing[field];
     const result = validateCompactArgs(missing);
     assert.equal(result.ok, false);
-    if (!result.ok) assert.equal(result.error, `Error: cct action "${action.action}" requires field(s): ${[...action.required].sort().join(", ")}.`);
+    if (!result.ok) assert.equal(result.error, `cct action "${action.action}" requires field(s): ${[...action.required].sort().join(", ")}.`);
     passed++;
     console.log(`  PASS: ${action.action}: required fields enforced`);
   }
@@ -48,13 +48,13 @@ for (const entry of CCT_COMPACT_ACTIONS) {
   if (disallowed) {
     const result = validateCompactArgs({ ...args, [disallowed]: "irrelevant" });
     assert.equal(result.ok, false);
-    if (!result.ok) assert.equal(result.error, `Error: cct action "${action.action}" does not accept field(s): ${disallowed}.`);
+    if (!result.ok) assert.equal(result.error, `cct action "${action.action}" does not accept field(s): ${disallowed}.`);
     passed++;
     console.log(`  PASS: ${action.action}: irrelevant fields rejected`);
   }
   const unknownResult = validateCompactArgs({ ...args, unknown_compact_field: "x" });
   assert.equal(unknownResult.ok, false);
-  if (!unknownResult.ok) assert.equal(unknownResult.error, "Error: cct received unknown field(s): unknown_compact_field.");
+  if (!unknownResult.ok) assert.equal(unknownResult.error, "cct received unknown field(s): unknown_compact_field.");
   passed++;
   console.log(`  PASS: ${action.action}: unknown fields rejected`);
   for (const [field, type] of Object.entries(action.types)) {
@@ -63,10 +63,10 @@ for (const entry of CCT_COMPACT_ACTIONS) {
     assert.equal(result.ok, false);
     if (!result.ok) {
       const expected = type === "vote"
-        ? 'Error: cct field "vote" must be "yes" or "no".'
+        ? 'cct field "vote" must be "yes" or "no".'
         : field === "minutes"
-          ? 'Error: cct field "minutes" must be a finite number greater than 0 and at most 120.'
-          : `Error: cct field "${field}" must be ${type}.`;
+          ? 'cct field "minutes" must be a finite number greater than 0 and at most 120.'
+          : `cct field "${field}" must be ${type}.`;
       assert.equal(result.error, expected);
     }
     passed++;
@@ -76,34 +76,34 @@ for (const entry of CCT_COMPACT_ACTIONS) {
 
 test("root/action validation error precedence and exact messages", () => {
   assert.equal(validateCompactArgs(null).ok, false);
-  assert.deepEqual(validateCompactArgs(null), { ok: false, error: "Error: cct arguments must be a JSON object." });
-  assert.deepEqual(validateCompactArgs({}), { ok: false, error: "Error: cct requires field: action." });
-  assert.deepEqual(validateCompactArgs({ action: 1 }), { ok: false, error: 'Error: cct field "action" must be string.' });
-  assert.deepEqual(validateCompactArgs({ action: "bad" }), { ok: false, error: 'Error: cct action "bad" is invalid. Allowed actions: send, status, peers, pools, create, join, leave, invite, summary, idle, resume, release, vote, services, terminate.' });
-  assert.deepEqual(validateCompactArgs({ action: "send", z: 1, pool: "bad" }), { ok: false, error: "Error: cct received unknown field(s): z." });
-  assert.deepEqual(validateCompactArgs({ action: "send", to: 42, purpose: "bad" }), { ok: false, error: 'Error: cct action "send" does not accept field(s): purpose.' });
-  assert.deepEqual(validateCompactArgs({ action: "send", to: 42 }), { ok: false, error: 'Error: cct action "send" requires field(s): message.' });
+  assert.deepEqual(validateCompactArgs(null), { ok: false, error: "cct arguments must be a JSON object." });
+  assert.deepEqual(validateCompactArgs({}), { ok: false, error: "cct requires field: action." });
+  assert.deepEqual(validateCompactArgs({ action: 1 }), { ok: false, error: 'cct field "action" must be string.' });
+  assert.deepEqual(validateCompactArgs({ action: "bad" }), { ok: false, error: 'cct action "bad" is invalid. Allowed actions: send, status, peers, pools, create, join, leave, invite, summary, idle, resume, release, vote, services, terminate.' });
+  assert.deepEqual(validateCompactArgs({ action: "send", z: 1, pool: "bad" }), { ok: false, error: "cct received unknown field(s): z." });
+  assert.deepEqual(validateCompactArgs({ action: "send", to: 42, purpose: "bad" }), { ok: false, error: 'cct action "send" does not accept field(s): purpose.' });
+  assert.deepEqual(validateCompactArgs({ action: "send", to: 42 }), { ok: false, error: 'cct action "send" requires field(s): message.' });
   const wrongAction = validateCompactArgs({ action: "idle", pool: "p", minutes: "2" });
-  assert.deepEqual(wrongAction, { ok: false, error: 'Error: cct field "minutes" must be a finite number greater than 0 and at most 120.' });
+  assert.deepEqual(wrongAction, { ok: false, error: 'cct field "minutes" must be a finite number greater than 0 and at most 120.' });
 });
 
 test("unknown and irrelevant field names sort lexicographically", () => {
-  assert.deepEqual(validateCompactArgs({ action: "send", x: 1, z: 2 }), { ok: false, error: "Error: cct received unknown field(s): x, z." });
-  assert.deepEqual(validateCompactArgs({ action: "send", purpose: "p", pool: "p" }), { ok: false, error: 'Error: cct action "send" does not accept field(s): pool, purpose.' });
+  assert.deepEqual(validateCompactArgs({ action: "send", x: 1, z: 2 }), { ok: false, error: "cct received unknown field(s): x, z." });
+  assert.deepEqual(validateCompactArgs({ action: "send", purpose: "p", pool: "p" }), { ok: false, error: 'cct action "send" does not accept field(s): pool, purpose.' });
 });
 
 test("minutes accepts positive finite numbers through 120 and rejects boundaries", () => {
   for (const minutes of [0, -1, 121, Infinity, NaN, "2"]) {
     const result = validateCompactArgs({ action: "idle", pool: "p", minutes });
     assert.equal(result.ok, false);
-    if (!result.ok) assert.equal(result.error, 'Error: cct field "minutes" must be a finite number greater than 0 and at most 120.');
+    if (!result.ok) assert.equal(result.error, 'cct field "minutes" must be a finite number greater than 0 and at most 120.');
   }
   assert.equal(validateCompactArgs({ action: "idle", pool: "p", minutes: 0.5 }).ok, true);
   assert.equal(validateCompactArgs({ action: "idle", pool: "p", minutes: 120 }).ok, true);
 });
 
 test("vote enum exact message", () => {
-  assert.deepEqual(validateCompactArgs({ action: "vote", release_id: "x", vote: "maybe" }), { ok: false, error: 'Error: cct field "vote" must be "yes" or "no".' });
+  assert.deepEqual(validateCompactArgs({ action: "vote", release_id: "x", vote: "maybe" }), { ok: false, error: 'cct field "vote" must be "yes" or "no".' });
 });
 
 test("compact schema derives actions and field types from the action table", () => {
@@ -126,7 +126,8 @@ test("compact tool schema byte budgets", () => {
   const sizes = compactToolByteSizes();
   assert.ok(sizes.cct <= 2000, `cct schema ${sizes.cct} exceeds 2000 bytes`);
   assert.ok(sizes.total <= 2500, `combined schemas ${sizes.total} exceeds 2500 bytes`);
-  assert.match(buildCompactTool().description, /Warning: this kills this agent's host session\./);
+  assert.doesNotMatch(buildCompactTool().description, /kills|terminate/i);
+  assert.match(buildCompactTool().inputSchema.properties.action.description, /terminate\(reason; ends this agent's own host session\)/);
   assert.equal("required" in CHECK_MESSAGES_TOOL.inputSchema, false);
 });
 
@@ -248,6 +249,14 @@ async function compactIntegration() {
     const identityHeader = identityLine.split(" runtime=")[0];
     const checked = await client.callTool({ name: "cct_check_messages", arguments: {} }) as any;
     assert.ok((checked.content?.[0]?.text ?? "").startsWith(`${identityHeader}\n`), "check_messages must start with id/name identity header");
+    // Regression (live os test 2026-09-25): a batch returned by check_messages is
+    // pending ack until the next check, and status must not report it as unread.
+    await post("/message/send", { peer_id: owner.id, peer_secret: owner.secret, to_peer_id: identityPeer.id, body: `status-unread-${start}` });
+    assert.match(await call({ action: "status" }), /\nunread: 1\nunread by pool: DM:1$/);
+    const readBatch = await client.callTool({ name: "cct_check_messages", arguments: {} }) as any;
+    assert.match(readBatch.content?.[0]?.text ?? "", new RegExp(`status-unread-${start}`));
+    const afterRead = await call({ action: "status" });
+    assert.match(afterRead, /\nunread: 0$/, `status after check must exclude the pending-ack batch: ${afterRead}`);
     const sent = `compact-message-${start}`;
     const sendText = await call({ action: "send", to: `@${pool}`, message: sent });
     assert.match(sendText, /Sent to pool/);

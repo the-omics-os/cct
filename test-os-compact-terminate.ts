@@ -45,7 +45,9 @@ child.on('exit',()=>process.exit(0));
   const listed = await client.listTools();
   assert.deepEqual(listed.tools.map((tool) => tool.name), ["cct_check_messages", "cct"]);
   const cctTool = listed.tools.find((tool) => tool.name === "cct");
-  assert.match(cctTool?.description ?? "", /Warning: this kills this agent's host session\./);
+  // The warning sits on the terminate action, not on the whole tool (live os test 2026-09-25).
+  assert.doesNotMatch(cctTool?.description ?? "", /kills|terminate/i);
+  assert.match(String((cctTool?.inputSchema as any)?.properties?.action?.description ?? ""), /terminate\(reason; ends this agent's own host session\)/);
   const db = new DatabaseSync(join(cctDir, "cct.db"));
   const row = db.prepare("SELECT host_pid, runtime FROM peers WHERE status='active' AND runtime='os' ORDER BY last_seen DESC LIMIT 1").get() as { host_pid: number; runtime: string } | undefined;
   assert.equal(row?.host_pid, fakePid, "server's detected host PID must be our fake process");

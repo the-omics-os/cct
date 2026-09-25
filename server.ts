@@ -815,6 +815,23 @@ async function handleStatus(): Promise<string> {
     : detectedRuntime === "codex" ? codexIdentity.source
       : (claudeSessionId ? "session" : "fallback");
   const poolThrottles = Array.isArray(peekRes.data?.pool_throttles) ? peekRes.data.pool_throttles : [];
+  // Match the unread flag: a batch already returned by cct_check_messages is
+  // only acknowledged on the next check, but it has been read.
+  let unread = unreadRes.data.total;
+  let unreadByPool = unreadRes.data.by_pool;
+  if (peekRes.ok && Array.isArray(peekRes.data?.messages)) {
+    const pending = new Set(pendingAckPeerId === myId ? pendingAckIds : []);
+    const counts = new Map<string, { pool_id: string | null; pool_name: string | null; count: number }>();
+    for (const message of peekRes.data.messages as PollMessage[]) {
+      if (pending.has(message.message_id)) continue;
+      const key = message.pool_id ?? "DM";
+      const entry = counts.get(key) ?? { pool_id: message.pool_id ?? null, pool_name: message.pool_name ?? null, count: 0 };
+      entry.count++;
+      counts.set(key, entry);
+    }
+    unreadByPool = [...counts.values()];
+    unread = unreadByPool.reduce((sum, entry) => sum + entry.count, 0);
+  }
   return formatCompactStatus({
     id: myId,
     name: myName,
@@ -826,8 +843,8 @@ async function handleStatus(): Promise<string> {
       status: pool.status,
       members: pool.members.map((member) => ({ peer_name: member.peer_name, peer_id: member.peer_id })),
     })),
-    unread: unreadRes.data.total,
-    unreadByPool: unreadRes.data.by_pool,
+    unread,
+    unreadByPool,
     poolThrottles,
   });
 }
