@@ -65,7 +65,7 @@ class Session:
         extensions=[extension,str(ADAPTER),str(ROOT/"probe.ts")]
         if variant=="reverse":extensions=[str(ADAPTER),extension,str(ROOT/"probe.ts")]
         (self.agent/"settings.json").write_text(json.dumps({"extensions":extensions,"defaultProvider":"cct-probe","defaultModel":"local","compaction":{"enabled":False},"retry":{"enabled":False}}))
-        (self.agent/"mcp.json").write_text(json.dumps({"mcpServers":{"cct":{"command":NODE,"args":["--import",str(REPO/"node_modules/tsx/dist/loader.mjs"),str(REPO/"server.ts")],"env":{"CCT_RUNTIME":"os"},"lifecycle":"lazy-keep-alive","directTools":True,"toolPrefix":"none","debug":True}}}))
+        (self.agent/"mcp.json").write_text(json.dumps({"mcpServers":{"cct":{"command":NODE,"args":["--import",str(REPO/"node_modules/tsx/dist/loader.mjs"),str(REPO/"server.ts")],"env":{"CCT_RUNTIME":"os"},"lifecycle":"keep-alive","directTools":True,"toolPrefix":"none","debug":True}}}))
         env={**BASE,"HOME":str(self.home),"TMPDIR":str(self.dir),"TERM":"dumb","OS_CODING_AGENT_DIR":str(self.agent),"PROBE_ROOT":str(ROOT),"PROBE_LOG":str(self.log),"PROBE_MARKER":str(self.marker)}
         self.handles=[self.rpc.open("w"),self.err.open("w")]
         args=[OS_BIN,"--mode","rpc","--provider","cct-probe","--model","local"]

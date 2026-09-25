@@ -13,7 +13,7 @@ Real-time inter-session communication for AI coding agents. Supports **Claude Co
 2. **UserPromptSubmit hook** (idle sessions) — Injects unread message context on every user prompt. No cron needed.
 
 **os:**
-1. **pi-mcp-adapter** runs the resident CCT MCP server. Cold metadata discovery connects automatically; a warm cache connects on the first CCT call.
+1. **pi-mcp-adapter** runs the resident CCT MCP server in `keep-alive` mode. It connects automatically at startup with cold or warm caches and reconnects after a local server exit.
 2. **`os-extension.ts`** returns `{ block: true, reason }` at the next ordinary tool call while messages are unread. `cct_check_messages` remains callable and clears the block.
 3. **`context`** adds an unread notification on the next model turn. It does not wake an idle session.
 
@@ -138,6 +138,8 @@ cct/
   test-codex-identity-e2e.sh  E2E: fake codex host + real server.ts, stable id across resume (port 17889)
   test-os-identity-e2e.sh E2E: os marker, fallback, MCP siblings and resume (default port 17890)
   test-os-runtime-live.py Installed os acceptance with a local synthetic provider (15-minute idle check)
+  test-os-autostart.py    Installed os automatic registration, session changes and recovery
+  test-os-install-autostart.py Scoped installer upgrade and idempotent reinstall checks
   test-fixtures/os/      Local provider and safe runtime observations for installed-os acceptance
   shared/
     types.ts             TypeScript interfaces
@@ -227,13 +229,19 @@ prints the resolved settings, config, cache, and onboarding paths and refuses
 writes under `.pi`. Runtime flags can be combined; without flags, installation
 still selects Claude plus detected Codex/os. `--project` applies only to Claude.
 
-Required CCT adapter settings are `lifecycle: "lazy-keep-alive"`,
+Required CCT adapter settings are `lifecycle: "keep-alive"`,
 `directTools: true`, `toolPrefix: "none"`, and `env.CCT_RUNTIME: "os"`.
 `PI_MCP_CONFIG_MODE=exclusive` avoids importing other clients' MCP configurations.
-After installation, start a new os session and call `cct_whoami`. With an empty
-cache, direct tools become available after discovery; a warm cache waits for the
-first CCT call before registration. The extension only blocks when
-`cct_check_messages` is active. Before that it allows tools without acknowledging messages.
+After installation, start a new os session. Registration starts automatically
+with either a cold or warm cache; no model call or `/mcp reconnect cct` is
+normally required. Direct tools become available after discovery. The extension
+only blocks when `cct_check_messages` is active. Before that it allows tools
+without acknowledging messages.
+
+The adapter's load-time connection is superseded by its session connection.
+Multiple startup launches are expected; they must settle to one live MCP
+process and one active peer for the host. Both extension orders are supported.
+`eager` also starts automatically but does not reconnect after a server exit.
 
 **Identity model:** `PI_SESSION_ID` exists in os's bash child environment, but is
 absent from the host and MCP child environments. The extension writes
@@ -257,6 +265,9 @@ Run `npm run test:os-identity` for source identity checks. Installed-runtime
 acceptance requires an installed os launcher and adapter:
 
 ```bash
+CCT_OS_ADAPTER=/absolute/path/to/pi-mcp-adapter/index.ts \
+  python3 test-os-autostart.py
+python3 test-os-install-autostart.py
 CCT_OS_ADAPTER=/absolute/path/to/pi-mcp-adapter/index.ts \
   python3 test-os-runtime-live.py
 ```
@@ -286,6 +297,16 @@ CCT state is exposed in the Claude Code status line (`~/.claude/statusline.sh`):
 - Format: `CCT:dd5c @pool(N) ✉` — peer ID prefix, pools with unread counts, total unread
 - Refreshes every 10s via `refreshInterval` setting
 - Graceful degradation: shows `CCT:off` if CCT not installed, `CCT:—` if no pidmap match
+
+The personal os footer (`~/.os/extensions/statusline.ts`) reads file B for the
+registered peer name. When B is absent and the current host's file A matches the
+session, it shows `CCT:pending`: CCT registration has not completed. With
+`keep-alive`, the assigned peer name appears on the next 10-second refresh after
+automatic registration. Older warm `lazy-keep-alive` sessions can remain pending
+until their first CCT call. Re-run `cct install --os` with the environment above
+and start a new os session to apply the automatic lifecycle. `/mcp reconnect cct`
+**inside os** remains a manual recovery command. The footer only reads these
+files; it does not register a peer or treat a session ID as a CCT address.
 
 ## Process Lifecycle (Orphan Prevention)
 

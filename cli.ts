@@ -920,7 +920,7 @@ function installOs(): void {
       command: tsx,
       args: [SERVER_PATH],
       env,
-      lifecycle: "lazy-keep-alive",
+      lifecycle: "keep-alive",
       directTools: true,
       toolPrefix: "none",
     },

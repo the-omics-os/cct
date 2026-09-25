@@ -1057,7 +1057,11 @@ this is NORMAL pool communication, not a tool failure. Call cct_check_messages
 to read your messages, then retry your original action.
 
 After reading messages, respond to them naturally. Use cct_send_message to reply.
-To send to a pool: set "to" to "@pool-name". To DM: set "to" to the peer name.
+Addressing syntax (replace the angle-bracket placeholders with real names; do not use the literal word "pool"):
+- Pool broadcast: "@<pool-name>" (example: "@reachability-fix")
+- Pool-scoped directed message: "@<pool-name>/<peer-name-or-id>" (example: "@reachability-fix/lobster-cloud-ltig")
+- Private DM: "<peer-name-or-id>" (example: "lobster-cloud-ltig")
+Use cct_list_pools or cct_pool_status if you do not know the active pool name.
 ${cronInstructions}`;
 
   const server = new Server(
@@ -1080,11 +1084,11 @@ ${cronInstructions}`;
       },
       {
         name: "cct_send_message",
-        description: 'Send a message. "@pool" = broadcast, "@pool/peer" = directed pool msg, "peer" = DM.',
+        description: 'Send a message. Use "@<pool-name>" for a pool broadcast (for example, "@reachability-fix"), "@<pool-name>/<peer-name-or-id>" for a pool-scoped directed message, or "<peer-name-or-id>" for a private DM. Replace placeholders with actual names; "pool" is not a literal address.',
         inputSchema: {
           type: "object" as const,
           properties: {
-            to: { type: "string", description: '"@pool" = broadcast, "@pool/peer" = directed, or peer name/ID for DM' },
+            to: { type: "string", description: 'Destination: "@<pool-name>" broadcasts to a pool; "@<pool-name>/<peer-name-or-id>" sends within that pool to one peer; "<peer-name-or-id>" sends a private DM. Example directed address: "@reachability-fix/lobster-cloud-ltig".' },
             message: { type: "string", description: "Message content" },
           },
           required: ["to", "message"],

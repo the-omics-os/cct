@@ -126,7 +126,7 @@ cct uninstall            # remove MCP + hooks from all runtimes
 |------|-------------|
 | `cct_check_messages` | Atomic read: polls + marks read in one transaction |
 | `cct_whoami` | Show this session's CCT peer ID/name |
-| `cct_send_message` | `@pool` = broadcast, `@pool/peer` = directed, peer name = DM |
+| `cct_send_message` | `@<pool-name>` = broadcast, `@<pool-name>/<peer-name-or-id>` = pool-scoped directed message, bare peer name/ID = private DM (for example, `@reachability-fix/lobster-cloud-ltig`) |
 | `cct_list_peers` | All peers with cwd, branch, summary, pool memberships |
 | `cct_list_pools` | Active pools with members and purpose |
 | `cct_create_pool` | Create pool (creator auto-joins) |

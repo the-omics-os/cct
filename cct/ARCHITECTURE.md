@@ -210,18 +210,26 @@ Stable-key revival reuses the existing membership restoration transaction.
 
 | Setting | Required value | Failure prevented |
 |---|---|---|
-| `lifecycle` | `lazy-keep-alive` | Default `lazy` disconnects after idle timeout; `keep-alive` raced `session_start` and produced two cold MCP launches in all five measurements |
+| `lifecycle` | `keep-alive` | Starts automatically even with warm metadata and reconnects a failed local MCP process; `lazy-keep-alive` waits for first use with warm metadata, and `eager` does not reconnect |
 | `directTools` | `true` | Tools otherwise remain behind the `mcp` proxy |
 | `toolPrefix` | `"none"` | Default `"server"` exposes `cct_cct_check_messages`, making an unprefixed block reason unusable |
 | `env.CCT_RUNTIME` | `"os"` | Explicit runtime classification independent of inherited Codex environment |
 
-Cold direct-tool bootstrap connects after startup and makes the direct tool
-available in the same session. A warm metadata cache exposes the tool but waits
-for the first CCT call before connecting. Registration is therefore guaranteed
-after discovery/first use, not unconditionally at host startup. The original
-row-1 acceptance wording was changed explicitly in STATE D22/D23. No timeout is
-claimed to make every marker race impossible; delayed and absent-marker controls
-exercise the fallback.
+**Lifecycle revision (2026-09-18):** Kevin approved automatic connection.
+The original `lazy-keep-alive` decision in STATE D22/D23 left warm sessions
+unregistered until their first CCT call. Installed adapter 2.33.0 at
+`cfbade44b86b45762e88b97b44ef1102f1027217` documents load-time initialization
+followed by session initialization that supersedes it. Observing two startup
+launches alone does not establish a surviving duplicate. The automatic-start
+regression measures cold/warm caches in both extension orders, actual surviving
+processes and active broker rows, resume/fork/new sessions, and recovery.
+
+Use the adapter's existing `keep-alive` setting; no adapter patch or extension
+reordering is required. Connections must settle to one live MCP process and one
+active peer per host, with the resolved session key. The installer persists the
+setting without changing other clients' configuration. The footer remains a
+reader of A and B. No timeout is claimed to make every marker race impossible;
+delayed and absent-marker controls exercise the fallback.
 
 **Blocking returns a value.** os `tool_call` handlers must return
 `{ block: true, reason }` (`runner.ts:982-1003`). Throwing produces an extension
