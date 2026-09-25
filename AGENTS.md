@@ -345,10 +345,11 @@ installer, extension, packed-package, measurements, and termination checks.
 
 Both server.ts and cli.ts support flexible peer addressing:
 1. **Exact match** on full peer ID or peer name (priority)
-2. **Prefix match** on peer ID (minimum 4 characters)
-3. **Prefix match** on peer name
+2. **Exact pair** `id/name` or `name/id`, as printed by `cct` `status` and member lists (server.ts only; both halves must name the same peer)
+3. **Prefix match** on peer ID (minimum 4 characters)
+4. **Prefix match** on peer name
 
-Examples: `aaccacce` (full ID), `aacc` (4-char prefix), `ccp-ftts` (full name), `ccp-` (name prefix).
+Examples: `aaccacce` (full ID), `aaccacce/ccp-ftts` or `ccp-ftts/aaccacce` (pair), `aacc` (4-char prefix), `ccp-ftts` (full name), `ccp-` (name prefix). In pool-directed sends, `@pool/<peer>` accepts the same forms, e.g. `@pool/ccp-ftts/aaccacce`.
 Ambiguous matches return all candidates with IDs for disambiguation.
 
 ## Status Line Integration

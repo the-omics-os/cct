@@ -593,6 +593,16 @@ async function resolvePeerId(nameOrId: string): Promise<{ id: string } | { error
   const exact = res.data.filter((p) => p.id === nameOrId || p.name === nameOrId);
   if (exact.length === 1) return { id: exact[0].id };
 
+  // Accept the "id/name" and "name/id" pairs that status and member lists print,
+  // since agents copy them verbatim (live os test 2026-09-25). Only an exact pair
+  // that names one peer matches; anything else falls through unchanged.
+  const parts = nameOrId.split("/");
+  if (exact.length === 0 && parts.length === 2 && parts[0] && parts[1]) {
+    const [a, b] = parts;
+    const paired = res.data.filter((p) => (p.id === a && p.name === b) || (p.name === a && p.id === b));
+    if (paired.length === 1) return { id: paired[0].id };
+  }
+
   // Prefix match on ID (min 4 chars to avoid noise)
   let matches = exact;
   if (matches.length === 0 && nameOrId.length >= 4) {

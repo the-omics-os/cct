@@ -264,10 +264,19 @@ async function compactIntegration() {
     assert.match(await call({ action: "send", to: `@${pool}/${owner.name}`, message: directed }), /Sent directed message/);
     const dm = `compact-dm-${start}`;
     assert.match(await call({ action: "send", to: owner.name, message: dm }), /DM sent/);
+    // Regression (live os test 2026-09-25): agents copy the id/name and name/id
+    // pairs that status prints; both resolve, a mismatched pair does not.
+    const pairIdName = `compact-pair-idname-${start}`;
+    const pairNameId = `compact-pair-nameid-${start}`;
+    const pairDirected = `compact-pair-directed-${start}`;
+    assert.match(await call({ action: "send", to: `${owner.id}/${owner.name}`, message: pairIdName }), /DM sent/);
+    assert.match(await call({ action: "send", to: `${owner.name}/${owner.id}`, message: pairNameId }), /DM sent/);
+    assert.match(await call({ action: "send", to: `@${pool}/${owner.name}/${owner.id}`, message: pairDirected }), /Sent directed message/);
+    assert.match(await call({ action: "send", to: `${owner.id}/not-${owner.name}`, message: "must not deliver" }), /not found/);
     const members = await post("/pool/status", { pool_name: pool });
     assert.ok(members.members.some((member: any) => member.peer_id === owner.id), "invite must create owner membership");
     const delivered = await post("/message/poll", { peer_id: owner.id });
-    for (const expected of [sent, directed, dm]) assert.ok(delivered.some((message: any) => message.body === expected), `compact send did not deliver ${expected}`);
+    for (const expected of [sent, directed, dm, pairIdName, pairNameId, pairDirected]) assert.ok(delivered.some((message: any) => message.body === expected), `compact send did not deliver ${expected}`);
 
     // Preserve established stale-recipient and ambiguous-prefix handling through compact actions.
     const registerPeer = async (name: string) => post("/register", { pid: process.pid, pid_start: `${Date.now()}-${Math.random()}`, host_pid: process.pid, host_pid_start: `${Date.now()}-${Math.random()}`, runtime: "claude", session_key: `compact-extra-${name}-${start}`, cwd: process.cwd(), name, name_is_explicit: true });
