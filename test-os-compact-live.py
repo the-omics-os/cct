@@ -11,7 +11,7 @@ PORT=int(os.environ.get('CCT_OS_TEST_PORT','17896'))
 with socket.socket() as s:s.bind(('127.0.0.1',PORT))
 WORK=Path(tempfile.mkdtemp(prefix="cct-os-compact-",dir="/private/tmp")); CCT=WORK/'cct'; CCT.mkdir()
 EVIDENCE_DIR=REPO/'.planning/COMPACT_TOOLS/codex/evidence'; EVIDENCE_DIR.mkdir(parents=True,exist_ok=True)
-URL=f'http://127.0.0.1:{PORT}'; BASE={'PATH':str(Path(NODE).parent)+':/usr/bin:/bin','CCT_DIR':str(CCT),'CCT_PORT':str(PORT),'CCT_BROKER':URL}
+URL=f'http://127.0.0.1:{PORT}'; BASE={'PATH':str(Path(NODE).parent)+':/usr/bin:/bin','CCT_DIR':str(CCT),'CCT_PORT':str(PORT),'CCT_BROKER':URL,'PI_OFFLINE':'1','AWS_EC2_METADATA_DISABLED':'true'}
 checks=[];sessions=[]
 def record(name, ok, evidence):
     checks.append({'row':name,'passed':bool(ok),'evidence':evidence})
@@ -66,6 +66,10 @@ class Session:
                 if self.p.poll() is None:self.p.terminate();self.p.wait(timeout=5)
         self.out.close();self.errfile.close()
 def text(r):return '\n'.join(c.get('text','') for c in r.get('result',{}).get('content',[]))
+def observations(session):
+    return [json.loads(line) for line in session.log.read_text().splitlines()] if session.log.exists() else []
+def notice(session):
+    return [e for e in observations(session) if e.get('kind')=='provider_input' and e.get('noticeCount',0)>0 and '[CCT peer inbox notice]' in str(e.get('noticeText'))]
 blog=(WORK/'broker.log').open('w');broker=subprocess.Popen([NODE,'--import',str(REPO/'node_modules/tsx/dist/loader.mjs'),str(REPO/'broker.ts')],cwd=WORK,env={**BASE,'HOME':str(WORK)},stdout=blog,stderr=blog)
 fixture=None
 try:
@@ -92,11 +96,13 @@ try:
     sender=wait(lambda:sql("select id,secret from peers where name='compact-sender' and status='active'"))[0];target=p['id']
     post('/message/send',{'peer_id':sender['id'],'peer_secret':sender['secret'],'to_peer_id':target,'body':'compact-live-unique-row3'})
     wait(lambda:flag(target) and int(flag(target).split('|')[0])>0);before=flag(target);sentinel=s.cwd/'ordinary-tool-ran'
-    blocked=s.tool('bash',{'command':f"touch '{sentinel}'"})
-    record('3 unread blocks bash with recovery instruction',blocked.get('isError') and 'cct_check_messages' in text(blocked) and not sentinel.exists(),{'flag_before':before,'blocked_result':text(blocked)})
+    wait(lambda:notice(s))
+    wait(lambda:any(e.get('kind')=='custom_message' and e.get('customType')=='cct-inbox-notice' for e in observations(s)))
+    ordinary=s.tool('bash',{'command':f"touch '{sentinel}'"})
+    record('3 unread notice reaches model and bash runs without consuming',not ordinary.get('isError') and sentinel.exists() and int(flag(target).split('|')[0])>0,{'flag_before':before,'notice':notice(s)[0],'ordinary_result':text(ordinary)})
     allowed=s.tool('cct',{'action':'status'});record('4 cct remains callable while unread',not allowed.get('isError') and 'you: '+p['id']+'/'+p['name'] in text(allowed),{'result':text(allowed),'flag':flag(target)})
     checked=s.tool('cct_check_messages',{});after=flag(target);retry=s.tool('bash',{'command':f"touch '{sentinel}'"})
-    record('3 check clears flag and bash retry runs',not checked.get('isError') and (not after or int(after.split('|')[0])==0) and not retry.get('isError') and sentinel.exists(),{'check_result':text(checked),'flag_after':after,'sentinel':sentinel.exists()})
+    record('3 check returns DM, clears flag and bash retry runs',not checked.get('isError') and 'compact-live-unique-row3' in text(checked) and (not after or int(after.split('|')[0])==0) and not retry.get('isError') and sentinel.exists(),{'check_result':text(checked),'flag_after':after,'sentinel':sentinel.exists()})
     s.stop()
     # Row 8: independent os sessions sharing one adapter cache/agent directory.
     shared=WORK/'shared-agent';shared.mkdir();a=Session('concurrent-a',agent=shared);b=Session('concurrent-b',agent=shared)
@@ -132,11 +138,14 @@ try:
     record('13 unread fail-open while recovery tool is inactive',not any(n in ('cct','cct_check_messages') for n in disabled_tools) and not fail_open.get('isError') and preactivation.exists(),{'unread_flag':flag(cp['id']),'active_tools_without_cct':disabled_tools,'bash_result':text(fail_open),'sentinel':preactivation.exists()})
     compact.prompt('/probe-enable-cct');compact.prompt('/probe-tools')
     enabled_tools=next(e['active'] for e in reversed(list(map(json.loads,compact.log.read_text().splitlines()))) if e.get('kind')=='tools' and e.get('at')=='command')
-    # Verify static CCT descriptions and recovery exemption/ordinary blocking.
-    status=compact.tool('cct',{'action':'status'});blocked_mcp=compact.tool('mcp',{});blocked_bash=compact.tool('bash',{'command':f"touch '{compact.cwd/'blocked-before-check'}"})
+    # Verify static CCT descriptions, recovery availability and nonblocking ordinary tools.
+    wait(lambda:notice(compact))
+    status=compact.tool('cct',{'action':'status'});ordinary_mcp=compact.tool('mcp',{})
+    before_check=compact.cwd/'ordinary-before-check'
+    ordinary_bash=compact.tool('bash',{'command':f"touch '{before_check}'"})
     check_result=compact.tool('cct_check_messages',{});after_check=flag(cp['id']);sent=compact.cwd/'switch-retry'
     retry=compact.tool('bash',{'command':f"touch '{sent}'"})
-    record('13 recovery exemptions, blocked mcp/bash, clear flag and retry',set(n for n in enabled_tools if n.startswith('cct'))=={'cct','cct_check_messages'} and not status.get('isError') and not check_result.get('isError') and blocked_mcp.get('isError') and blocked_bash.get('isError') and 'cct_check_messages' in text(blocked_bash) and (not after_check or int(after_check.split('|')[0])==0) and not retry.get('isError') and sent.exists(),{'active_tools_without_cct':disabled_tools,'active_tools_after_switch':enabled_tools,'status':text(status),'blocked_mcp':text(blocked_mcp),'blocked_bash':text(blocked_bash),'check':text(check_result),'flag_after':after_check,'sentinel':sent.exists()})
+    record('13 recovery available, model-visible notice, ordinary tools unblocked, clear flag and retry',set(n for n in enabled_tools if n.startswith('cct'))=={'cct','cct_check_messages'} and bool(notice(compact)) and not status.get('isError') and not check_result.get('isError') and 'staged-switch-unread' in text(check_result) and not ordinary_mcp.get('isError') and not ordinary_bash.get('isError') and before_check.exists() and (not after_check or int(after_check.split('|')[0])==0) and not retry.get('isError') and sent.exists(),{'active_tools_without_cct':disabled_tools,'active_tools_after_switch':enabled_tools,'status':text(status),'ordinary_mcp':text(ordinary_mcp),'ordinary_bash':text(ordinary_bash),'notice':notice(compact),'check':text(check_result),'flag_after':after_check,'sentinel':sent.exists()})
     compact.stop()
     evidence=WORK/'acceptance.json';evidence.write_text(json.dumps(checks,indent=2))
     measurement={'provider_request':{'method':'UTF-8 compact JSON bytes of {messages:context.messages} at the same local synthetic-provider boundary as PHASE_0','compact_first_request_bytes':compact_provider,'legacy_first_request_bytes':legacy_provider},'evidence':str(EVIDENCE_DIR)}

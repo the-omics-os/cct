@@ -237,7 +237,7 @@ setting without changing other clients' configuration. The footer remains a
 reader of A and B. No timeout is claimed to make every marker race impossible;
 delayed and absent-marker controls exercise the fallback.
 
-**Blocking returns a value.** os `tool_call` handlers must return
+**Historical blocking contract (superseded by D18 for os).** os `tool_call` handlers must return
 `{ block: true, reason }` (`runner.ts:982-1003`). Throwing produces an extension
 error and does not establish this block contract. The handler exempts exact `cct`, all `cct_*` tools, and ToolSearch, reads B and the existing `count|pool_summary|timestamp` flag,
 and ignores stale or malformed flags. Both delivery handlers require the exact
@@ -246,7 +246,7 @@ per session; missing identity or an unavailable direct tool allows work without
 acknowledging messages. This prevents first-install discovery from trapping the
 host behind a tool it cannot call.
 
-**Delivery is at the next tool or model turn.** Busy os sessions see a returned
+**Historical next-tool/model-turn delivery (superseded by D18).** Busy os sessions saw a returned
 `tool_call` block. `context` appends an unread notification through
 `transformContext` (`src/core/sdk.ts:356-360`), which runs only on a model turn.
 It never wakes an idle session. This matches Codex's next-prompt timing; Claude
@@ -292,8 +292,8 @@ still assigns a session ID (`session-manager.ts:926-930`); the difficulty is
 inherited environment and process ancestry, not an absent ID. A lost marker
 race produces only a host-scoped identity, so a new host cannot recover that
 fallback peer by session ID. The adapter remains third-party software with a
-native dependency; pruning it belongs to its owner. There is no spontaneous
-idle wake-up. Package upgrades may replace the local launcher and require Q7
+native dependency; pruning it belongs to its owner. D18 adds spontaneous idle
+chat-DM wake through the existing os API. Package upgrades may replace the local launcher and require Q7
 to be reapplied. No os source edits are part of this integration.
 
 ---
@@ -339,6 +339,121 @@ legacy, making rollback a change of the installer-provided environment value.
 PHASE_3 measured 1,244 B of compact eager schemas versus 5,441 B for legacy;
 the first synthetic-provider request was 15,100 B compact versus 20,730 B
 legacy, and a status response for a 25-member pool was 456 B.
+
+---
+
+## D18: os inbox notice and idle chat-DM wake
+
+**Decision (2026-09-25):** Replace D16's repeating os tool blocks/ephemeral
+context reminders with a session-owned observer and coalesced custom message.
+Only os changes; Claude/Codex hooks and idle delivery stay unchanged. No os-core,
+adapter, broker endpoint, SQLite schema, or tool-schema change is required.
+
+**Producer contract.** `server.ts` keeps the legacy three-field unread flag and
+adds atomic `flags/<peerId>.os-notify` JSON, version 1, containing `peerId`,
+`producer`, `readGeneration`, `count`, `maxId`, `maxDmId`, `timestamp`, and
+`localBroker`. Numeric message fields describe outstanding unread messages
+minus this process's deferred-ack batch; `maxDmId` selects only non-system chat
+with `pool_name === null`. No body or secret is stored in the sidecar.
+`timestamp` is freshness, not owner identity. `localBroker` is derived from the
+resolved broker URL endpoint: exact `localhost`, canonical IPv4 `127/8`, or
+IPv6 `::1` is local; remote/invalid/unknown is false. This is **endpoint
+locality, not peer authentication or a trust boundary**: LAN-bound brokers via
+localhost and SSH tunnels appear local. No DNS lookup. A successful check
+prepares the complete response before deferred ack; optional sidecar/flag cache
+write failures do not hide bodies or ack a batch that was never returned.
+
+For os only, B is `peerId|name|producer|ownerStart`; first two fields remain
+unchanged, fourth may be empty when process start cannot be verified. Only B's
+producer publishes/deletes metadata, checking ownership after async polling
+and before publishing. After a successful peek, a non-owner can claim an owner
+only on verified `ESRCH` or a verified PID-start mismatch (PID reuse), with a
+synchronous B re-read before claim. **Never steal on sidecar staleness/absence**,
+a stalled live PID, EPERM/unknown process identity or a legacy B lacking a
+verified start. Competing survivors settle behind the live B winner, without
+cross-process CAS or exactly-once crash delivery. A successful checker can
+transfer B and advance its read generation; a failed checker cannot transfer
+ownership or rearm. The extension never writes caches, queries the broker,
+registers a peer or acknowledges messages. SQLite remains authoritative.
+
+**Consumer contract.** Start one unref'd 1-second observer in `session_start`
+for open TUI/RPC only, stop on shutdown, invalidate old-session callbacks.
+Require exact active `cct_check_messages`, valid A/B session mapping and fresh
+matching metadata (≤30s old, no future timestamp). Missing inputs fail open
+for tools and closed for idle scheduling, without acknowledging messages.
+Observe at agent/tool/context boundaries but never return a block or append a
+competing context reminder. Print/JSON have no observer.
+
+Use os's existing provenance-labelled `cct-inbox-notice` custom message with
+`{triggerTurn:true,deliverAs:"steer"}`. During a human-driven run it queues at a
+safe boundary without aborting tools; an autonomous run defers further busy
+notices until settle (no unbudgeted peer-driven chaining). Only an outstanding
+chat DM can start an idle run; pool-only, system/service and directed pool
+messages (even a pool named `DM`) await normal work. RPC embedders must expect
+unprompted model requests. The notice asks for a check and, on idle starts,
+to handle available work and stop rather than wait/poll for replies. It grants
+no authority and does not bound the model's own inference or tool loops.
+
+**Coalescing and receipt.** Per `peer:producer:readGeneration`, track eligible,
+queued, dequeued-into-history or uncertain separately from an idle start spent,
+budget refusal and DM high-water mark. `sendMessage` is fire-and-forget;
+matching `message_end` means history entry, **not model acknowledgement**.
+An attempted/delivered DM-containing notice remains claimed even when further
+DMs arrive; a successful read generation rearms without a zero-count interval.
+A first DM may follow an earlier pool-only notice. TUI Esc can discard a queued
+notice: do not immediately restart human-cancelled work, but re-offer **once**
+(DM or pool-only) on later human work. RPC retains queued steers and is not
+auto-re-offered; an RPC `clear_queue` or uncertain delivery needs a manual
+`cct_check_messages`. Crash/restart may conservatively replay; exactly-once
+model consumption is not promised.
+
+**Scheduling, lifecycle and order.** Known `agent_start`→`agent_settled` running
+state is distinct from `ctx.isIdle()`: non-idle tree/summary/compaction and
+human preflight are not agent runs and cannot license a new start. The CCT
+`input` handler synchronously reserves trusted interactive/RPC prompt preflight
+before later async handlers, with no time-based release. `cct install --os`
+places CCT first among **explicit global** `settings.extensions`, de-duplicates
+it and preserves all other entries' order; installed os processes same-level
+handlers serially. Earlier CLI, managed or project async `input` handlers can
+still invalidate this scheduling assumption. Verify actual effective load order.
+UI waits, failed/handled preflight and pending switch/fork pause notification;
+replacement also pauses busy notices. os has no reliable completion event for
+failed/handled preflight or cancelled replacement: never infer completion from
+elapsed time or activity. `/cct-wake status` exposes a visible pause; human
+`/cct-wake resume` only **after the operation has finished** clears lifecycle
+latches and refuses known running/non-idle/UI wait. It cannot prove hidden
+async preflight finished, does not synchronously restart cancelled work, and
+never clears budget, denied DM state or master opt-out. New session/reload
+clears old lifecycle state; explicit inbox checks always work.
+
+**Idle policy and budgets.** Fresh matched `localBroker:true` is needed by
+default for idle starts; remote/unknown locality needs host
+`CCT_OS_AUTO_WAKE_REMOTE=1`. Host `CCT_OS_AUTO_WAKE=0` always wins, suppressing
+idle starts only (busy notices/manual reads still work). Use master opt-out on
+LAN/tunnel hosts if desired; changing only MCP child env is insufficient.
+Checkpoint max **5 starts per rolling 60 seconds plus 10 consecutive** per
+logical session to os session history *before attempted dispatch*; restore on
+reload/resume, new fork/session gets separate budget. Only trusted interactive/
+RPC input resets consecutive, not rolling history. Extension/peer inputs and
+resume do not reset either cap. A refused old DM is **not retried on time expiry
+or human reset**; only a strictly newer chat DM may be reconsidered when the
+current budget permits, and repeated refusals advance the high-water mark.
+The per-source refusal watermark is in memory and not restored on reload;
+budget checkpoints are restored, so reload does not guarantee suppression of
+an old refused source after the rolling window expires. Attempted failed/aborted dispatch costs a start; invalid/unwritable checkpoints
+fail closed for idle starts without suppressing later human-work busy notices.
+These limits bound CCT-initiated idle starts, **not total inference spending**.
+
+**Verification.** Source controller/owner/legacy tests and installed os 0.2.0
+RPC/TUI synthetic-provider acceptance use private HOME/brokers and a staged
+source adapter. Scratch CCT-first installer tests do not alter operator config
+or prove live effective order. See README for commands and
+`.planning/OS_INBOX_WAKE/HARDENING_ACCEPTANCE.md` for short receipts. The final
+900s quiet + 2h periodic/reconnect test **passed** on 2026-09-26 at
+`/private/tmp/cct-final-endurance.2u1rJx`: 102 delivery checks, 15 MCP reconnects,
+unchanged source hashes and clean owned host/broker/peer cleanup. `ENDURANCE.md`
+records the final receipt and parent verification. No live rollout, publication
+or real-provider claim.
 
 ---
 

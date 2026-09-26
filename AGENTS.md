@@ -14,8 +14,8 @@ Real-time inter-session communication for AI coding agents. Supports **Claude Co
 
 **os:**
 1. **pi-mcp-adapter** runs the resident CCT MCP server in `keep-alive` mode. The os installer selects the compact CCT surface: exactly `cct_check_messages` and `cct`.
-2. **`os-extension.ts`** exempts `cct`, all `cct_*` tools, and `ToolSearch`; it returns `{ block: true, reason }` at the next ordinary tool call while messages are unread. `cct_check_messages` remains callable and clears the block.
-3. **`context`** adds an unread notification on the next model turn. It does not wake an idle session. Compact tool descriptions and instructions are static to avoid leaking one session's identity through the adapter's shared metadata cache; use `cct` with `action: status` for identity.
+2. **`os-extension.ts`** sends one coalesced, model-visible inbox notice at a safe boundary; it does not block ordinary or CCT tools. `cct_check_messages` reads the inbox and rearms notification.
+3. **Idle chat DMs** automatically invoke open TUI/RPC os sessions through the existing custom-message API. Pool-only/system/service messages wait for ordinary work. Print/JSON runs do not use the observer. Compact descriptions/instructions remain static; use `cct` with `action: status` for identity. See **os Integration** below for opt-out, rate limits and lifecycle caveats.
 
 ```
 Claude A ──► MCP Server ──► Broker (SQLite) ◄── MCP Server ◄── Codex B
@@ -159,14 +159,20 @@ cct/
   broker.ts              HTTP broker + SQLite (29 endpoints, 7 tables, transactions)
   server.ts              MCP stdio server (17-tool legacy surface; 2-tool compact os surface; runtime detection, deferred ack, orphan prevention)
   cli.ts                 CLI (runtime-scoped installer for Claude, Codex, and os)
-  os-extension.ts        os session marker, returned tool block, next-turn notification
+  os-extension.ts        os session marker, coalesced model notice, idle chat-DM wake
   hook.sh                Claude Code PreToolUse hook (pure bash, <10ms, stale detection)
   hook-codex.sh          Codex PreToolUse hook (JSON stdin/stdout, <10ms, session_id lookup)
   prompt-codex.sh        Codex UserPromptSubmit hook (idle delivery via additionalContext)
   session-start-codex.sh Codex SessionStart hook (identity bridge: session_id → peer_id)
-  test-integration.sh    Integration tests (132 checks, isolated on port 17888; also runs the unit tests)
+  test-integration.sh    Integration tests (135 checks; private broker, refuses occupied ports)
   test-compact-surface.ts Compact schemas, validation, mapping, status, and MCP surface tests
-  test-os-extension.ts   os guard exemptions and unread-delivery checks
+  test-os-extension.ts   os nonblocking model-notice checks
+  test-os-notifications.ts One-shot controller, lifecycle, opt-out and budget
+  test-os-notification-server.ts Real sibling-MCP ownership/check/cache-failure regressions
+  test-os-inbox-wake.py   Installed os RPC/TUI idle wake, busy delivery and abort acceptance
+  test-os-inbox-hardening.py Installed slow-preflight, Esc, owner, replacement and ordering acceptance
+  test-os-inbox-endurance.py Private budget/ping-pong/reconnect, 900s quiet and 2h soak harness
+  test-os-inbox-endurance-run.sh Bounded long-run runner with private receipts
   test-os-compact-installer.py Isolated compact os installer settings and idempotence
   test-os-compact-live.py Installed os compact-surface acceptance with a synthetic provider
   test-compact-packed.ts Packed-artifact acceptance for compact tools
@@ -201,7 +207,7 @@ cct/
 ## Design Documents
 
 Core design documents live in `/Users/tyo/Omics-OS/cct/cct/`:
-- `ARCHITECTURE.md` — **Design decisions D1-D16.** D16 records the os runtime contract.
+- `ARCHITECTURE.md` — **Design decisions D1-D18.** D16 records os integration; D18 supersedes its original next-turn/blocking delivery.
 - `ROADMAP.md` — 5 build phases (1-4 complete, 5 = PTY Launcher scoped)
 - `STATE.md` — Current progress
 - `REQUIREMENTS.md` — User flows and constraints
@@ -218,11 +224,11 @@ Delivery is runtime-specific; do not set up a cron for every CCT runtime:
 |---------|------------|---------------------|
 | **Claude Code** | PreToolUse hook blocks ordinary calls with unread messages. | Set up one CronCreate job at `*/1 * * * *` while in any pool; its prompt calls `cct_check_messages`. Cancel it via CronList + CronDelete after leaving the last pool. |
 | **Codex CLI** | PreToolUse hook blocks ordinary calls. | UserPromptSubmit hook delivers on the next prompt; no cron setup. |
-| **os** | Extension blocks ordinary tool calls while unread messages exist, when the recovery tool is active. | Context notification appears on the next model turn; no cron setup or spontaneous idle wake-up. |
+| **os** | Coalesced model-visible custom notice; ordinary tools continue. | Chat DMs wake open TUI/RPC sessions; pool-only messages wait for ordinary work. No cron. |
 
 Claude Code join/create responses include the cron reminder; leave responses check remaining pools and prompt for cleanup when the last pool is left. Codex and os receive their corresponding hook/extension delivery instructions.
 
-**Idle session limitation:** There is no way to push into an idle Claude Code or os session via MCP. Claude Code CronCreate bottoms out at 60s; os context delivery waits for the next model turn. The PreToolUse hook only fires during tool calls. Phase 5 (PTY Launcher) will solve this with `cct claude` wrapping the session for sub-10s delivery.
+**Idle delivery:** MCP alone does not schedule a model turn. Claude Code's CronCreate bottoms out at 60s; Codex waits for the next prompt. os's local extension observes derived metadata and invokes the existing os custom-message API for idle chat DMs. No PTY launcher or os-core patch is required. PTY wrapping for other runtimes remains a proposal, not implemented functionality.
 
 **Stable identity (all three runtimes):** The CCT peer ID/name is anchored to a stable session key so it survives MCP restarts, `/mcp` reconnects, and network transitions (e.g. a Wi-Fi change that lets the broker mark the peer dead). Claude uses `CLAUDE_CODE_SESSION_ID`; Codex uses `codex-root:<root session id>`, resolved from codex's rollout transcripts because **codex never exports its session id into MCP server env** (see below and ARCHITECTURE **D11c**). os uses `os:<session id>` from its extension-owned marker (D16). The broker de-dupes registrations on `(runtime, session_key)` and revives the same row (same id/secret/name) even if it was marked dead — **and restores the pool memberships that death dropped** (via `died_at`/`left_at` pairing), so the reclaimed peer isn't silently mute in its pools. `server.ts` recovers in place on a `peer not found` heartbeat instead of exiting, but only while the host process is alive (checked in `reregister`, so a genuine orphan is not resurrected). Peers with no session key fall back to legacy ephemeral (new id per registration). Limitations: a *dead* stdio MCP process still needs its runtime to reconnect; two live sessions sharing one `CLAUDE_CODE_SESSION_ID` collapse to one row. See ARCHITECTURE **D11b**.
 
@@ -242,8 +248,8 @@ CCT supports OpenAI Codex CLI as a first-class runtime. `cct install` auto-detec
 
 | State | Claude Code | Codex CLI | os |
 |-------|-------------|-----------|----|
-| Busy (tool calls) | `hook.sh` blocks, text output | `hook-codex.sh` blocks, JSON output | Extension returns a `tool_call` block |
-| No current turn | CronCreate 60s polling | `prompt-codex.sh` injects on next prompt | Extension `context` notification on next model turn |
+| Busy (tool calls) | `hook.sh` blocks, text output | `hook-codex.sh` blocks, JSON output | One coalesced model-visible custom notice; no tool block |
+| No current turn | CronCreate 60s polling | `prompt-codex.sh` injects on next prompt | Chat DM invokes open TUI/RPC; pool-only waits for ordinary work |
 
 **Config location:** `~/.codex/config.toml` — `[mcp_servers.cct]` + `[[hooks.*]]` sections.
 
@@ -274,9 +280,10 @@ Required CCT adapter settings are `lifecycle: "keep-alive"`,
 After installation, start a new os session. Registration starts automatically
 with either a cold or warm cache; no model call or `/mcp reconnect cct` is
 normally required. Direct tools become available after discovery: the active
-CCT tools are `cct_check_messages` and `cct`. The extension only blocks when
-`cct_check_messages` is active; it exempts `cct`, every `cct_*` tool, and
-`ToolSearch`, and otherwise fails open without acknowledging messages. Use
+CCT tools are `cct_check_messages` and `cct`. The observer only notifies when
+`cct_check_messages` is active and matching fresh metadata is available; it
+otherwise fails open without acknowledging messages. Ordinary tools are never
+blocked by the os extension. Use
 `cct` with `action: status` to get the CCT peer ID/name, runtime, identity key,
 and pool status. `cct_check_messages` remains the exact-named, zero-argument
 recovery tool and prefixes its results with `you: <id>/<name>`.
@@ -287,14 +294,18 @@ identity in tool descriptions or instructions; retrieve it from
 `cct` with `action: status`. The recovery tool description is static on both
 compact and legacy surfaces. The adapter's load-time connection is superseded
 by its session connection. Multiple startup launches are expected; they must
-settle to one live MCP process and one active peer for the host. Both extension
-orders are supported. `eager` also starts automatically but does not reconnect
-after a server exit.
+settle to one live MCP process and one active peer for the host. Explicit global
+extension load order matters: `cct install --os` places the canonical CCT
+extension first in `settings.extensions`, de-duplicates it and preserves all
+other entries' relative order. This lets its synchronous human-input reservation
+precede later global async handlers (including the adapter). Earlier CLI,
+managed or project handlers can still run first; check the effective host order.
+`eager` also starts automatically but does not reconnect after a server exit.
 
 **Identity model:** `PI_SESSION_ID` exists in os's bash child environment, but is
 absent from the host and MCP child environments. The extension writes
 `~/.cct/pidmaps/os_session_<hostPid>` → session ID (file A); the MCP server writes
-`os_<sessionId>` → peer ID (file B). Extension shutdown removes only A; MCP
+`os_<sessionId>` → `peerId|name|producer|ownerStart` (file B; fourth field may be empty; first two fields unchanged and producer os-only). Extension shutdown removes only A; MCP
 cleanup owns B. The CLI walks this ancestry even when a bash child has
 `PI_SESSION_ID`. Neither `PI_SESSION_ID` nor `CODEX_THREAD_ID` is a CCT address:
 in os use `cct` with `action: status`; legacy Claude/Codex use `cct_whoami` or
@@ -307,9 +318,93 @@ stderr diagnostic. Without B, the extension emits one diagnostic per session
 and allows tools. Distinct resolved os session IDs remain distinct; a weak host
 key may be upgraded when the marker becomes available.
 
-The os extension provides no spontaneous idle wake-up. The resident server keeps
-heartbeating and refreshes the unread flag, including messages arriving after a
-previous deferred-ack read. Notifications become visible at the next turn/tool.
+The resident server polls every 2 seconds and writes atomic
+`flags/<peerId>.os-notify` metadata alongside the unchanged legacy unread flag.
+Only the producer named in B may publish/delete this metadata; successful
+checks transfer ownership and advance the read generation. A failed check never
+transfers/rearms. After a successful peek a sibling can claim B automatically
+only if it re-reads the same B and verifies the old owner exited (`ESRCH`) or
+its PID was reused (different verified process start). Missing/stale sidecar,
+stalled live PID, old B without a known start or indeterminate PID state never
+justify theft; explicit check/reconnect remains the fallback. Metadata has no
+bodies/secrets; SQLite and deferred acknowledgements remain authoritative.
+The extension only observes metadata, every second and at model events, then
+uses `sendMessage(..., {triggerTurn:true, deliverAs:"steer"})`. Queued means
+scheduled; matching `message_end` means entered history, **not** model ack.
+A notice never acknowledges SQLite; crashes may conservatively replay.
+
+Busy notices coalesce until a successful check; the first DM can follow a
+pool-only notice. Peer-driven runs defer fresh busy notices until settle (no
+unbudgeted autonomous busy chaining); human-driven runs see them at a safe
+boundary without blocking tools. Only non-system chat DMs wake open idle TUI/RPC
+sessions. Pool broadcasts, directed pool messages (even a pool named `DM`),
+system/service messages and pool throttles do not. RPC embedders should expect
+unprompted requests for chat DMs; RPC retains queued notices and `clear_queue`
+can drop them without an observable model acknowledgement. TUI Esc does not
+restart cancelled work: one uncertain queued notice (DM **or pool-only**) can
+be re-offered during later human-driven work, not immediately on settle. RPC
+retained notices are not auto re-offered; use `cct_check_messages` manually if
+uncertain. An attempted or delivered DM notice remains claimed despite newer
+DMs until a successful check changes read generation. Idle notices ask the
+model to handle available work and stop, not wait or poll for replies; model-
+internal loops are not controlled by these limits. Print/JSON have no observer.
+
+Idle wake is permitted by default only with fresh matched `localBroker:true`,
+computed by the server from the **resolved endpoint**: exact `localhost`,
+IPv4 `127/8` or IPv6 `::1`. Remote, missing or unknown locality fails closed
+for idle starts; busy notices and manual reads still work. Host
+`CCT_OS_AUTO_WAKE_REMOTE=1` opts in to remote wake, but host
+`CCT_OS_AUTO_WAKE=0` disables idle wake regardless (never busy notices).
+Endpoint locality is **not** authentication or a trust boundary: LAN-bound
+brokers reached by loopback and SSH tunnels look local; opt out on such hosts
+when appropriate. MCP-child-only environment changes do not control the host.
+
+The session-history checkpoint is persisted **before attempted dispatch**:
+maximum 5 automatic idle starts per rolling 60 seconds plus 10 consecutive
+starts per logical session. Reload/resume restores counters; new fork/session
+has a separate budget. Only trusted interactive/RPC input resets consecutive,
+not rolling timestamps; peer/extension input and `/cct-wake resume` cannot
+reset budgets. A budget-refused DM cannot retry just because time expires or a
+human reset occurs. A **strictly newer chat DM** can be evaluated when budgets
+permit; further refusals advance the DM high-water mark. The refusal
+watermark is in-memory and may be lost on reload (the budget checkpoint is
+restored); reload is not an unconditional old-DM suppression guarantee.
+Aborted/failed
+attempts remain spent, and malformed/unwritable checkpoint fails closed for
+idle wake while busy/manual reads remain available. Rate limits bound starts,
+not total inference or spending.
+
+Track known `agent_start`→`agent_settled` separately from `ctx.isIdle()`:
+non-idle summary/tree/compaction/preflight cannot launch a competing run.
+Human input latches preflight before later async input handlers; no timeout
+releases it after 5 seconds. UI waits and replacement pause notifications;
+failed/handled preflight and cancelled replacement have no definitive completion
+event, so there is **no guessed timeout**. Replacement also pauses busy notices.
+Use human-facing `/cct-wake status` to inspect the visible pause and
+`/cct-wake resume` **only after the operation actually finished**; resume
+refuses known running, non-idle or UI-wait states, cannot verify hidden async
+completion, and does not synchronously start cancelled work. It clears lifecycle
+pauses only: not budgets, budget-refused DMs or master opt-out. A successful new
+session/reload also clears stale lifecycle state. Explicit inbox checks remain
+available. No closed-process/sleeping-machine wake or permission bypass.
+
+Installed RPC/TUI acceptance uses synthetic providers, private broker/HOME and
+a privately staged **source adapter** loaded by the installed os bundle; it is
+not proof of operator config or live rollout. Scratch `cct install --os` order
+tests touch only private settings. Final long endurance **passed** at
+`/private/tmp/cct-final-endurance.2u1rJx`: genuine 900s quiet idle, then a two-hour
+periodic/reconnect soak, 102 delivery checks, 15 MCP reconnects, unchanged source
+hashes and clean owned-process/peer cleanup. See
+`.planning/OS_INBOX_WAKE/ENDURANCE.md` for the verified receipts.
+Run `npx tsx test-os-notifications.ts` and
+`node --import tsx test-os-notification-server.ts` for focused gates;
+`python3 test-os-inbox-hardening.py --case esc` (also `order`, `preflight-auth`,
+`handled`, `replacement`, `owner-recovery`) exercises installed scenarios;
+`python3 test-os-inbox-endurance.py --case budgets` (also `consecutive`,
+`pingpong`, `fork`, `reload`, `reconnect`, `locality`, `install`) exercises short
+runtime cases. `--case calibration` is short, **not** long acceptance;
+`--case endurance` runs 900s quiet + 7200s soak, or use owned
+`bash test-os-inbox-endurance-run.sh`. See README for the original wake tests.
 
 Run `npm run test:os-identity` for source identity checks. Installed-runtime
 acceptance requires an installed os launcher and adapter:
@@ -336,7 +431,7 @@ legacy eager schemas. The first synthetic-provider request was **15,100 B** on
 compact versus **20,730 B** on legacy. A compact status response for a
 25-member pool was **456 B** (displaying up to 20 members plus an overflow
 count). These are local synthetic-provider measurements, not external model
-or HTTP wire measurements. `test-integration.sh` now reports 132 checks. PHASE_3
+or HTTP wire measurements. `test-integration.sh` now reports 135 checks, including notification regressions. PHASE_3
 acceptance recorded 14/14 passing rows, including Codex session 15/15, Codex
 identity 8/8, Codex concurrent MCP 9/9, and the isolated os compact-surface,
 installer, extension, packed-package, measurements, and termination checks.

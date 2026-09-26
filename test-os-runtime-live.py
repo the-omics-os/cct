@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Installed-os behavioral acceptance, using a local provider and an isolated broker.
 
-Run CCT_OS_ADAPTER=/absolute/adapter/index.ts python3 test-os-runtime-live.py.
-The selected os launcher must set Q7 in its host environment. The default idle
-interval is 900 seconds; OS_IDLE_SECONDS changes it for calibration only.
+Run CCT_OS_ADAPTER=/absolute/staged/adapter/index.ts python3 test-os-runtime-live.py.
+The test explicitly configures matching os/PI directories and exclusive MCP mode.
+The default idle interval is 900 seconds; OS_IDLE_SECONDS changes it for calibration only.
 This macOS harness preserves evidence under /private/tmp and never queries the
 live CCT database, reads another agent's messages, or calls an external model.
 """
@@ -23,7 +23,7 @@ with socket.socket() as port_probe:
 WORK=Path(tempfile.mkdtemp(prefix="cct-os-live-",dir="/private/tmp"))
 CCT=WORK/"cct";CCT.mkdir()
 URL=f"http://127.0.0.1:{PORT}"
-BASE={"PATH":str(Path(NODE).parent)+":/usr/bin:/bin","CCT_DIR":str(CCT),"CCT_PORT":str(PORT),"CCT_BROKER":URL}
+BASE={"PATH":str(Path(NODE).parent)+":/usr/bin:/bin","CCT_DIR":str(CCT),"CCT_PORT":str(PORT),"CCT_BROKER":URL,"PI_OFFLINE":"1","AWS_EC2_METADATA_DISABLED":"true"}
 sessions=[];checks=[]
 def check(name,condition):
     checks.append({"name":name,"passed":bool(condition),"timestamp":time.time()})
@@ -66,7 +66,7 @@ class Session:
         if variant=="reverse":extensions=[str(ADAPTER),extension,str(ROOT/"probe.ts")]
         (self.agent/"settings.json").write_text(json.dumps({"extensions":extensions,"defaultProvider":"cct-probe","defaultModel":"local","compaction":{"enabled":False},"retry":{"enabled":False}}))
         (self.agent/"mcp.json").write_text(json.dumps({"mcpServers":{"cct":{"command":NODE,"args":["--import",str(REPO/"node_modules/tsx/dist/loader.mjs"),str(REPO/"server.ts")],"env":{"CCT_RUNTIME":"os"},"lifecycle":"keep-alive","directTools":True,"toolPrefix":"none","debug":True}}}))
-        env={**BASE,"HOME":str(self.home),"TMPDIR":str(self.dir),"TERM":"dumb","OS_CODING_AGENT_DIR":str(self.agent),"PROBE_ROOT":str(ROOT),"PROBE_LOG":str(self.log),"PROBE_MARKER":str(self.marker)}
+        env={**BASE,"HOME":str(self.home),"TMPDIR":str(self.dir),"TERM":"dumb","OS_CODING_AGENT_DIR":str(self.agent),"PI_CODING_AGENT_DIR":str(self.agent),"PI_MCP_CONFIG_MODE":"exclusive","PROBE_ROOT":str(ROOT),"PROBE_LOG":str(self.log),"PROBE_MARKER":str(self.marker)}
         self.handles=[self.rpc.open("w"),self.err.open("w")]
         args=[OS_BIN,"--mode","rpc","--provider","cct-probe","--model","local"]
         if resume:args+=["--session",str(resume)]
@@ -112,7 +112,7 @@ try:
     wait(lambda:urllib.request.urlopen(URL+"/health",timeout=1).status==200)
     main=Session("main");peer=main.ready();pid=peer["id"]
     host=next(e for e in map(json.loads,main.log.read_text().splitlines()) if e["kind"]=="host")
-    check("Q7 launcher sets matching adapter/os directories",host["values"]["PI_CODING_AGENT_DIR"]==str(main.agent) and host["values"]["OS_CODING_AGENT_DIR"]==str(main.agent))
+    check("explicit matching adapter/os directories",host["values"]["PI_CODING_AGENT_DIR"]==str(main.agent) and host["values"]["OS_CODING_AGENT_DIR"]==str(main.agent))
     check("row1 runtime/name/cwd",peer["runtime"]=="os" and re.fullmatch(r"os-[a-z0-9]{4}",peer["name"]) and peer["cwd"]==str(main.cwd.resolve()))
     check("row9 strict marker session key",peer["session_key"]=="os:"+main.sid)
     check("row10 cold cache becomes usable in this session","cct_check_messages" in main.log.read_text() and not (main.home/".pi").exists())
@@ -125,10 +125,20 @@ try:
         assert post("/message/send",{"peer_id":recipient["id"],"peer_secret":recipient["secret"],"to_peer_id":pid,"body":"synthetic acceptance message"})["ok"]
         wait(lambda:count(pid)>0)
     incoming()
+    # The real extension sends a custom message to the model; it never rejects
+    # the ordinary tool. This provider observes the notice but does not auto-check.
+    def observations():
+        return [json.loads(line) for line in main.log.read_text().splitlines()] if main.log.exists() else []
+    wait(lambda:any(e.get("kind")=="provider_input" and e.get("noticeCount",0)>0 and
+                    "[CCT peer inbox notice]" in str(e.get("noticeText")) for e in observations()))
+    wait(lambda:any(e.get("kind")=="custom_message" and e.get("customType")=="cct-inbox-notice" for e in observations()))
+    notice_events=[e for e in observations() if e.get("kind")=="custom_message" and e.get("customType")=="cct-inbox-notice"]
+    check("row2 one custom notice for outstanding DM",len(notice_events)==1)
     sentinel=main.cwd/"ordinary-ran"
     result=main.tool("bash",{"command":f"touch '{sentinel}'"})
-    check("row2 unread causes real block with callable tool",result.get("isError") and f"CCT: {count(pid)} unread" in messageText(result) and "cct_check_messages" in messageText(result) and not sentinel.exists())
-    main.tool("cct_check_messages",{})
+    check("row2 model-visible custom notice, unread ordinary tool runs",not result.get("isError") and sentinel.exists() and count(pid)>0)
+    checked=main.tool("cct_check_messages",{})
+    check("row3 checker returns DM body",not checked.get("isError") and "synthetic acceptance message" in messageText(checked))
     check("row3 read clears flag",count(pid)==0)
     result=main.tool("bash",{"command":f"touch '{sentinel}'"})
     check("row4 next ordinary tool runs",not result.get("isError") and sentinel.exists())
@@ -150,7 +160,8 @@ try:
     main.command("/probe-disable-cct")
     result=main.tool("bash",{"command":"true"})
     check("row10 unavailable direct tool fails open without ack",not result.get("isError") and count(pid)>0)
-    main.command("/probe-enable-cct");main.tool("cct_check_messages",{})
+    main.command("/probe-enable-cct");second_check=main.tool("cct_check_messages",{})
+    check("second DM survives deferred-ack read",not second_check.get("isError") and "synthetic acceptance message" in messageText(second_check))
     # Start real wall-clock idle interval now; other cases run independently.
     idleStart=time.monotonic();idleWall=time.time()
     initialCalls=sum(1 for e in map(json.loads,main.log.read_text().splitlines()) if e["kind"]=="tool_call")

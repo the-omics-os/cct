@@ -30,7 +30,8 @@ CCT.mkdir(mode=0o700)
 URL = f"http://127.0.0.1:{PORT}"
 LOADER = str(REPO / "node_modules/tsx/dist/loader.mjs")
 BASE = {"PATH": f"{Path(NODE).parent}:/usr/bin:/bin", "CCT_DIR": str(CCT),
-        "CCT_PORT": str(PORT), "CCT_BROKER": URL}
+        "CCT_PORT": str(PORT), "CCT_BROKER": URL, "PI_OFFLINE": "1",
+        "AWS_EC2_METADATA_DISABLED": "true"}
 sessions, checks = [], []
 
 
@@ -111,7 +112,8 @@ class Session:
             "directTools": True, "toolPrefix": "none", "debug": True,
         }}}))
         env = {**BASE, "HOME": str(self.home), "TMPDIR": str(self.dir), "TERM": "dumb",
-               "OS_CODING_AGENT_DIR": str(self.agent), "PROBE_LOG": str(self.log),
+               "OS_CODING_AGENT_DIR": str(self.agent), "PI_CODING_AGENT_DIR": str(self.agent),
+               "PI_MCP_CONFIG_MODE": "exclusive", "PROBE_LOG": str(self.log),
                "PROBE_ROOT": str(REPO / "test-fixtures/os"), "PROBE_MARKER": str(self.marker),
                "PROBE_LAUNCH_LOG": str(self.launch_log)}
         self.handles = [self.rpc_log.open("w"), (self.dir / "stderr.log").open("w")]

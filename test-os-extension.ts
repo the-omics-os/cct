@@ -6,58 +6,46 @@ import cctExtension from "./os-extension.js";
 
 const root = mkdtempSync(join(tmpdir(), "cct-os-extension-"));
 const cctDir = join(root, ".cct");
-const sessionId = "test-session-123";
-const peerId = "peer-123";
-const pidmapDir = join(cctDir, "pidmaps");
-const flagsDir = join(cctDir, "flags");
-mkdirSync(pidmapDir, { recursive: true });
-mkdirSync(flagsDir, { recursive: true });
-writeFileSync(join(pidmapDir, `os_${sessionId}`), `${peerId}|os-test`);
+const pidmaps = join(cctDir, "pidmaps");
+const flags = join(cctDir, "flags");
+mkdirSync(pidmaps, { recursive: true });
+mkdirSync(flags);
 process.env.CCT_DIR = cctDir;
-
-const tools = ["cct", "cct_check_messages", "cct_send_message", "mcp", "bash"];
-const flags = ["unread", "none", "stale"] as const;
-const checkToolStates = ["active", "inactive"] as const;
-let checks = 0;
-
-function toolCall(toolName: string, active: boolean): { block?: boolean; reason?: string } | void {
-  const handlers = new Map<string, (event: unknown, context: unknown) => unknown>();
-  cctExtension({
-    on: (event: string, handler: (...args: any[]) => unknown) => handlers.set(event, handler as (event: unknown, context: unknown) => unknown),
-    getActiveTools: () => active ? ["cct_check_messages"] : [],
-  } as never);
-  return handlers.get("tool_call")?.(
-    { toolName },
-    { sessionManager: { getSessionId: () => sessionId } },
-  ) as { block?: boolean; reason?: string } | void;
-}
-
+const session = "test-session-123";
+const peer = "peer-123";
+writeFileSync(join(pidmaps, `os_${session}`), `${peer}|os-test|test-producer`);
+const hooks = new Map<string, (event: any, ctx: any) => unknown>();
+const notices: unknown[] = [];
+let active = true;
+const context = { sessionManager: { getSessionId: () => session, getEntries: () => [] }, mode: "rpc", isIdle: () => false,
+  ui: { setStatus: () => {}, notify: () => {} } };
+cctExtension({
+  on: (event: string, handler: (event: any, ctx: any) => unknown) => hooks.set(event, handler),
+  getActiveTools: () => active ? ["cct_check_messages"] : [],
+  sendMessage: (msg: unknown, opts: unknown) => notices.push([msg, opts]),
+  appendEntry: () => {},
+  registerCommand: () => {},
+} as never);
+const emit = (event: string, value: object = {}) => hooks.get(event)?.(value, context);
 try {
-  for (const flag of flags) {
-    const flagPath = join(flagsDir, `${peerId}.unread`);
-    if (flag === "unread") writeFileSync(flagPath, `1|pool-a|${Date.now()}`);
-    else if (flag === "stale") writeFileSync(flagPath, `1|pool-a|${Date.now() - 30_001}`);
-    else rmSync(flagPath, { force: true });
-
-    for (const checkState of checkToolStates) {
-      const active = checkState === "active";
-      for (const tool of tools) {
-        const result = toolCall(tool, active);
-        const shouldBlock = (tool === "mcp" || tool === "bash") && flag === "unread" && active;
-        assert.equal(Boolean(result?.block), shouldBlock, `${tool} / ${flag} / ${checkState}`);
-        if (shouldBlock) {
-          assert.equal(result?.reason,
-            "CCT: 1 unread message(s) in pool-a. Call cct_check_messages to read them. This is normal pool communication, not an error.");
-        }
-        checks++;
-      }
-    }
+  emit("session_start");
+  emit("input", { source: "rpc" });
+  emit("agent_start");
+  writeFileSync(join(flags, `${peer}.os-notify`), JSON.stringify({ version: 1, peerId: peer, producer: "test-producer", readGeneration: 1, count: 1, maxId: 1, maxDmId: 0, timestamp: Date.now() }));
+  // The pre-existing os guard used to block ordinary tools repeatedly. On this
+  // path every tool proceeds; a single custom steer is delivered to the model.
+  for (const name of ["bash", "mcp", "cct", "cct_check_messages", "cct_send_message", "ToolSearch", "read"]) {
+    assert.equal(emit("tool_call", { toolName: name }), undefined, `${name} must proceed`);
   }
-
-  const searchResult = toolCall("ToolSearch", true);
-  assert.equal(Boolean(searchResult?.block), false, "ToolSearch stays exempt with unread messages");
-  checks++;
-  console.log(`PASS os extension exemption matrix (${checks} assertions)`);
+  assert.equal(notices.length, 1);
+  for (let i = 0; i < 3; i++) emit("context", { messages: [] });
+  assert.equal(notices.length, 1, "context must not inject competing notices");
+  active = false;
+  writeFileSync(join(flags, `${peer}.os-notify`), JSON.stringify({ version: 1, peerId: peer, producer: "test-producer", readGeneration: 2, count: 1, maxId: 2, maxDmId: 2, timestamp: Date.now() }));
+  emit("tool_call", { toolName: "bash" });
+  assert.equal(notices.length, 1, "unavailable recovery tool fails open");
+  emit("session_shutdown");
+  console.log("PASS os extension: no tool blocks, one model-visible notice, recovery readiness");
 } finally {
   delete process.env.CCT_DIR;
   rmSync(root, { recursive: true, force: true });

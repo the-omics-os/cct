@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { resolve } from "node:path";
+import { readFileSync } from "node:fs";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { DatabaseSync } from "node:sqlite";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -252,11 +253,42 @@ async function compactIntegration() {
     // Regression (live os test 2026-09-25): a batch returned by check_messages is
     // pending ack until the next check, and status must not report it as unread.
     await post("/message/send", { peer_id: owner.id, peer_secret: owner.secret, to_peer_id: identityPeer.id, body: `status-unread-${start}` });
+    // Server owns atomic os metadata; classify by actual pool_id and msg_type,
+    // never by the display name "DM" or a refreshed flag timestamp.
+    const metaPath = resolve(process.env.CCT_DIR!, "flags", `${identityPeer.id}.os-notify`);
+    const waitMeta = async (predicate: (m: any) => boolean) => {
+      for (let i = 0; i < 50; i++) {
+        try {
+          const m = JSON.parse(readFileSync(metaPath, "utf8"));
+          if (predicate(m)) return m;
+        } catch {}
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      throw new Error("Timed out waiting for os metadata");
+    };
+    const firstMeta = await waitMeta((m) => m.count === 1 && m.maxDmId > 0);
+    assert.equal(firstMeta.peerId, identityPeer.id);
+    assert.equal(firstMeta.localBroker, true, "resolved private loopback broker is local");
+    assert.match(firstMeta.producer, /^\d+-[\w-]+$/);
+    assert.equal(firstMeta.readGeneration, 1, "initial empty check advanced successful-read generation");
     assert.match(await call({ action: "status" }), /\nunread: 1\nunread by pool: DM:1$/);
     const readBatch = await client.callTool({ name: "cct_check_messages", arguments: {} }) as any;
     assert.match(readBatch.content?.[0]?.text ?? "", new RegExp(`status-unread-${start}`));
+    const afterCheckMeta = await waitMeta((m) => m.readGeneration === firstMeta.readGeneration + 1 && m.count === 0);
+    assert.equal(afterCheckMeta.maxDmId, 0);
+    await post("/message/send", { peer_id: owner.id, peer_secret: owner.secret, to_peer_id: identityPeer.id, body: `next-dm-${start}` });
+    const secondMeta = await waitMeta((m) => m.readGeneration === afterCheckMeta.readGeneration && m.count === 1 && m.maxDmId > firstMeta.maxDmId);
+    assert.equal(secondMeta.producer, firstMeta.producer);
+    const secondRead = await client.callTool({ name: "cct_check_messages", arguments: {} }) as any;
+    assert.match(secondRead.content?.[0]?.text ?? "", new RegExp(`next-dm-${start}`));
     const afterRead = await call({ action: "status" });
     assert.match(afterRead, /\nunread: 0$/, `status after check must exclude the pending-ack batch: ${afterRead}`);
+    await call({ action: "create", pool: "DM", purpose: "pool-name collision control" });
+    await call({ action: "invite", pool: "DM", peer: owner.name });
+    await post("/message/send", { peer_id: owner.id, peer_secret: owner.secret, pool_name: "DM", body: `named-dm-pool-${start}` });
+    const namedPool = await waitMeta((m) => m.count >= 1 && m.maxId > secondMeta.maxId);
+    assert.equal(namedPool.maxDmId, 0, "a pool literally named DM is not a chat DM");
+    await client.callTool({ name: "cct_check_messages", arguments: {} });
     const sent = `compact-message-${start}`;
     const sendText = await call({ action: "send", to: `@${pool}`, message: sent });
     assert.match(sendText, /Sent to pool/);

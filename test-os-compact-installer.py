@@ -50,7 +50,7 @@ try:
     assert cct["toolPrefix"] == "none"
     assert first_mcp["mcpServers"]["other"] == mcp["mcpServers"]["other"]
     assert first_mcp["settings"] == mcp["settings"]
-    assert first_settings["extensions"] == settings["extensions"] + [str(REPO / "os-extension.ts")]
+    assert first_settings["extensions"] == [str(REPO / "os-extension.ts"), *settings["extensions"]]
     assert first_settings["unrelated"] is True
     saved = {path: path.read_bytes() for path in [settings_path, mcp_path, settings_path.with_suffix(".json.bak"),
                                                 mcp_path.with_suffix(".json.bak")]}

@@ -4,13 +4,22 @@ set -euo pipefail
 # CCT Integration Test Suite
 # Tests broker endpoints, hook performance, and security properties.
 
-BROKER_PORT=17888
+# Refuse occupied ports; never kill a process just because it owns a test port.
+BROKER_PORT=$(python3 - "${CCT_TEST_PORT:-17888}" <<'PORT_PROBE'
+import socket, sys
+with socket.socket() as probe:
+    probe.bind(("127.0.0.1", int(sys.argv[1])))
+    print(probe.getsockname()[1])
+PORT_PROBE
+)
 BROKER_URL="http://127.0.0.1:${BROKER_PORT}"
 CCT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/cct-test.XXXXXX")
 HOOK_SH="$(cd "$(dirname "$0")" && pwd)/hook.sh"
 BROKER_TS="$(cd "$(dirname "$0")" && pwd)/broker.ts"
 
 export CCT_PORT="$BROKER_PORT"
+export CCT_BROKER="$BROKER_URL"
+export CCT_HOST="127.0.0.1"
 export CCT_DIR
 
 PASSED=0
@@ -82,8 +91,7 @@ cleanup() {
     kill "$BROKER_PID" 2>/dev/null || true
     wait "$BROKER_PID" 2>/dev/null || true
   fi
-  # Kill test broker on the isolated port (never the live broker)
-  lsof -ti :$BROKER_PORT 2>/dev/null | xargs kill 2>/dev/null || true
+  # Only owned child PIDs are terminated; never scan/kill by port.
   rm -rf "$CCT_DIR"
   echo "Cleanup complete."
 }
@@ -105,20 +113,27 @@ else
   fail "compact-surface unit tests"
 fi
 
+# Notification tests include their own private broker/MCP subprocesses.
+for test in test-os-extension.ts test-os-notifications.ts test-os-notification-server.ts; do
+  NOTIFY_HOME=$(mktemp -d "$CCT_DIR/os-notify.XXXXXX")
+  if HOME="$NOTIFY_HOME" CCT_DIR="$NOTIFY_HOME/.cct" node --import "$(dirname "$BROKER_TS")/node_modules/tsx/dist/loader.mjs" "$(dirname "$BROKER_TS")/$test"; then
+    pass "$test"
+  else
+    fail "$test"
+  fi
+done
+
 # --- Start broker ---
 
 echo ""
 echo "=== Starting broker ==="
 
-# Kill any leftover test broker on the isolated port
-lsof -ti :$BROKER_PORT 2>/dev/null | xargs kill 2>/dev/null || true
-sleep 0.3
-
 mkdir -p "$CCT_DIR"
 
-CCT_TOKEN="" CCT_PORT="$BROKER_PORT" CCT_DIR="$CCT_DIR" npx tsx "$BROKER_TS" &
+CCT_TOKEN="" CCT_PORT="$BROKER_PORT" CCT_DIR="$CCT_DIR" node --import "$(dirname "$BROKER_TS")/node_modules/tsx/dist/loader.mjs" "$BROKER_TS" &
 BROKER_PID=$!
 sleep 1
+kill -0 "$BROKER_PID" # Fail before requests if our broker did not start.
 
 # Verify broker is up
 HEALTH=$(curl -s "$BROKER_URL/health")

@@ -16,6 +16,7 @@ export default function (pi: any) {
   pi.on("session_shutdown",()=>{timers.forEach(clearTimeout);log("session_shutdown");});
   pi.on("tool_call",(event:any)=>{log("tool_call",{toolName:event.toolName});});
   pi.on("tool_result",(event:any)=>{log("tool_result",{toolName:event.toolName,isError:event.isError});});
+  pi.on("message_end",(event:any)=>{if(event.message.role==="custom")log("custom_message",{customType:event.message.customType,content:event.message.content});});
   pi.registerCommand("probe-tools",{description:"Record synthetic tool inventory",handler:async()=>tools("command")});
   let savedTools: string[] = [];
   pi.registerCommand("probe-disable-cct",{description:"Temporarily hide direct CCT tools",handler:async()=>{savedTools=pi.getActiveTools();pi.setActiveTools(savedTools.filter((n:string)=>n !== "cct" && !n.startsWith("cct_")));}});
@@ -25,7 +26,13 @@ export default function (pi: any) {
     models:[{id:"local",name:"Local synthetic probe",reasoning:false,input:["text"],cost:{input:0,output:0,cacheRead:0,cacheWrite:0},contextWindow:100000,maxTokens:1000}],
     streamSimple(model:any,context:any) {
       const providerContextBytes = Buffer.byteLength(JSON.stringify({messages:context.messages}));
-      log("provider_input", {providerContextBytes});
+      const notices = context.messages.filter((m:any)=>{
+        const value=typeof m.content==="string"?m.content:m.content?.filter((c:any)=>c.type==="text").map((c:any)=>c.text).join("\n") ?? "";
+        return value.includes("[CCT peer inbox notice]");
+      });
+      const lastNotice=notices.at(-1);
+      const noticeText=typeof lastNotice?.content==="string"?lastNotice.content:lastNotice?.content?.filter((c:any)=>c.type==="text").map((c:any)=>c.text).join("\n") ?? null;
+      log("provider_input", {providerContextBytes,noticeCount:notices.length,noticeText});
       const stream = createAssistantMessageEventStream();
       const last = context.messages.at(-1);
       const text = typeof last?.content === "string" ? last.content : last?.content?.filter((c:any)=>c.type==="text").map((c:any)=>c.text).join("") ?? "";

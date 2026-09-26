@@ -43,17 +43,27 @@ try:
     first_settings = json.loads(settings_path.read_text())
     first_mcp = json.loads(mcp_path.read_text())
     assert first_mcp["mcpServers"]["cct"]["lifecycle"] == "keep-alive", first_mcp["mcpServers"]["cct"]["lifecycle"]
-    assert first_mcp["mcpServers"]["cct"]["env"] == {"PRESERVE_ME": "synthetic", "CCT_RUNTIME": "os"}
+    assert first_mcp["mcpServers"]["cct"]["env"] == {"PRESERVE_ME": "synthetic", "CCT_RUNTIME": "os", "CCT_TOOL_SURFACE": "compact"}
     assert first_mcp["mcpServers"]["other"] == mcp["mcpServers"]["other"]
     assert first_mcp["settings"] == mcp["settings"]
-    assert first_settings["extensions"] == settings["extensions"] + [str(REPO / "os-extension.ts")]
+    assert first_settings["extensions"] == [str(REPO / "os-extension.ts"), *settings["extensions"]]
     assert first_settings["unrelated"] is True
     saved = {path: path.read_bytes() for path in [settings_path, mcp_path, settings_path.with_suffix(".json.bak"),
                                                 mcp_path.with_suffix(".json.bak")]}
     install()
     assert all(path.read_bytes() == value for path, value in saved.items())
+    # Reinstall an older adapter-first layout with duplicate canonical references.
+    # Moving CCT must not disturb the relative order of other extensions.
+    settings_path.write_text(json.dumps({**settings, "extensions": [
+        settings["extensions"][0], str(REPO / "os-extension.ts"),
+        settings["extensions"][1], str(REPO / "os-extension.ts")]}))
+    install()
+    assert json.loads(settings_path.read_text())["extensions"] == first_settings["extensions"]
+    migrated = settings_path.read_bytes()
+    install()
+    assert settings_path.read_bytes() == migrated
     assert all(Path(path).read_bytes() == value for path, value in before.items())
     assert not (HOME_DIR / ".pi").exists()
-    print("PASS automatic startup, env/config preservation, extension order, byte-idempotent reinstall, client isolation")
+    print("PASS automatic startup, env/config preservation, CCT-first order/migration, byte-idempotent reinstall, client isolation")
 finally:
     print("EVIDENCE " + str(WORK))

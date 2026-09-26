@@ -926,7 +926,10 @@ function installOs(): void {
     },
   };
   const extensions: unknown[] = settings.extensions ?? [];
-  if (!extensions.includes(OS_EXTENSION_PATH)) settings.extensions = [...extensions, OS_EXTENSION_PATH];
+  // os invokes input handlers in extension load order. Reserve human prompts
+  // before explicitly configured async handlers (notably pi-mcp-adapter).
+  // Only move our canonical entry; retain the relative order of every other entry.
+  settings.extensions = [OS_EXTENSION_PATH, ...extensions.filter((entry) => entry !== OS_EXTENSION_PATH)];
   writeOsJsonIfChanged(paths.mcp, mcp);
   writeOsJsonIfChanged(paths.settings, settings);
   console.log("CCT installed for os (global). Restart os to activate.");
