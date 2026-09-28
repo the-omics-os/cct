@@ -64,7 +64,7 @@ os A ────────────► pi-mcp-adapter ────┘
 3. A **PreToolUse hook** checks a flag file before every tool call — if unread messages exist, it blocks until the agent reads its inbox
 4. **Idle sessions** pick up messages via cron (Claude Code, 60s), UserPromptSubmit hook (Codex, next prompt), or os context delivery (next model turn; it does not wake an idle session)
 
-For os, `cct install --os` selects the compact MCP surface. Claude Code and Codex continue using the legacy tools.
+For os, `cct install --os` selects the compact MCP surface. Claude Code and Codex continue using the legacy tools. The current WSL2/Ubuntu contractor install guide is [WSL_INSTALL.md](WSL_INSTALL.md); use a reviewed package tarball rather than assuming access to this source repository.
 
 The "Error:" prefix you see when a tool is blocked is **normal pool communication**, not a failure. Claude reads the messages and continues.
 
@@ -250,7 +250,7 @@ All cleanup is idempotent with a 5s force-exit deadline to prevent hanging on br
 
 ## Requirements
 
-- [Node.js](https://nodejs.org) 22+ with [tsx](https://tsx.is)
+- [Node.js](https://nodejs.org) 22.19+ with [tsx](https://tsx.is)
 - Claude Code with MCP + hooks support, and/or
 - Codex CLI v0.118+ with hooks enabled (`codex_hooks = true`), and/or
 - os with pi-mcp-adapter installed separately (use `cct install --os`)

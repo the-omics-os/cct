@@ -4,7 +4,7 @@
 Run CCT_OS_ADAPTER=/absolute/adapter/index.ts python3 test-os-runtime-live.py.
 The selected os launcher must set Q7 in its host environment. The default idle
 interval is 900 seconds; OS_IDLE_SECONDS changes it for calibration only.
-This macOS harness preserves evidence under /private/tmp and never queries the
+This harness preserves evidence in the platform's temporary directory and never queries the
 live CCT database, reads another agent's messages, or calls an external model.
 """
 from pathlib import Path
@@ -20,7 +20,7 @@ PORT=int(os.environ.get("CCT_OS_TEST_PORT", "17893"))
 import socket
 with socket.socket() as port_probe:
     port_probe.bind(("127.0.0.1", PORT))
-WORK=Path(tempfile.mkdtemp(prefix="cct-os-live-",dir="/private/tmp"))
+WORK=Path(tempfile.mkdtemp(prefix="cct-os-live-"))
 CCT=WORK/"cct";CCT.mkdir()
 URL=f"http://127.0.0.1:{PORT}"
 BASE={"PATH":str(Path(NODE).parent)+":/usr/bin:/bin","CCT_DIR":str(CCT),"CCT_PORT":str(PORT),"CCT_BROKER":URL}

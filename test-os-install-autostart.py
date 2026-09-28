@@ -9,7 +9,7 @@ import tempfile
 
 REPO = Path(__file__).resolve().parent
 NODE = shutil.which("node")
-WORK = Path(tempfile.mkdtemp(prefix="cct-install-autostart-", dir="/private/tmp"))
+WORK = Path(tempfile.mkdtemp(prefix="cct-install-autostart-"))
 HOME_DIR = WORK / "home"
 AGENT = HOME_DIR / ".os/agent"
 AGENT.mkdir(parents=True)
@@ -43,7 +43,9 @@ try:
     first_settings = json.loads(settings_path.read_text())
     first_mcp = json.loads(mcp_path.read_text())
     assert first_mcp["mcpServers"]["cct"]["lifecycle"] == "keep-alive", first_mcp["mcpServers"]["cct"]["lifecycle"]
-    assert first_mcp["mcpServers"]["cct"]["env"] == {"PRESERVE_ME": "synthetic", "CCT_RUNTIME": "os"}
+    assert first_mcp["mcpServers"]["cct"]["env"] == {"PRESERVE_ME": "synthetic", "CCT_RUNTIME": "os", "CCT_TOOL_SURFACE": "compact"}
+    assert first_mcp["mcpServers"]["cct"]["directTools"] is True
+    assert first_mcp["mcpServers"]["cct"]["toolPrefix"] == "none"
     assert first_mcp["mcpServers"]["other"] == mcp["mcpServers"]["other"]
     assert first_mcp["settings"] == mcp["settings"]
     assert first_settings["extensions"] == settings["extensions"] + [str(REPO / "os-extension.ts")]

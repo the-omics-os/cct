@@ -9,7 +9,7 @@ import tempfile
 
 REPO = Path(__file__).resolve().parent
 NODE = shutil.which("node")
-WORK = Path(tempfile.mkdtemp(prefix="cct-compact-install-", dir="/private/tmp"))
+WORK = Path(tempfile.mkdtemp(prefix="cct-compact-install-"))
 HOME_DIR = WORK / "home"
 AGENT = HOME_DIR / ".os/agent"
 AGENT.mkdir(parents=True)
@@ -48,6 +48,9 @@ try:
     assert cct["lifecycle"] == "keep-alive", cct["lifecycle"]
     assert cct["directTools"] is True
     assert cct["toolPrefix"] == "none"
+    assert Path(cct["command"]).resolve() == Path(NODE).resolve()
+    assert Path(cct["args"][0]).is_file() and Path(cct["args"][0]).name == "cli.mjs"
+    assert Path(cct["args"][1]) == REPO / "server.ts"
     assert first_mcp["mcpServers"]["other"] == mcp["mcpServers"]["other"]
     assert first_mcp["settings"] == mcp["settings"]
     assert first_settings["extensions"] == settings["extensions"] + [str(REPO / "os-extension.ts")]

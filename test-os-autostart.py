@@ -24,7 +24,7 @@ FOOTER = Path(os.environ.get("CCT_OS_FOOTER", str(Path.home() / ".os/extensions/
 PORT = int(os.environ.get("CCT_OS_TEST_PORT", "17934"))
 with socket.socket() as probe:
     probe.bind(("127.0.0.1", PORT))
-WORK = Path(tempfile.mkdtemp(prefix="cct-autostart-", dir="/private/tmp"))
+WORK = Path(tempfile.mkdtemp(prefix="cct-autostart-"))
 CCT = WORK / "cct"
 CCT.mkdir(mode=0o700)
 URL = f"http://127.0.0.1:{PORT}"

@@ -9,7 +9,7 @@ ADAPTER=Path(os.environ.get('CCT_OS_ADAPTER','')).expanduser().resolve()
 assert NODE and OS_BIN and ADAPTER.is_file(), 'installed os, node, and CCT_OS_ADAPTER are required'
 PORT=int(os.environ.get('CCT_OS_TEST_PORT','17896'))
 with socket.socket() as s:s.bind(('127.0.0.1',PORT))
-WORK=Path(tempfile.mkdtemp(prefix="cct-os-compact-",dir="/private/tmp")); CCT=WORK/'cct'; CCT.mkdir()
+WORK=Path(tempfile.mkdtemp(prefix="cct-os-compact-")); CCT=WORK/'cct'; CCT.mkdir()
 EVIDENCE_DIR=REPO/'.planning/COMPACT_TOOLS/codex/evidence'; EVIDENCE_DIR.mkdir(parents=True,exist_ok=True)
 URL=f'http://127.0.0.1:{PORT}'; BASE={'PATH':str(Path(NODE).parent)+':/usr/bin:/bin','CCT_DIR':str(CCT),'CCT_PORT':str(PORT),'CCT_BROKER':URL}
 checks=[];sessions=[]
