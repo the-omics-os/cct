@@ -66,7 +66,7 @@ export interface BrokerResponse<T = unknown> {
 export interface RegisterRequest {
   pid: number;
   pid_start: string;
-  runtime?: "claude" | "codex" | "os";
+  runtime?: "claude" | "codex" | "os" | "opencode";
   session_key?: string;
   host_pid?: number;
   host_pid_start?: string;

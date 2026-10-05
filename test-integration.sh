@@ -1063,6 +1063,60 @@ rm -f "$CCT_DIR/pidmaps/${$}_"* 2>/dev/null || true
 HOOK_OUT=$(echo '{"tool_name":"Bash"}' | bash "$HOOK_SH" 2>/dev/null || true)
 check "Hook exits clean for non-pool session" "" "$HOOK_OUT"
 
+# --- opencode runtime rows (broker-level; the plugin's own semantics ---
+#     are covered by test-opencode-identity.ts) ---
+
+echo ""
+echo "=== opencode runtime (runtime=opencode) ==="
+
+sleep 300 &
+SLEEP_PIDS+=($!)
+OC_PID_1=$!
+sleep 300 &
+SLEEP_PIDS+=($!)
+OC_PID_2=$!
+OC_PIDSTART_1=$(date +%s)
+OC_PIDSTART_2=$(date +%s)
+
+OC_REG_1=$(post "/register" "{\"pid\":$OC_PID_1,\"pid_start\":\"$OC_PIDSTART_1\",\"runtime\":\"opencode\",\"session_key\":\"opencode:integration-1\",\"host_pid\":$OC_PID_1,\"host_pid_start\":\"$OC_PIDSTART_1\",\"cwd\":\"/tmp/opencode\",\"name\":\"oc-first\",\"name_is_explicit\":true}")
+OC_ID_1=$(json_field "$OC_REG_1" "['data']['id']")
+OC_SECRET_1=$(json_field "$OC_REG_1" "['data']['secret']")
+check "opencode first registration name" "oc-first" "$(json_field "$OC_REG_1" "['data']['name']")"
+
+# Same-directory second instance -> same (runtime, session_key) row: same id
+# and secret, one more live connection (D11b directory-keyed identity).
+OC_REG_2=$(post "/register" "{\"pid\":$OC_PID_2,\"pid_start\":\"$OC_PIDSTART_2\",\"runtime\":\"opencode\",\"session_key\":\"opencode:integration-1\",\"host_pid\":$OC_PID_2,\"host_pid_start\":\"$OC_PIDSTART_2\",\"cwd\":\"/tmp/opencode\",\"name\":\"oc-second\",\"name_is_explicit\":false}")
+check "opencode same-directory duplicate keeps same peer id" "$OC_ID_1" "$(json_field "$OC_REG_2" "['data']['id']")"
+check "opencode same-directory duplicate keeps same secret" "$OC_SECRET_1" "$(json_field "$OC_REG_2" "['data']['secret']")"
+check "opencode non-explicit duplicate does not rename peer" "oc-first" "$(json_field "$OC_REG_2" "['data']['name']")"
+
+# Peer-authenticated pool create (creator auto-joins).
+OC_POOL=$(post "/pool/create" "{\"peer_id\":\"$OC_ID_1\",\"peer_secret\":\"$OC_SECRET_1\",\"name\":\"opencode-int-pool\",\"purpose\":\"integration\"}")
+check_contains "opencode peer creates pool" "\"ok\":true" "$OC_POOL"
+
+# Partial unregister: one live connection remains, peer stays active.
+OC_UNREG_1=$(post "/unregister" "{\"peer_id\":\"$OC_ID_1\",\"peer_secret\":\"$OC_SECRET_1\",\"pid\":$OC_PID_1,\"pid_start\":\"$OC_PIDSTART_1\"}")
+check_contains "opencode partial unregister acknowledged" "\"unregistered\":false" "$OC_UNREG_1"
+check "opencode partial unregister leaves 1 connection" "1" "$(json_field "$OC_UNREG_1" "['data']['connections_remaining']")"
+
+# Final unregister retires the peer; death drops pool memberships.
+OC_UNREG_2=$(post "/unregister" "{\"peer_id\":\"$OC_ID_1\",\"peer_secret\":\"$OC_SECRET_1\",\"pid\":$OC_PID_2,\"pid_start\":\"$OC_PIDSTART_2\"}")
+check_contains "opencode final unregister retires peer" "\"unregistered\":true" "$OC_UNREG_2"
+
+# Revive: same session_key after death -> same id and the dropped pool
+# membership is restored (ARCHITECTURE D11b pairing).
+OC_REG_3=$(post "/register" "{\"pid\":$OC_PID_1,\"pid_start\":\"$OC_PIDSTART_1\",\"runtime\":\"opencode\",\"session_key\":\"opencode:integration-1\",\"host_pid\":$OC_PID_1,\"host_pid_start\":\"$OC_PIDSTART_1\",\"cwd\":\"/tmp/opencode\",\"name\":\"oc-third\",\"name_is_explicit\":true}")
+check "opencode revive reuses same peer id" "$OC_ID_1" "$(json_field "$OC_REG_3" "['data']['id']")"
+check "opencode explicit rename on revive" "oc-third" "$(json_field "$OC_REG_3" "['data']['name']")"
+OC_POOL_STATUS=$(post "/pool/status" "{\"pool_name\":\"opencode-int-pool\"}")
+check_contains "opencode revive restores pool membership" "\"peer_id\":\"$OC_ID_1\"" "$OC_POOL_STATUS"
+
+OC_HB=$(post "/heartbeat" "{\"peer_id\":\"$OC_ID_1\",\"peer_secret\":\"$OC_SECRET_1\",\"pid\":$OC_PID_1,\"pid_start\":\"$OC_PIDSTART_1\"}")
+check_contains "opencode revived peer heartbeats OK" "\"acknowledged\":true" "$OC_HB"
+
+# Retire the revived peer so later sections start from a clean broker.
+post "/unregister" "{\"peer_id\":\"$OC_ID_1\",\"peer_secret\":\"$OC_SECRET_1\",\"pid\":$OC_PID_1,\"pid_start\":\"$OC_PIDSTART_1\"}" > /dev/null
+
 # --- Results ---
 
 echo ""
