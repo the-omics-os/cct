@@ -1,5 +1,5 @@
 #!/usr/bin/env tsx
-import { existsSync, readFileSync, writeFileSync, chmodSync, mkdirSync, copyFileSync, readdirSync, realpathSync, lstatSync, readlinkSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, chmodSync, mkdirSync, copyFileSync, readdirSync, realpathSync, lstatSync, readlinkSync, unlinkSync } from "node:fs";
 import { join, dirname, resolve, basename, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
@@ -14,6 +14,16 @@ import {
   CONFIG_PATH,
   PIDMAP_DIR,
 } from "./shared/constants.ts";
+import {
+  isKnownOsAdapterEntry,
+  isOwnedOsExtension,
+  osAdapterConfigPath,
+  readOsAdapterConfig,
+  resolveOsAgentDir,
+  validateOsAdapterConfig,
+  verifyOsAdapterEntry,
+  type OsAdapterConfig,
+} from "./shared/os-adapter-config.ts";
 import type {
   BrokerResponse,
   HealthResponse,
@@ -34,6 +44,13 @@ const GLOBAL_CLAUDE_JSON = join(homedir(), ".claude.json");
 const GLOBAL_CLAUDE_SETTINGS = join(homedir(), ".claude", "settings.json");
 const CODEX_CONFIG_PATH = join(homedir(), ".codex", "config.toml");
 const OS_EXTENSION_PATH = join(CCT_DIR, "os-extension.ts");
+const OS_MCP_EXTENSION_PATH = join(CCT_DIR, "os-mcp-extension.ts");
+// The prototype must never run alongside the canonical body-delivery extension.
+const OS_PROTOTYPE_EXTENSION_PATH = join(CCT_DIR, "os-inbox-extension.ts");
+
+function isCctOsExtension(entry: unknown): boolean {
+  return isOwnedOsExtension(entry, OS_EXTENSION_PATH) || isOwnedOsExtension(entry, OS_PROTOTYPE_EXTENSION_PATH);
+}
 
 function resolveTargetPaths(projectMode: boolean): { claudeJson: string; claudeSettings: string } {
   if (!projectMode) return { claudeJson: GLOBAL_CLAUDE_JSON, claudeSettings: GLOBAL_CLAUDE_SETTINGS };
@@ -816,17 +833,6 @@ function resolveAdapterAgentDir(): string {
   return resolve(configured);
 }
 
-function resolveOsAgentDir(): string {
-  // os/src/config.ts:516,519-521,532-537 and src/utils/paths.ts:77-103.
-  // Keep local until PHASE_1's shared directory constant is available.
-  const configured = process.env.OS_CODING_AGENT_DIR;
-  if (!configured) return join(homedir(), ".os", "agent");
-  if (configured === "~") return homedir();
-  if (configured.startsWith("~/")) return resolve(homedir(), configured.slice(2));
-  if (configured.startsWith("file://")) return fileURLToPath(configured);
-  return resolve(configured);
-}
-
 function canonicalWritePath(path: string, depth = 0): string {
   if (depth > 64) die(`Cannot safely resolve config path: ${path}`);
   const absolute = resolve(path);
@@ -861,16 +867,18 @@ function assertOsWritePaths(paths: string[]): void {
   }
 }
 
-function osConfigPaths(): { settings: string; mcp: string } {
+function osConfigPaths(): { settings: string; mcp: string; adapter: string } {
   const settings = join(resolveOsAgentDir(), "settings.json");
+  const adapter = osAdapterConfigPath();
   const adapterDir = resolveAdapterAgentDir();
   const mcp = join(adapterDir, "mcp.json");
   console.log(`os settings: ${settings}`);
   console.log(`os adapter config: ${mcp}`);
   console.log(`os adapter state (cache/onboarding): ${adapterDir}`);
-  // Check all write and backup destinations before reading or changing configs.
-  assertOsWritePaths([settings, settings + ".bak", mcp, mcp + ".bak"]);
-  return { settings, mcp };
+  console.log(`CCT adapter wrapper state: ${adapter}`);
+  // Include owned wrapper state and every backup, resolving dangling symlinks too.
+  assertOsWritePaths([settings, settings + ".bak", mcp, mcp + ".bak", adapter, adapter + ".bak"]);
+  return { settings, mcp, adapter };
 }
 
 function readOsJson(path: string): Record<string, any> {
@@ -901,15 +909,100 @@ function writeOsJsonIfChanged(path: string, value: Record<string, any>): void {
   writeFileSync(path, next, { mode: 0o600 });
 }
 
+function osAdapterPreflight(settings: Record<string, any>, installing: boolean): {
+  extensions: unknown[];
+  config?: OsAdapterConfig;
+  saved?: OsAdapterConfig;
+} {
+  try {
+    // lstat also detects a dangling state symlink: never overwrite malformed state.
+    let saved: OsAdapterConfig | undefined;
+    try {
+      lstatSync(osAdapterConfigPath());
+      saved = readOsAdapterConfig();
+    } catch (error: any) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    const extensions: unknown[] = settings.extensions ?? [];
+    // Replacing a global explicit entry must not leave a known auto-discovered
+    // original/wrapper running too. Do not mutate third-party autoextension files
+    // or attempt to reinterpret their manifests/override filters.
+    const autoDir = join(resolveOsAgentDir(), "extensions");
+    if (existsSync(autoDir)) {
+      const candidates = [autoDir, ...readdirSync(autoDir, { withFileTypes: true })
+        .filter((entry) => !entry.name.startsWith(".") && entry.name !== "node_modules"
+          && (entry.isDirectory() || entry.isSymbolicLink() || /\.(ts|js)$/.test(entry.name)))
+        .map((entry) => join(autoDir, entry.name))];
+      if (candidates.some((entry) => isKnownOsAdapterEntry(entry) || isOwnedOsExtension(entry, OS_MCP_EXTENSION_PATH))) {
+        throw new Error("Known adapter/wrapper activation in global autoextensions is unsupported; use one explicit entry outside extensions/");
+      }
+    }
+    const packages: unknown[] = Array.isArray(settings.packages) ? settings.packages : [settings.packages];
+    for (const entry of packages) {
+      const source = typeof entry === "string" ? entry : (entry as any)?.source;
+      if (typeof source === "string" && (isKnownOsAdapterEntry(source) || isOwnedOsExtension(source, OS_MCP_EXTENSION_PATH))) {
+        throw new Error("pi-mcp-adapter/wrapper activation via settings.packages is unsupported; use one explicit global index.ts/directory entry");
+      }
+    }
+    const wrappers: number[] = [];
+    const adapters: { index: number; config: OsAdapterConfig }[] = [];
+    extensions.forEach((entry, index) => {
+      if (isOwnedOsExtension(entry, OS_MCP_EXTENSION_PATH)) {
+        wrappers.push(index);
+        return;
+      }
+      const source = typeof entry === "string" ? entry : (entry as any)?.path ?? (entry as any)?.source;
+      if (typeof source === "string" && isOwnedOsExtension(source, OS_MCP_EXTENSION_PATH)) {
+        throw new Error("CCT adapter wrapper requires a string global file entry");
+      }
+      if (typeof source !== "string" || !isKnownOsAdapterEntry(source)) return;
+      if (typeof entry !== "string") throw new Error("pi-mcp-adapter requires a string global file/directory entry");
+      adapters.push({ index, config: { version: 1, adapterEntry: entry, adapterPath: verifyOsAdapterEntry(entry) } });
+    });
+    if (wrappers.length > 1 || adapters.length > 1 || (wrappers.length && adapters.length)) {
+      throw new Error("Ambiguous pi-mcp-adapter activation: duplicate wrapper/original entries; enable exactly one");
+    }
+    if (wrappers.length && !saved) throw new Error("CCT adapter wrapper is present but cct-adapter.json is missing; restore its original entry before retrying");
+    if (saved && adapters.length && (saved.adapterEntry !== adapters[0].config.adapterEntry
+        || saved.adapterPath !== adapters[0].config.adapterPath)) {
+      throw new Error("Saved CCT adapter state conflicts with the explicit original entry");
+    }
+    if (installing && saved && !wrappers.length && !adapters.length) {
+      throw new Error("Saved CCT adapter state has no matching wrapper/original entry; restore the original before retrying");
+    }
+    const config = saved ?? adapters[0]?.config;
+    const next = [...extensions];
+    if (wrappers.length) next[wrappers[0]] = installing ? OS_MCP_EXTENSION_PATH : saved!.adapterEntry;
+    else if (installing && adapters.length) next[adapters[0].index] = OS_MCP_EXTENSION_PATH;
+    // Only CCT-owned entries are de-duplicated; unfamiliar duplicate entries survive.
+    const other = next.filter((entry) => !isCctOsExtension(entry));
+    return { extensions: installing ? [OS_EXTENSION_PATH, ...other] : other, config, saved };
+  } catch (error: any) {
+    die(`Cannot configure CCT os adapter wrapper: ${error.message}; no os configs changed.`);
+  }
+}
+
+function removeOsAdapterState(path: string, saved: OsAdapterConfig): void {
+  // Do not delete an unrelated/stale backup. A backup is owned only if it validates
+  // and records this exact original; unlinking a symlink never deletes its target.
+  const backup = path + ".bak";
+  try {
+    const previous = validateOsAdapterConfig(JSON.parse(readFileSync(backup, "utf8")));
+    if (previous.adapterEntry === saved.adapterEntry && previous.adapterPath === saved.adapterPath) unlinkSync(backup);
+  } catch {}
+  unlinkSync(path);
+}
+
 function installOs(): void {
   const paths = osConfigPaths();
   if (!findOsPackage()) die("Cannot verify an installed @the-omics-os/os package for the os executable; no os configs changed.");
   const { settings, mcp } = readOsConfigs(paths);
+  const adapter = osAdapterPreflight(settings, true);
   const cfg = readJsonFile(CONFIG_PATH);
   const tsx = createRequire(import.meta.url).resolve("tsx/cli");
   if (!existsSync(tsx)) die(`Missing CCT dependency: ${tsx}; install CCT dependencies before configuring os.`);
   const previous = mcp.mcpServers?.cct;
-  const env: Record<string, string> = { ...previous?.env, CCT_RUNTIME: "os", CCT_TOOL_SURFACE: "compact" };
+  const env: Record<string, string> = { ...previous?.env, CCT_RUNTIME: "os", CCT_TOOL_SURFACE: "compact", CCT_OS_INBOX_BODY: "1" };
   const broker = process.env.CCT_BROKER ?? cfg.broker;
   const token = process.env.CCT_TOKEN ?? cfg.token;
   if (broker) env.CCT_BROKER = broker;
@@ -926,14 +1019,15 @@ function installOs(): void {
       toolPrefix: "none",
     },
   };
-  const extensions: unknown[] = settings.extensions ?? [];
-  // os invokes input handlers in extension load order. Reserve human prompts
-  // before explicitly configured async handlers (notably pi-mcp-adapter).
-  // Only move our canonical entry; retain the relative order of every other entry.
-  settings.extensions = [OS_EXTENSION_PATH, ...extensions.filter((entry) => entry !== OS_EXTENSION_PATH)];
+  // Reserve human prompts before async handlers. The wrapper replaces the adapter
+  // at its existing slot; no third-party file or unrelated extension is modified.
+  settings.extensions = adapter.extensions;
+  if (adapter.config && !adapter.saved) writeOsJsonIfChanged(paths.adapter, adapter.config);
   writeOsJsonIfChanged(paths.mcp, mcp);
   writeOsJsonIfChanged(paths.settings, settings);
   console.log("CCT installed for os (global). Restart os to activate.");
+  if (adapter.config) console.log("CCT outgoing wrapper enabled for the verified pi-mcp-adapter@2.33.0 original; uninstall --os restores its exact entry.");
+  else console.log("Missing CCT outgoing wrapper capability: no identifiable explicit global pi-mcp-adapter entry. Existing adapter behavior is unchanged.");
   console.log("Requirement: install/enable pi-mcp-adapter separately in os; CCT does not install it.");
   console.log("Requirement: the os host must retain this adapter directory environment; Q7 normally sets PI_CODING_AGENT_DIR=${OS_CODING_AGENT_DIR:-$HOME/.os/agent}.");
 }
@@ -941,14 +1035,16 @@ function installOs(): void {
 function uninstallOs(): void {
   const paths = osConfigPaths();
   const { settings, mcp } = readOsConfigs(paths);
+  const adapter = osAdapterPreflight(settings, false);
   if (mcp.mcpServers && Object.hasOwn(mcp.mcpServers, "cct")) {
     delete mcp.mcpServers.cct;
     writeOsJsonIfChanged(paths.mcp, mcp);
   }
-  if (settings.extensions?.includes(OS_EXTENSION_PATH)) {
-    settings.extensions = settings.extensions.filter((entry: unknown) => entry !== OS_EXTENSION_PATH);
+  if (settings.extensions && JSON.stringify(settings.extensions) !== JSON.stringify(adapter.extensions)) {
+    settings.extensions = adapter.extensions;
     writeOsJsonIfChanged(paths.settings, settings);
   }
+  if (adapter.saved) removeOsAdapterState(paths.adapter, adapter.saved);
   console.log("CCT uninstalled from os (global). Restart os to deactivate.");
 }
 

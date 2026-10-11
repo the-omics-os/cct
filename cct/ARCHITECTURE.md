@@ -1,7 +1,9 @@
-# CCT Architecture — Final Design Decisions
+# CCT Architecture — Design Decisions
 
-Date: 2026-04-19
-Status: FROZEN — build against this document only.
+Core design date: 2026-04-19. Current release target: 0.2.1.
+Status: design authority; user UI approval complete, release publication and
+verification in progress. D16–D19 extend the original Claude-only design.
+The existing `v0.2.0` tag is preserved, not overwritten.
 
 ## Design Decisions (resolved)
 
@@ -13,16 +15,18 @@ The research proves no MCP-native push exists for API auth. PreToolUse hook is o
 ### D2: Single source of truth
 **Decision: SQLite broker only. No file-based message queues.**
 
-The broker owns all state: peers, pools, memberships, messages. The hook does NOT read inbox files or curl the broker. Instead, the **MCP server writes a tiny flag file** (`/tmp/cct/{peer_id}.unread` containing the count) whenever it polls the broker. The hook reads this one file — a single `stat` + `read` of a few bytes. The MCP server is responsible for keeping this flag in sync via its polling loop.
+The broker owns all state: peers, pools, memberships, messages. The hook does NOT read inbox bodies or curl the broker. Instead, the **MCP server writes a derived flag** (`~/.cct/flags/{peer_id}.unread`, containing `count|pool_summary|timestamp`) whenever it polls the broker. The hook reads this small file and ignores stale flags. The MCP server keeps the flag in sync; SQLite remains authoritative.
 
 Flow:
 ```
-Broker (SQLite)  ←── MCP server polls every 2s ──→  writes /tmp/cct/{peer_id}.unread
-                                                              ↑
-                                                     Hook reads this file (fast)
+Broker (SQLite) ←── MCP server polls every 2s ──→ ~/.cct/flags/{peer_id}.unread
+                                                        ↑
+                                               Hook reads this file
 ```
 
-This gives us: one source of truth (SQLite), fast hook (<5ms), no race conditions on message data.
+This provides one authoritative store and a fast hook (<10ms target). Flags
+and D19's bounded body/receipt files are derived coordination data, not durable
+message queues or an exactly-once guarantee.
 
 ### D3: Hook performance
 **Decision: Pure bash, no python, no curl. Read one small file.**
@@ -52,7 +56,8 @@ messages returned by the prior check as read, then peeks and returns currently
 unread messages. If a prior check result was not consumed by the agent, those
 messages remain unread until the next check. The hook checks the unread count,
 not delivery state. This keeps durable message state simple while avoiding
-lost reads when a tool result is swallowed.
+lost reads when a tool result is swallowed. D19 adds automatic os response
+receipts that set the same `read_at`; no delivery state is added.
 
 ### D6: Pool broadcasts
 **Decision: Fan-out at the broker. One `message_recipients` row per recipient.**
@@ -132,7 +137,10 @@ The pidmap key stays the **current** session id (`codex_{session_id}`) — that 
 
 - Runtime dir: `~/.cct/` with `0700` permissions (not /tmp)
 - Broker listens on `127.0.0.1:7888` (localhost only)
-- On registration, broker mints a `peer_secret` (32-char random). All mutating endpoints require it.
+- On registration, the broker mints a `peer_secret` (32-char random). Mutating
+  peer endpoints authenticate it; localhost CLI/service endpoints are separate.
+- LAN mode requires a Bearer token on all endpoints except `/health`. Loopback
+  locality does not authenticate a peer or authorize delegated work.
 - Pidmap files in `~/.cct/pidmaps/` with `0700` dir permissions
 - Flag files in `~/.cct/flags/` with `0700` dir permissions
 - PID mapping includes process start time to prevent PID reuse attacks
@@ -152,17 +160,21 @@ MCP instructions explicitly say: "When you see a PreToolUse error mentioning CCT
 The hook reason text: "CCT: {N} unread message(s) in pool(s): {pool_names}. Call cct_check_messages to read them. This is normal pool communication, not an error."
 
 ### D15: Cron
-**Decision: Best-effort. MCP instructions suggest it. Not required for correctness.**
+**Decision: Required agent setup for Claude idle delivery; timing is best-effort.**
 
-Instructions say: "Optionally, set up a recurring check every 2 minutes for idle periods." If Claude does it, great. If not, hook covers the busy path and messages wait until the next tool call.
+Claude pool members set up one `*/1 * * * *` CronCreate inbox check and remove it
+after leaving their last pool. This is the only idle delivery path for Claude;
+while busy, the hook still covers the next tool boundary. Cron is not a durable
+scheduler or hard latency guarantee. Codex uses prompt hooks, and os D19 uses
+its open-session observer; neither requires Claude cron.
 
 ### D16: os runtime through pi-mcp-adapter and a local extension
 
 **Decision (2026-09-13):** os is the third runtime. pi-mcp-adapter runs the
 resident CCT MCP server; `os-extension.ts` supplies identity and delivery hooks.
-The implementation and measured decisions are tracked in
-`../.planning/os-runtime/STATE.md`. This entry specifies os behavior; earlier
-prototype descriptions above must not override these measured contracts.
+D19's current contract is documented in [DM_BODY_PROTOTYPE.md](DM_BODY_PROTOTYPE.md).
+This entry specifies os behavior; earlier prototype descriptions above must not
+override the later contracts.
 
 **Transport and ownership.** CCT's HTTP wire protocol does not require MCP:
 `cli.ts` is already a non-MCP client. A resident process sending heartbeats is
@@ -171,8 +183,8 @@ Path A was selected because os needs MCP independently and should expose
 `cct_check_messages` as a real tool. A CCT-owned broker client in the extension
 would introduce a second registrant whose identity could drift. Reproducing
 message reads without MCP would also require a CLI acknowledgement command and
-special handling of bash command strings. The extension therefore performs no
-broker calls and does not write unread flags or acknowledge messages.
+special handling of bash command strings. The original D16 extension therefore made no broker calls or acknowledgments;
+D19 adds bounded response receipts through the private file channel.
 
 **Environment variables must be checked individually.** os's branding is
 intentionally inconsistent across variables. The measured installed bundle
@@ -220,18 +232,17 @@ Stable-key revival reuses the existing membership restoration transaction.
 | `toolPrefix` | `"none"` | Default `"server"` exposes `cct_cct_check_messages`, making an unprefixed block reason unusable |
 | `env.CCT_RUNTIME` | `"os"` | Explicit runtime classification independent of inherited Codex environment |
 | `env.CCT_TOOL_SURFACE` | `"compact"` | Selects the two-tool os surface; the unset/default surface remains legacy |
+| `env.CCT_OS_INBOX_BODY` | `"1"` | D19: enables bounded body publication and response receipts |
 
-**Lifecycle revision (2026-09-18):** Kevin approved automatic connection.
-The original `lazy-keep-alive` decision in STATE D22/D23 left warm sessions
-unregistered until their first CCT call. Installed adapter 2.33.0 at
-`cfbade44b86b45762e88b97b44ef1102f1027217` documents load-time initialization
-followed by session initialization that supersedes it. Observing two startup
-launches alone does not establish a surviving duplicate. The automatic-start
-regression measures cold/warm caches in both extension orders, actual surviving
-processes and active broker rows, resume/fork/new sessions, and recovery.
+**Lifecycle revision (2026-09-18):** automatic connection replaces the original
+`lazy-keep-alive` decision, which left warm sessions unregistered until first use.
+The verified `pi-mcp-adapter@2.33.0` factory initializes at load time and again
+at session initialization, which supersedes the first connection. Observing two
+startup launches alone does not establish a surviving duplicate. Acceptance
+covers cold/warm caches, surviving processes/peer rows, session changes and recovery.
 
-Use the adapter's existing `keep-alive` setting; no adapter patch or extension
-reordering is required. Connections must settle to one live MCP process and one
+Use the adapter's existing `keep-alive` setting; no adapter patch is required.
+D19's installer puts canonical CCT first among explicit global entries. Connections must settle to one live MCP process and one
 active peer per host, with the resolved session key. The installer persists the
 setting without changing other clients' configuration. The footer remains a
 reader of A and B. No timeout is claimed to make every marker race impossible;
@@ -276,9 +287,9 @@ The installer must receive that same host environment. It resolves both os and
 adapter paths, prints them, and refuses writes under real or synthetic `.pi`,
 including symlink targets and backups. `exclusive` prevents automatic imports
 of other clients' MCP servers; it alone does not relocate cache/onboarding
-state. This preserves the OS_HARNESS `.pi`-absence requirement. `cct install`
-does not acquire/install the adapter. The user separately authorized this live
-adapter installation and launcher; the receipt documents its rollback.
+state. `cct install` does not acquire/install the adapter. The host and installer
+must both receive the same environment; a launcher's exports do not propagate
+back into the shell running the installer.
 
 **Local structural types.** `os-extension.ts` imports only Node built-ins and
 declares minimal local types with citations to reviewed os source. The os loader
@@ -319,8 +330,8 @@ fields. It covers `send`, `status`, `peers`, `pools`, `create`, `join`, `leave`,
 `invite`, `summary`, `idle`, `resume`, `release`, `vote`, `services`, and
 `terminate`. Server-side validation strictly rejects unknown fields, fields
 irrelevant to the selected action, missing required fields, and invalid types
-or values. See `.planning/COMPACT_TOOLS/CONTRACT.md` for the full field contract
-and exact errors.
+or values. See `shared/constants.ts` and `shared/compact.ts` for the full
+field contract and exact errors.
 
 The schema is a flat object with no top-level `oneOf`/`anyOf` combinators,
 including for Anthropic/Bedrock compatibility. Tool descriptions and compact
@@ -328,8 +339,8 @@ instructions are static because adapter tool metadata/instructions are cached
 across sessions; neither may contain session-specific peer identity. The
 compact identity path is `cct` with `action: status`, whose output includes the
 caller identity first. The recovery description is static on both surfaces.
-The os extension exempts bare `cct`, `cct_*`, and ToolSearch so the action tool
-cannot be trapped by the unread guard.
+**Historical D17 unread guard:** the original extension exempted bare `cct`,
+`cct_*` and ToolSearch. D19 does not block tools at all.
 
 The 17 legacy tools remain available unchanged to Claude Code and Codex, with
 `cct_check_messages`'s now-static description as the intentional shared fix.
@@ -342,7 +353,12 @@ legacy, and a status response for a 25-member pool was 456 B.
 
 ---
 
-## D18: os inbox notice and idle chat-DM wake
+## D18: Historical os inbox notice and idle chat-DM wake
+
+**Historical contract, superseded by D19.** The following records the former
+one-shot notice/controller and its tests, not current automatic body behavior.
+Its stop instruction, ten-consecutive cap and refused-DM watermark are not the
+canonical policy.
 
 **Decision (2026-09-25):** Replace D16's repeating os tool blocks/ephemeral
 context reminders with a session-owned observer and coalesced custom message.
@@ -444,16 +460,131 @@ an old refused source after the rolling window expires. Attempted failed/aborted
 fail closed for idle starts without suppressing later human-work busy notices.
 These limits bound CCT-initiated idle starts, **not total inference spending**.
 
-**Verification.** Source controller/owner/legacy tests and installed os 0.2.0
-RPC/TUI synthetic-provider acceptance use private HOME/brokers and a staged
-source adapter. Scratch CCT-first installer tests do not alter operator config
-or prove live effective order. See README for commands and
-`.planning/OS_INBOX_WAKE/HARDENING_ACCEPTANCE.md` for short receipts. The final
-900s quiet + 2h periodic/reconnect test **passed** on 2026-09-26 at
-`/private/tmp/cct-final-endurance.2u1rJx`: 102 delivery checks, 15 MCP reconnects,
-unchanged source hashes and clean owned host/broker/peer cleanup. `ENDURANCE.md`
-records the final receipt and parent verification. No live rollout, publication
-or real-provider claim.
+**Historical verification.** Source controller/owner tests and installed
+RPC/TUI synthetic-provider acceptance used private HOME/brokers and a staged
+source adapter. A 900s quiet plus 2h periodic/reconnect run passed for D18 notices,
+including owned cleanup. These results are historical notice-delivery evidence,
+not current D19 actual-body acceptance, arbitrary host certification or a
+long body-delivery soak.
+
+---
+
+## D19: Canonical os automatic DM body delivery
+
+**Decision:** integrate actual-body delivery in canonical `os-extension.ts`.
+D19 supersedes D18's one-shot notice/controller for os only; Claude/Codex hooks,
+manual tools and SQLite `read_at` semantics are unchanged. User UI approval is
+complete; 0.2.1 publication verification remains in progress.
+
+**Installation:** `cct install --os` selects canonical `os-extension.ts`, removes
+duplicate canonical/prototype entries, preserves unrelated order and writes
+MCP-child `CCT_OS_INBOX_BODY=1` alongside compact/keep-alive settings. Never load
+the former `os-inbox-extension.ts` alongside it. Explicit global ordering puts
+the body extension first; earlier CLI/managed/project handlers can precede it.
+No os-core or third-party file edits, socket, fsync handoff, broker schema or
+tool-schema change is required.
+
+**Release-owned outgoing wrapper:** `os-mcp-extension.ts` delegates to the
+unmodified original `pi-mcp-adapter@2.33.0` factory via the normal host loader.
+It intercepts tool registration to decorate only direct CCT display callbacks;
+execution, schemas, prompts, preparation and non-CCT renderers remain unchanged.
+The supported activation is exactly one verified explicit global string entry
+for the original `index.ts` or single-factory directory, outside autoextensions.
+The installer replaces the adapter at its existing slot and saves the exact
+original entry/canonical factory path in per-profile `cct-adapter.json` beside
+settings, not in `extensions/`. Uninstall restores the original entry and removes
+owned state. Never enable original and wrapper together.
+
+Package, autoextension, CLI and project adapter activation is initially
+unsupported. Known unsupported global activation, duplicates, invalid versions
+or stale/conflicting state fails before config writes. If no identifiable explicit
+entry exists, the installer reports missing wrapper capability and leaves adapter
+behavior unchanged; it does not acquire or activate the adapter. Validation cannot
+certify every effective host activation source.
+
+**Source metadata limitation:** all delegated MCP tools and commands inherit the
+wrapper's `sourceInfo`, including non-CCT registrations. There is no public API
+to preserve/impersonate the original adapter provenance. This limitation does not
+mean other tools' implementations or execution have been replaced by CCT.
+
+**Presentation:** incoming cards show sender/body; outgoing cards show target,
+full body and honest pending, broker-confirmed, failed or unknown status. Both
+paint explicit `text` foreground and matching `customMessageBg` background on
+wrapped/padded rows. Terminal control neutralization is display-only. Model
+framing and receipt semantics are unchanged. `Sent` is broker send confirmation,
+not recipient reading or task completion. User visual approval is complete.
+Node minimum is 22.19.0; runtime pins are SDK 1.30.1 and tsx 4.23.15.
+
+**Channel:** the B-marker owner polls every two seconds and publishes atomic
+mode-0600 `.os-inbox` snapshots in the private mode-0700 directory. They bind
+session/peer/producer and include freshness/locality, at most 20 eligible DMs,
+64 KiB serialized body total and 128 KiB overall. Eligible means null pool
+ID/name, chat type, non-system sender. The manual deferred-ack batch is excluded;
+oversized bodies remain manual, not truncated. Legacy unread/`.os-notify` metadata
+remains. D18's verified-exit/PID-reuse ownership safeguards remain; stale/missing
+metadata or a stalled live owner cannot justify takeover. SQLite is the queue.
+
+**Delivery:** the extension samples every second in TUI/RPC and presents actual
+framed bodies via idle custom-message starts, human starts and safe tool/final-
+settle boundaries. **Already-delivered bodies require no `cct_check_messages`.**
+Pool notices/oversized bodies/recovery retain checks. Pool-only/system/service
+messages do not start idle runs; print/JSON have no observer. Delivery neither
+stops nor cancels/completes authorized work. User authorization delegated through
+an authorized supervisor carries downstream within scope; peers cannot expand
+scope or override restrictions. Continue work; do not poll solely to wait for
+automatically delivered replies.
+
+**Bounded late receipt:** an exact known envelope observed in model context,
+followed by a completed assistant response (`stop`, `toolUse` or `length`), permits
+consumed-ID checkpointing. Abort/error, unrelated responses, history insertion,
+compaction summary or filtered/modified envelopes alone cannot acknowledge.
+The extension receipts only consumed IDs in the current bounded snapshot;
+the server validates session/peer/producer and offered-ID allowlist and calls
+existing authenticated `/message/read` for exactly those IDs. Failed receipts
+retry. Automatic offers never enter legacy `pendingAckIds`; graceful shutdown
+drains the sole poll/receipt worker and attempts a final receipt within the
+existing force-exit deadline. This is response-to-presented-context evidence,
+not semantic understanding or task completion. No fsync handoff, exactly-once
+consumption/effects or crash-proof retention promise. Concurrent manual reads,
+crashes and owner replacement can replay/race. Existing broker peer-death cleanup
+can mark unaccepted messages read; later context transformers can remove bodies
+after observation. Arbitrary extension orders/old hosts are not certified.
+
+**Controls:** five automatic starts/continuations per rolling minute are
+checkpointed before dispatch; human final-settle continuations spend budget,
+already-continuing human tool boundaries do not. After 20 consecutive starts,
+cooldown grows up to ten minutes. Deferred DMs remain eligible, unlike D18's
+refusal watermark. Three failed attempts pause retries until human input or
+`/cct-wake resume`; rolling history stays enforced. Esc/abort retains unread
+work and pauses scheduling without immediately restarting on settle. Same-session
+reload/graceful restart restores cancellation and budgets. Host
+`CCT_OS_AUTO_WAKE=0` disables automatic starts/continuations and overrides remote
+opt-in; host `CCT_OS_AUTO_WAKE_REMOTE=1` is needed for remote/unknown locality.
+Human/manual access remains. Resolved loopback locality is not authentication
+or a trust boundary, including LAN-bound loopback brokers/SSH tunnels. Limits
+bound starts, not total inference/spending; failed budget persistence fails
+closed for automatic work.
+
+Known running state remains distinct from `isIdle()`. Human preflight, UI waits
+and replacement prevent competing idle starts. Failed/handled preflight and
+cancelled replacement have no definitive completion event: no guessed timeout.
+Use `/cct-wake resume` **only after the operation actually finished**; it refuses
+running/non-idle/UI-wait states but cannot prove hidden async completion. Resume
+clears pauses/failure backoff, not rolling budget or opt-out. No closed-process
+wake or permission bypass.
+
+**Acceptance:** recorded controller, private-server and isolated installer gates
+plus installed RPC/TUI cases cover actual bodies, zero model inbox-tool calls,
+cancellation retention, late acknowledgment, owned cleanup, native compaction,
+restart/reload and readable incoming/outgoing history. Real-model exchanges
+verified automatic delivery and scoped delegated continuation. The user personally
+confirmed the UI; no further UI approval is pending. D18 wake/hardening/endurance
+results are historical, not current acceptance. No long body soak or arbitrary
+host/extension-order certification is claimed. Contract and compatibility limits:
+[DM_BODY_PROTOTYPE.md](DM_BODY_PROTOTYPE.md).
+
+**OpenCode scope:** existing Phase 1 identity work is preserved, not promoted
+to a claim of complete OpenCode delivery, installer or feature support.
 
 ---
 
@@ -538,20 +669,27 @@ CREATE INDEX idx_peers_status ON peers(status)
   pidmaps/                       0700  PID → peer_id mappings
     {claude_pid}_{start_time}          Contains: peer_id
   flags/                         0700  Fast unread count flags
-    {peer_id}.unread                   Contains: unread count (integer string)
+    {peer_id}.unread                   Contains: count|pool_summary|timestamp
+    {peer_id}.os-inbox                 Bounded automatic-body snapshot (os)
+    {peer_id}.os-receipt               Bounded late response receipt (os)
 
-~/omics-os/cct/                        Source code
+<source checkout>/                     Source code
   package.json
   tsconfig.json
   CLAUDE.md
   broker.ts                            HTTP server + SQLite
   server.ts                            MCP stdio server
   cli.ts                               CLI tool
+  os-extension.ts                      os identity/body observer
+  os-mcp-extension.ts                  Outgoing presentation wrapper
   hook.sh                              PreToolUse hook (pure bash)
   shared/
     types.ts                           TypeScript interfaces
     constants.ts                       Ports, paths, timeouts, compact actions
     compact.ts                         Compact schemas, validation, dispatch, status formatting
+    os-adapter-config.ts               Verified adapter/per-profile wrapper state
+    os-cct-send-renderer.ts             Display-only outgoing cards
+    os-inbox-renderer.ts                Display-only incoming cards
     summarize.ts                       Local git-based summary
 ```
 
@@ -582,10 +720,13 @@ description on both surfaces; the compact recovery result begins with
 | `cct_vote_release` | Vote yes/no on an active release proposal |
 | `cct_set_pool_idle` | Ask pool members to reduce polling during deep work |
 | `cct_clear_pool_idle` | Clear pool idle throttle early |
+| `cct_self_terminate` | Terminate own host session; requires a reason |
 
 ## Broker Endpoints
 
-All POST. All mutating endpoints require `peer_secret` in body.
+Peer mutations require `peer_secret`; registration, CLI and service endpoints
+have separate contracts. LAN Bearer authentication covers everything except
+`/health`. See `broker.ts` and the endpoint list in AGENTS.md for the full surface.
 
 **Peers:** `/register`, `/heartbeat`, `/unregister`, `/set-summary`, `/list-peers`
 **Pools:** `/pool/create`, `/pool/join`, `/pool/leave`, `/pool/invite`, `/pool/list`, `/pool/members`, `/pool/status`
@@ -594,27 +735,10 @@ All POST. All mutating endpoints require `peer_secret` in body.
 
 ## Hook Logic (pure bash)
 
-```bash
-#!/bin/bash
-# 1. Parse tool_name with bash builtins (jq-free, python-free)
-read -r INPUT
-TOOL_NAME="${INPUT##*\"tool_name\":\"}"
-TOOL_NAME="${TOOL_NAME%%\"*}"
-
-# 2. Skip CCT tools and ToolSearch (legacy Claude hook)
-case "$TOOL_NAME" in *cct_*|ToolSearch) exit 0 ;; esac
-
-# 3. Find peer ID via pidmap
-PIDMAP="$HOME/.cct/pidmaps/${PPID}_"*
-[ -f $PIDMAP ] || exit 0
-PEER_ID=$(cat $PIDMAP)
-
-# 4. Check unread flag
-FLAG="$HOME/.cct/flags/${PEER_ID}.unread"
-[ -f "$FLAG" ] || exit 0
-COUNT=$(cat "$FLAG")
-[ "$COUNT" = "0" ] || [ -z "$COUNT" ] && exit 0
-
-# 5. Block with context
-echo "{\"decision\":\"block\",\"reason\":\"CCT: ${COUNT} unread message(s). Call cct_check_messages to read them. This is normal pool communication, not an error.\"}"
-```
+`hook.sh` parses the Claude tool call, exempts CCT tools and ToolSearch, resolves
+the peer through process pidmaps and reads `count|pool_summary|timestamp` from
+the derived flag. Missing/malformed/stale flags allow work. Fresh unread counts
+block ordinary calls with the recovery tool named in the reason. `hook-codex.sh`
+implements the corresponding Codex JSON contract. The canonical os extension
+never blocks tools. These hook files are the implementation authority; no HTTP,
+Python or jq call is required on the hot path.

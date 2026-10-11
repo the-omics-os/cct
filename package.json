@@ -1,7 +1,7 @@
 {
   "name": "@omicsos/cct",
-  "version": "0.2.0",
-  "description": "Claude Code Talk — real-time inter-session communication for Claude Code",
+  "version": "0.2.1",
+  "description": "Claude Code Talk \u2014 real-time inter-session communication for Claude Code",
   "author": "Kevin Yar <kevin.yar@omics-os.com>",
   "license": "MIT",
   "repository": {
@@ -15,9 +15,6 @@
     "multi-agent"
   ],
   "type": "module",
-  "engines": {
-    "node": ">=22.19.0"
-  },
   "bin": {
     "cct": "bin/cct.mjs"
   },
@@ -26,24 +23,30 @@
     "broker.ts",
     "server.ts",
     "cli.ts",
+    "opencode-plugin.ts",
     "os-extension.ts",
+    "os-mcp-extension.ts",
     "hook.sh",
     "hook-codex.sh",
     "prompt-codex.sh",
     "session-start-codex.sh",
     "shared/",
+    "npm-shrinkwrap.json",
     "LICENSE",
     "README.md",
+    "CHANGELOG.md",
     "WSL_INSTALL.md"
   ],
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.1",
-    "tsx": "^4.23.15"
+    "@modelcontextprotocol/sdk": "1.30.1",
+    "tsx": "4.23.15"
   },
   "peerDependencies": {
     "typescript": "^5"
   },
   "devDependencies": {
+    "@earendil-works/pi-tui": "1.0.0",
+    "@opencode-ai/plugin": "~1.18.17",
     "@types/node": "^22"
   },
   "scripts": {
@@ -53,6 +56,15 @@
     "test:codex-session": "tsx test-codex-session.ts",
     "test:codex-identity": "./test-codex-identity-e2e.sh",
     "test:codex-concurrent": "./test-codex-concurrent-mcp-e2e.sh",
-    "test:os-identity": "./test-os-identity-e2e.sh"
+    "test:os-identity": "./test-os-identity-e2e.sh",
+    "test:os-inbox": "tsx test-os-inbox-renderer.ts && tsx test-os-inbox-pump.ts && tsx test-os-inbox-server.ts",
+    "test:os-inbox-ui": "python3 test-os-inbox-ui.py",
+    "test:os-inbox-lifecycle": "python3 test-os-inbox-lifecycle.py --case esc && python3 test-os-inbox-lifecycle.py --case restart && python3 test-os-inbox-lifecycle.py --case compact && python3 test-os-inbox-lifecycle.py --case reload",
+    "test:opencode-identity": "tsx test-opencode-identity.ts",
+    "test:os-wrapper": "tsx test-os-mcp-extension.ts && python3 test-os-adapter-installer.py",
+    "test:os-cards": "python3 test-os-cct-cards-ui.py --theme light && python3 test-os-cct-cards-ui.py --theme dark"
+  },
+  "engines": {
+    "node": ">=22.19.0"
   }
 }

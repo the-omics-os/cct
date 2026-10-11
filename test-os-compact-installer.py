@@ -44,7 +44,7 @@ try:
     first_mcp = json.loads(mcp_path.read_text())
     cct = first_mcp["mcpServers"]["cct"]
     assert cct["env"] == {"PRESERVE_ME": "synthetic", "CCT_RUNTIME": "os",
-                          "CCT_TOOL_SURFACE": "compact"}, cct["env"]
+                          "CCT_TOOL_SURFACE": "compact", "CCT_OS_INBOX_BODY": "1"}, cct["env"]
     assert cct["lifecycle"] == "keep-alive", cct["lifecycle"]
     assert cct["directTools"] is True
     assert cct["toolPrefix"] == "none"

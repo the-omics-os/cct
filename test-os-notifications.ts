@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import cctExtension from "./os-extension.js";
+// Historical notice-only controller regressions. Canonical body delivery is
+// exercised by test-os-inbox-pump.ts and installed body/lifecycle acceptance.
+import cctExtension from "./test-fixtures/os/legacy-notice-extension.ts";
 
 const root = mkdtempSync(join(tmpdir(), "cct-os-notices-"));
 const pidmaps = join(root, "pidmaps"), flags = join(root, "flags");
