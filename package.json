@@ -15,6 +15,9 @@
     "multi-agent"
   ],
   "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "bin": {
     "cct": "bin/cct.mjs"
   },
@@ -30,11 +33,12 @@
     "session-start-codex.sh",
     "shared/",
     "LICENSE",
-    "README.md"
+    "README.md",
+    "WSL_INSTALL.md"
   ],
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.27.1",
-    "tsx": "^4.0.0"
+    "@modelcontextprotocol/sdk": "^1.30.1",
+    "tsx": "^4.23.15"
   },
   "peerDependencies": {
     "typescript": "^5"

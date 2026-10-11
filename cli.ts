@@ -2,6 +2,7 @@
 import { existsSync, readFileSync, writeFileSync, chmodSync, mkdirSync, copyFileSync, readdirSync, realpathSync, lstatSync, readlinkSync } from "node:fs";
 import { join, dirname, resolve, basename, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 import { homedir, userInfo } from "node:os";
 import { spawn as nodeSpawn, spawnSync } from "node:child_process";
 import {
@@ -905,7 +906,7 @@ function installOs(): void {
   if (!findOsPackage()) die("Cannot verify an installed @the-omics-os/os package for the os executable; no os configs changed.");
   const { settings, mcp } = readOsConfigs(paths);
   const cfg = readJsonFile(CONFIG_PATH);
-  const tsx = join(CCT_DIR, "node_modules", ".bin", "tsx");
+  const tsx = createRequire(import.meta.url).resolve("tsx/cli");
   if (!existsSync(tsx)) die(`Missing CCT dependency: ${tsx}; install CCT dependencies before configuring os.`);
   const previous = mcp.mcpServers?.cct;
   const env: Record<string, string> = { ...previous?.env, CCT_RUNTIME: "os", CCT_TOOL_SURFACE: "compact" };
@@ -917,8 +918,8 @@ function installOs(): void {
     ...mcp.mcpServers,
     cct: {
       ...previous,
-      command: tsx,
-      args: [SERVER_PATH],
+      command: process.execPath,
+      args: [tsx, SERVER_PATH],
       env,
       lifecycle: "keep-alive",
       directTools: true,
