@@ -1,11 +1,12 @@
 # CCT State
 
-## Current phase: 0.2.1 release preparation
+## Current phase: 0.2.1 released and verified
 
-**Status:** user UI approval is complete. Release assembly, publication and
-post-publication verification are in progress; this page does not claim that
-0.2.1 is already released. The existing GitHub `v0.2.0` tag is preserved, not
-moved or overwritten. At preparation time npm `latest` remains 0.1.0.
+**Status:** user UI approval, GitHub release, npm publication and registry
+installation verification are complete. Published runtime source is commit
+`0af3df7ad6234122a93c4457c1cfc345954e1923`, tagged `v0.2.1`. The existing
+GitHub `v0.2.0` tag is preserved. Local setup uses the published package and
+its reversible wrapper without a third-party source patch.
 
 The user personally confirmed the readable incoming/outgoing UI and explicitly
 waived further UI approval. No additional UI sign-off is a release gate.
@@ -84,8 +85,10 @@ for other runtimes remains a proposal, not implemented functionality. Remaining
 compatibility work includes arbitrary context-transform/order, old-host APIs,
 provider-native retry, persistent provider failures and sustained bounded exchanges.
 
-## Remaining release work
+## Release completion
 
-The publishing owner must finish publication of 0.2.1 and verify the GitHub tag,
-release assets and npm version/dist-tag before changing status to released.
-No existing tag is to be overwritten. See [CHANGELOG.md](../CHANGELOG.md).
+GitHub tag/release assets, npm version and the exact registry artifact are verified.
+A clean production-only registry install runs the CLI; local os setup selects
+one canonical body extension and one reversible adapter wrapper. Existing sessions
+need reload/restart to load changed setup. No tag was overwritten.
+See [CHANGELOG.md](../CHANGELOG.md).

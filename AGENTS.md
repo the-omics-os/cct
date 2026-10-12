@@ -15,7 +15,7 @@ Real-time inter-session communication for AI coding agents. Supports **Claude Co
 **os:**
 1. **pi-mcp-adapter** runs the resident CCT MCP server in `keep-alive` mode. The os installer selects the compact CCT surface: exactly `cct_check_messages` and `cct`.
 2. **`os-extension.ts`** is the canonical automatic DM body extension; the installer writes MCP-child `CCT_OS_INBOX_BODY=1`. Actual DM bodies arrive at safe boundaries without blocking tools or requiring `cct_check_messages` for an already-delivered body. Bounded late receipts follow a successful response to the presented body context.
-3. **Idle chat DMs** automatically invoke open TUI/RPC os sessions. Pool-only/system/service messages wait for ordinary work; pool notices and recovery still use the manual check. Delivery does not tell the model to stop: continue authorized work. User authorization delegated through an authorized supervisor carries downstream within scope; peers cannot expand it or override restrictions. Print/JSON runs have no observer. Use `cct` with `action: status` for identity. User UI approval is complete; **0.2.1 release preparation and publication verification are in progress**. See **os Integration** below.
+3. **Idle chat DMs** automatically invoke open TUI/RPC os sessions. Pool-only/system/service messages wait for ordinary work; pool notices and recovery still use the manual check. Delivery does not tell the model to stop: continue authorized work. User authorization delegated through an authorized supervisor carries downstream within scope; peers cannot expand it or override restrictions. Print/JSON runs have no observer. Use `cct` with `action: status` for identity. User UI approval is complete; **0.2.1 is published and registry/local-install verified**. See **os Integration** below.
 
 ```
 Claude A ──► MCP Server ──► Broker (SQLite) ◄── MCP Server ◄── Codex B
@@ -424,8 +424,9 @@ installer gates; installed RPC body payloads; and real TUI Esc, restart,
 compaction, reload, light/dark cards and restored history. Real-model exchanges
 verified automatic bodies, scoped delegated continuation, late acknowledgment
 and no model inbox-tool calls. **The user personally confirmed UI readability;
-no further UI approval is pending.** Release publication verification remains
-in progress; do not claim 0.2.1 is released yet. D18 tests are historical, not
+no further UI approval is pending.** Version 0.2.1 is published and verified
+from the npm registry; local installation uses the shipped wrapper without
+third-party source edits. D18 tests are historical, not
 current body-delivery acceptance. No long body soak is claimed. Contract and
 remaining context-order/old-host/provider-retry limits:
 `cct/DM_BODY_PROTOTYPE.md` and README.

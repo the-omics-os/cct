@@ -1,8 +1,8 @@
 # Canonical os automatic DM body delivery
 
 This is the current D19 delivery contract, superseding D18 notices. The filename
-preserves its design history. **0.2.1 release preparation is in progress; user
-UI approval is complete.** Publication and registry verification remain pending.
+preserves its design history. **0.2.1 is published and registry-verified; user
+UI approval is complete.** Local installation uses the published wrapper.
 
 ## Components and setup
 

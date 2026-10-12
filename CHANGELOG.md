@@ -1,10 +1,10 @@
 # Changelog
 
-## 0.2.1 — release preparation
+## 0.2.1 — 2026-10-12
 
-Publication and post-publication verification are pending. At preparation time
-npm `latest` remains 0.1.0. The existing GitHub `v0.2.0` tag is preserved;
-this release targets a new `v0.2.1` tag and does not overwrite earlier history.
+Published as `@omicsos/cct@0.2.1` and GitHub `v0.2.1`. The registry artifact,
+clean production-only installation and actual CLI are verified. The existing
+GitHub `v0.2.0` tag is preserved; no earlier history was overwritten.
 
 ### Added
 

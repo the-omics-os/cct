@@ -42,9 +42,9 @@ The outgoing formatter ships as CCT's `os-mcp-extension.ts` wrapper, delegating
 to the unmodified `pi-mcp-adapter@2.33.0` factory. No os-core or third-party file
 edits are required. See the [delivery contract](https://github.com/the-omics-os/cct/blob/v0.2.1/cct/DM_BODY_PROTOTYPE.md).
 
-**Release status:** 0.2.1 preparation is in progress; user UI approval is complete.
-Publication and registry verification remain pending. The existing `v0.2.0` tag
-is preserved. See [release notes](https://github.com/the-omics-os/cct/blob/v0.2.1/CHANGELOG.md).
+**Release status:** 0.2.1 is published on npm and GitHub; registry installation
+and local setup are verified. User UI approval is complete. The existing
+`v0.2.0` tag is preserved. See [release notes](https://github.com/the-omics-os/cct/releases/tag/v0.2.1).
 
 ## Quick Start
 
