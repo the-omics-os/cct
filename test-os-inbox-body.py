@@ -24,7 +24,7 @@ import urllib.request
 HERE = Path(__file__).resolve().parent
 RUNTIME = Path(os.environ.get("CCT_PACKAGE_ROOT", HERE)).resolve()
 FIXTURE = HERE / "test-fixtures/os/inbox-body-probe.ts"
-DEFAULT_ADAPTER = "/Users/tyo/.os/agent/packages/pi-mcp-adapter-2.33.0-cfbade44/index.ts"
+DEFAULT_ADAPTER = "~/.os/agent/packages/pi-mcp-adapter-2.33.0-cfbade44/index.ts"
 
 
 def records(path):

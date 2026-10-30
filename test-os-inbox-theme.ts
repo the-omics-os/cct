@@ -1,8 +1,9 @@
 // Installed-host contrast acceptance; no configuration writes or live sessions.
 import assert from "node:assert/strict";
+import { homedir } from "node:os";
 import { stripVTControlCharacters } from "node:util";
 import { renderInboxMessage } from "./shared/os-inbox-renderer.ts";
-const dist = process.env.CCT_OS_DIST ?? "/Users/tyo/.local/share/os-releases/1.1.3/lib/node_modules/@the-omics-os/os/dist";
+const dist = process.env.CCT_OS_DIST ?? `${homedir()}/.local/share/os-releases/1.1.3/lib/node_modules/@the-omics-os/os/dist`;
 const { loadThemeFromPath } = await import(`${dist}/modes/interactive/theme/theme.js`);
 const nonce = "theme-test";
 const message = { content: `Sender "os-test" ("id"), message 1, time "now"\n<peer-body-${nonce}>\nBody contrast text wraps across the card.\n</peer-body-${nonce}>`,

@@ -189,4 +189,4 @@ Former D18 notice/wake/hardening/endurance results are historical, not current
 body-delivery acceptance. No long body-delivery soak or arbitrary host certification
 is claimed. Remaining robustness work includes arbitrary context-filter/order,
 old-host capability, provider-native retry, persistent provider failures and
-sustained bounded exchanges. See [STATE.md](STATE.md) for release progress.
+sustained bounded exchanges.

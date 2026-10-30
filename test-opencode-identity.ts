@@ -157,8 +157,8 @@ async function main(): Promise<void> {
   const { sanitizeInstanceKey } = await import("./opencode-plugin.ts");
 
   {
-    const key = sanitizeInstanceKey("/Users/tyo/foo");
-    check("short path sanitizes separators", key === "opencode:_Users_tyo_foo", `got ${key}`);
+    const key = sanitizeInstanceKey("/home/dev/foo");
+    check("short path sanitizes separators", key === "opencode:_home_dev_foo", `got ${key}`);
   }
   {
     const key = sanitizeInstanceKey("dir with spaces/and:colons");

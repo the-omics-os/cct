@@ -52,5 +52,4 @@ GitHub `v0.2.0` tag is preserved; no earlier history was overwritten.
 - Send confirmation is not receipt or completion. No fsync handoff, exactly-once
   effects, closed-process wake, crash-proof retention or long body soak is claimed.
 
-See the [delivery contract](cct/DM_BODY_PROTOTYPE.md) and
-[release state](cct/STATE.md) for details.
+See the [delivery contract](cct/DM_BODY_PROTOTYPE.md) for details.

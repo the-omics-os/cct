@@ -217,9 +217,6 @@ cct/
 
 Core design documents live in `cct/`:
 - `ARCHITECTURE.md` — **Design decisions D1-D19.** D16 records os integration; historical D18 notice/wake is superseded by canonical D19 body delivery and the release-owned outgoing wrapper.
-- `ROADMAP.md` — Core build phases and deferred PTY launcher proposal.
-- `STATE.md` — Current progress and release status.
-- `REQUIREMENTS.md` — User flows and constraints.
 - `DM_BODY_PROTOTYPE.md` — Current automatic-body contract and compatibility limits.
 
 Release notes live in `CHANGELOG.md`. The existing `v0.2.0` tag must not be

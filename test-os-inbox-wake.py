@@ -159,7 +159,7 @@ def acceptance(opt_out=False, failed_model=False, abort=False, tui=False):
     import urllib.request
     os_bin = Path(os.environ.get("CCT_OS_BIN") or shutil.which("os") or "").resolve()
     import hashlib
-    adapter = Path(os.environ.get("CCT_OS_ADAPTER", "/Users/tyo/GITHUB/AGENTS/pi-mcp-adapter/index.ts")).expanduser().resolve()
+    adapter = Path(os.environ.get("CCT_OS_ADAPTER", "~/GITHUB/AGENTS/pi-mcp-adapter/index.ts")).expanduser().resolve()
     node = shutil.which("node")
     assert os_bin.is_file() and os_bin.name == "cli.js" and "@the-omics-os/os/dist/bundle" in str(os_bin), os_bin
     assert adapter.is_file() and node and (HERE / "node_modules/tsx/dist/loader.mjs").is_file()

@@ -18,7 +18,7 @@ import {
 const ROOT_ID = "01a09bf3-1014-7ac2-a910-d3e5ab14d32f";
 const FORK_ID = "01a09c07-81b6-7931-98c9-71b81f9b6a15";
 const FORK2_ID = "01a09d11-2222-7931-98c9-71b81f9b6a99";
-const CWD = "/Users/tyo/Omics-OS/lobster-cloud";
+const CWD = "/home/dev/example-project";
 
 let pass = 0;
 let fail = 0;

@@ -56,7 +56,7 @@ class Harness:
         assert self.node and os_bin.is_file() and os_bin.name == "cli.js" and "@the-omics-os/os/dist/bundle" in str(os_bin)
         assert json.loads((os_bin.parents[2] / "package.json").read_text())["version"] == "0.2.0"
         self.os_bin = os_bin
-        self.adapter_source = Path(os.environ.get("CCT_OS_ADAPTER", "/Users/tyo/GITHUB/AGENTS/pi-mcp-adapter/index.ts")).resolve()
+        self.adapter_source = Path(os.environ.get("CCT_OS_ADAPTER", "~/GITHUB/AGENTS/pi-mcp-adapter/index.ts")).expanduser().resolve()
         assert self.adapter_source.is_file() and FIXTURE.is_file()
         if shared:
             self.port, self.url = shared.port, shared.url
