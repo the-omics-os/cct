@@ -165,32 +165,32 @@ cct/
   hook-codex.sh          Codex PreToolUse hook (JSON stdin/stdout, <10ms, session_id lookup)
   prompt-codex.sh        Codex UserPromptSubmit hook (idle delivery via additionalContext)
   session-start-codex.sh Codex SessionStart hook (identity bridge: session_id → peer_id)
-  test-integration.sh    Integration tests (135 checks; private broker, refuses occupied ports)
+  test-integration.sh    Integration tests (isolated broker, refuses occupied ports)
   test-compact-surface.ts Compact schemas, validation, mapping, status, and MCP surface tests
   test-os-extension.ts   Canonical os extension wiring checks
   test-os-inbox-pump.ts  Automatic body controller (62 checks)
-  test-os-inbox-server.ts Private broker/MCP body and receipt gates
-  test-os-inbox-installer.py Isolated canonical installer gates
-  test-os-inbox-body.py  Installed RPC actual-body delivery acceptance
+  test-os-inbox-server.ts Isolated broker/MCP body and read-receipt tests
+  test-os-inbox-installer.py Isolated canonical installer tests
+  test-os-inbox-body.py  Installed RPC actual-body delivery test
   test-os-inbox-lifecycle.py Installed TUI Esc, restart, compaction and reload
-  test-os-notifications.ts Historical D18 one-shot controller
+  test-os-notifications.ts Legacy notice one-shot controller
   test-os-notification-server.ts Sibling-MCP ownership/check/cache-failure regressions
-  test-os-inbox-wake.py   Historical D18 notice/wake acceptance
-  test-os-inbox-hardening.py Historical D18 hardening acceptance
-  test-os-inbox-endurance.py Historical D18 quiet/soak harness
-  test-os-inbox-endurance-run.sh Bounded long-run runner with private receipts
+  test-os-inbox-wake.py   Legacy notice/wake test
+  test-os-inbox-hardening.py Legacy notice hardening test
+  test-os-inbox-endurance.py Legacy notice quiet/long-run harness
+  test-os-inbox-endurance-run.sh Bounded long-run runner
   test-os-compact-installer.py Isolated compact os installer settings and idempotence
-  test-os-compact-live.py Installed os compact-surface acceptance with a synthetic provider
-  test-compact-packed.ts Packed-artifact acceptance for compact tools
-  test-compact-measurements.ts Schema and compact output measurement gates
+  test-os-compact-live.py Installed os compact-surface test with a synthetic provider
+  test-compact-packed.ts Packed-artifact test for compact tools
+  test-compact-measurements.ts Schema and compact output measurement tests
   test-os-compact-terminate.ts Safe terminate-path test with a fake host
   test-codex-session.ts  Unit tests for codex session/fork-chain resolution
   test-codex-identity-e2e.sh  E2E: fake codex host + real server.ts, stable id across resume (port 17889)
   test-os-identity-e2e.sh E2E: os marker, fallback, MCP siblings, compact surface, and resume (default port 17890)
-  test-os-runtime-live.py Installed os acceptance with a local synthetic provider (15-minute idle check)
+  test-os-runtime-live.py Installed os test with a local synthetic provider (15-minute idle check)
   test-os-autostart.py    Installed os automatic registration, session changes and recovery
   test-os-install-autostart.py Scoped installer upgrade and idempotent reinstall checks
-  test-fixtures/os/      Local provider and safe runtime observations for installed-os acceptance
+  test-fixtures/os/      Local provider and runtime fixtures for installed-os tests
   shared/
     types.ts             TypeScript interfaces
     constants.ts         Ports, paths, timeouts, and compact action definitions
@@ -216,7 +216,7 @@ cct/
 ## Design Documents
 
 Core design documents live in `cct/`:
-- `ARCHITECTURE.md` — **Design decisions D1-D19.** D16 records os integration; historical D18 notice/wake is superseded by canonical D19 body delivery and the release-owned outgoing wrapper.
+- `ARCHITECTURE.md` — **Design decisions and rationale**, including os integration, automatic DM body delivery (which replaced the earlier notice/wake design) and the outgoing wrapper.
 - `DM_BODY_PROTOTYPE.md` — Current automatic-body contract and compatibility limits.
 
 Release notes live in `CHANGELOG.md`. The existing `v0.2.0` tag must not be
@@ -416,20 +416,11 @@ refuses running/non-idle/UI-wait states but cannot verify hidden async completio
 it clears pauses/failure backoff, not rolling budget or opt-out. Explicit checks
 remain available. No closed-process wake or permission bypass.
 
-Recorded acceptance covers controller, private-server receipt and isolated
-installer gates; installed RPC body payloads; and real TUI Esc, restart,
-compaction, reload, light/dark cards and restored history. Real-model exchanges
-verified automatic bodies, scoped delegated continuation, late acknowledgment
-and no model inbox-tool calls. **The user personally confirmed UI readability;
-no further UI approval is pending.** Version 0.2.1 is published and verified
-from the npm registry; local installation uses the shipped wrapper without
-third-party source edits. D18 tests are historical, not
-current body-delivery acceptance. No long body soak is claimed. Contract and
-remaining context-order/old-host/provider-retry limits:
-`cct/DM_BODY_PROTOTYPE.md` and README.
+Delivery contract and current limits (context order, older hosts, provider
+retry): `cct/DM_BODY_PROTOTYPE.md` and README.
 
 Run `npm run test:os-identity` for source identity checks. Installed-runtime
-acceptance requires an installed os launcher and adapter:
+tests require an installed os launcher and adapter:
 
 ```bash
 export CCT_OS_ADAPTER=/absolute/path/to/pi-mcp-adapter/index.ts
@@ -443,20 +434,17 @@ a calibration run. The harness uses an isolated broker and synthetic HOME,
 records the actual flags and peer rows, and sends only local fixture messages.
 Use distinct `CCT_OS_TEST_PORT` values when running alongside other E2E tests.
 An npm upgrade can replace the local os launcher symlink; reapply the launcher
-and verify its Q7 environment after upgrading.
+and verify its environment after upgrading.
 
 ## Compact Surface Measurements
 
-PHASE_3 acceptance measured **1,244 B** for the two eager compact schemas
+Local measurements: **1,244 B** for the two eager compact schemas
 (`cct`: 1,046 B; `cct_check_messages`: 198 B), versus **5,441 B** for the 17
 legacy eager schemas. The first synthetic-provider request was **15,100 B** on
 compact versus **20,730 B** on legacy. A compact status response for a
 25-member pool was **456 B** (displaying up to 20 members plus an overflow
 count). These are local synthetic-provider measurements, not external model
-or HTTP wire measurements. `test-integration.sh` now reports 135 checks, including notification regressions. PHASE_3
-acceptance recorded 14/14 passing rows, including Codex session 15/15, Codex
-identity 8/8, Codex concurrent MCP 9/9, and the isolated os compact-surface,
-installer, extension, packed-package, measurements, and termination checks.
+or HTTP wire measurements.
 
 ## Peer Resolution
 
@@ -466,7 +454,7 @@ Both server.ts and cli.ts support flexible peer addressing:
 3. **Prefix match** on peer ID (minimum 4 characters)
 4. **Prefix match** on peer name
 
-Examples: `aaccacce` (full ID), `aaccacce/ccp-ftts` or `ccp-ftts/aaccacce` (pair), `aacc` (4-char prefix), `ccp-ftts` (full name), `ccp-` (name prefix). In pool-directed sends, `@pool/<peer>` accepts the same forms, e.g. `@pool/ccp-ftts/aaccacce`.
+Examples: `a1b2c3d4` (full ID), `a1b2c3d4/browser-agent` or `browser-agent/a1b2c3d4` (pair), `a1b2` (4-char prefix), `browser-agent` (full name), `browser-` (name prefix). In pool-directed sends, `@pool/<peer>` accepts the same forms, e.g. `@pool/browser-agent/a1b2c3d4`.
 Ambiguous matches return all candidates with IDs for disambiguation.
 
 ## Status Line Integration
@@ -474,7 +462,7 @@ Ambiguous matches return all candidates with IDs for disambiguation.
 CCT state is exposed in the Claude Code status line (`~/.claude/statusline.sh`):
 - Reads `~/.cct/pidmaps/` to resolve current session's peer ID
 - Reads `~/.cct/flags/{peer_id}.unread` for pool memberships and unread counts
-- Format: `CCT:dd5c @pool(N) ✉` — peer ID prefix, pools with unread counts, total unread
+- Format: `CCT:a1b2 @pool(N) ✉` — peer ID prefix, pools with unread counts, total unread
 - Refreshes every 10s via `refreshInterval` setting
 - Graceful degradation: shows `CCT:off` if CCT not installed, `CCT:—` if no pidmap match
 
