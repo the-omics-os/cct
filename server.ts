@@ -27,6 +27,7 @@ import {
   formatCompactStatus,
   toolRef as compactToolRef,
 } from "./shared/compact.ts";
+import { TSX_CLI } from "./shared/tsx.ts";
 import { resolveCodexSessionIdentity, type CodexSessionIdentity } from "./shared/codex-session.ts";
 import type {
   BrokerResponse,
@@ -173,7 +174,7 @@ async function ensureBroker(): Promise<void> {
   }
 
   const brokerPath = new URL("./broker.ts", import.meta.url).pathname;
-  const child = spawn("npx", ["tsx", brokerPath], {
+  const child = spawn(process.execPath, [TSX_CLI, brokerPath], {
     stdio: "ignore",
     detached: true,
   });

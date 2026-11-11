@@ -1,8 +1,8 @@
 # CCT Architecture — Design Decisions
 
-Core design date: 2026-04-19. Last published release: 0.2.1. Current candidate: 0.2.2
+Core design date: 2026-04-19. Last published release: 0.2.1. Current candidate: 0.2.3
 (unpublished; D20).
-Status: design authority; user UI approval covers the 0.2.1 cards. The 0.2.2 footer (D20) has automated acceptance and no recorded user visual approval. D16–D20 extend the original
+Status: design authority; user UI approval covers the 0.2.1 cards. The 0.2.3 footer (D20) has automated acceptance and no recorded user visual approval. D16–D20 extend the original
 Claude-only design.
 The existing `v0.2.0` tag is preserved, not overwritten.
 
@@ -580,7 +580,7 @@ plus installed RPC/TUI cases cover actual bodies, zero model inbox-tool calls,
 cancellation retention, late acknowledgment, owned cleanup, native compaction,
 restart/reload and readable incoming/outgoing history. Real-model exchanges
 verified automatic delivery and scoped delegated continuation. The user personally
-confirmed the 0.2.1 cards; no further approval is pending for them. The 0.2.2 footer has no recorded user visual approval. D18 wake/hardening/endurance
+confirmed the 0.2.1 cards; no further approval is pending for them. The 0.2.3 footer has no recorded user visual approval. D18 wake/hardening/endurance
 results are historical, not current acceptance. No long body soak or arbitrary
 host/extension-order certification is claimed. Contract and compatibility limits:
 [DM_BODY_PROTOTYPE.md](DM_BODY_PROTOTYPE.md).
@@ -619,17 +619,17 @@ oversized, malformed or unreadable B keeps the identity already resolved in the 
 Absent B remains pending or none. The delivery path reads B with the same 4 KiB bound and
 behaves as before for valid files. An oversized flag shows `flags unavailable`.
 
-**Compatibility decision (no wire schema change):** the 0.2.2 flag keeps the 0.2.1 layout.
+**Compatibility decision (no wire schema change):** the 0.2.3 flag keeps the 0.2.1 layout.
 A flag is rewritten only by its own peer's MCP server, and a 0.2.1 server writes raw pool
-names. Until that peer runs 0.2.2 and polls, its footer may show: a raw name containing an
+names. Until that peer runs 0.2.3 and polls, its footer may show: a raw name containing an
 escape-like sequence (`%2C`, `%44M`, …) decoded (`a%2Cb` as `a,b`); a raw pool named `DM`
-as direct unread; or `flags unavailable` for a raw name containing `,`. The 0.2.2 server
+as direct unread; or `flags unavailable` for a raw name containing `,`. The 0.2.3 server
 rewrites the flag on its next successful poll or `cct_check_messages`. No migration exists.
 Totals, counts, hook scripts and delivery are unaffected. A protocol expansion was rejected
 as disproportionate for a display-only ambiguity.
 
 **Approval status:** user visual approval covers the 0.2.1 incoming/outgoing cards. The
-0.2.2 footer has automated acceptance only: the host RPC `setStatus` stream and a real
+0.2.3 footer has automated acceptance only: the host RPC `setStatus` stream and a real
 broker. No user visual approval is recorded for it.
 
 **Other readers:** hook scripts read only the leading count and echo the entries into

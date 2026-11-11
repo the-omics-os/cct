@@ -3,7 +3,7 @@
 This is the current D19 delivery contract, superseding D18 notices. The filename
 preserves its design history. **0.2.1 is the last published release and is
 registry-verified; user UI approval covers the 0.2.1 cards.** Local installation uses the
-published wrapper. The unpublished 0.2.2 candidate changes only the footer and the
+published wrapper. The unpublished 0.2.3 candidate changes only the footer and the
 unread-flag presentation (ARCHITECTURE D20); body delivery and acknowledgment
 semantics are unchanged.
 
@@ -86,7 +86,7 @@ history shows a display-unavailable diagnostic, not raw protocol framing.
 Both incoming and outgoing cards paint the theme's `text` foreground and an
 explicit `customMessageBg` background on every wrapped/padded row. This avoids
 placing light-theme dark text on an unknown terminal background. The user
-personally confirmed the 0.2.1 card readability. No user visual approval is recorded for the 0.2.2 footer.
+personally confirmed the 0.2.1 card readability. No user visual approval is recorded for the 0.2.3 footer.
 
 Outgoing direct `cct` sends show `CCT → target`, full body and `Sending…`,
 `Sent`, `Send failed` or `Send status unknown`. Only the pinned adapter's direct

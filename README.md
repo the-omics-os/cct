@@ -45,7 +45,7 @@ edits are required. See the [delivery contract](https://github.com/the-omics-os/
 **Release status:** 0.2.1 is published on npm and GitHub; registry installation
 and local setup are verified. User UI approval covers the 0.2.1 cards. The existing
 `v0.2.0` tag is preserved. See [release notes](https://github.com/the-omics-os/cct/releases/tag/v0.2.1).
-0.2.2 is an unpublished candidate: see CHANGELOG `0.2.2`.
+0.2.3 is an unpublished candidate: see CHANGELOG `0.2.3`.
 
 ## Quick Start
 
@@ -172,6 +172,8 @@ Create ──► Join ──► Collaborate ──► Release Vote ──► Lea
 
 ```bash
 cct status              # broker health, peers, pools
+cct status --json       # machine-readable install, broker and os state (no broker needed)
+cct version             # package version
 cct whoami              # show this session's CCT peer ID/name
 cct peers               # list registered peers
 cct pools               # list active pools with members
@@ -387,7 +389,7 @@ Footer reads are size-bounded. An oversized or malformed peer file keeps the ide
 already shown in the session; delivery still needs a valid file.
 
 Pool counts follow the os flag, which can include a pool you have left (a known
-preexisting issue; see CHANGELOG `0.2.2` and ARCHITECTURE D20). Identity does not
+preexisting issue; see CHANGELOG `0.2.3` and ARCHITECTURE D20). Identity does not
 depend on any personal status line.
 
 ### Verification
@@ -408,7 +410,7 @@ Recorded acceptance covers controller and private-server receipt gates,
 isolated installers, installed RPC actual-body delivery, and real TUI Esc,
 restart, compaction and reload. Terminal checks cover incoming/outgoing cards,
 light/dark themes, wrapped bodies and history without changing provider content.
-The user personally confirmed the 0.2.1 cards. No user visual approval is recorded for the 0.2.2 footer.
+The user personally confirmed the 0.2.1 cards. No user visual approval is recorded for the 0.2.3 footer.
 Real-model exchanges also verified automatic bodies and late acknowledgments
 without model inbox checks. This is bounded acceptance, not a long body-delivery
 soak or arbitrary host/extension-order certification. Former D18 notice/wake

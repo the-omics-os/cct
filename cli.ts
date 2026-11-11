@@ -24,6 +24,7 @@ import {
   verifyOsAdapterEntry,
   type OsAdapterConfig,
 } from "./shared/os-adapter-config.ts";
+import { TSX_CLI } from "./shared/tsx.ts";
 import type {
   BrokerResponse,
   HealthResponse,
@@ -296,7 +297,8 @@ async function cmdHelp() {
 Usage: cct <command> [args]
 
 Commands:
-  status                       Show broker health, peers, and pools
+  version                      Print the CCT version
+  status [--json]              Show broker health, peers, and pools (--json: install/broker/os state)
   whoami                       Show this session's CCT peer ID and name
   peers                        List all registered peers
   pools                        List all active pools
@@ -329,7 +331,81 @@ LAN mode:
 Env vars: CCT_HOST (bind addr), CCT_PORT, CCT_BROKER (connect addr), CCT_TOKEN`);
 }
 
-async function cmdStatus() {
+function packageVersion(): string {
+  return JSON.parse(readFileSync(join(CCT_DIR, "package.json"), "utf8")).version;
+}
+
+function readJsonQuiet(path: string): { value?: any; error?: string } {
+  if (!existsSync(path)) return {};
+  try {
+    return { value: JSON.parse(readFileSync(path, "utf8")) };
+  } catch (e: any) {
+    return { error: `${path}: ${e.message}` };
+  }
+}
+
+/** Read-only os connection state for `status --json`; never writes or exits. */
+function osStatus() {
+  const settingsPath = join(resolveOsAgentDir(), "settings.json");
+  const mcpPath = join(resolveAdapterAgentDir(), "mcp.json");
+  const adapterStatePath = osAdapterConfigPath();
+  const errors: string[] = [];
+  const settings = readJsonQuiet(settingsPath);
+  const mcp = readJsonQuiet(mcpPath);
+  for (const r of [settings, mcp]) if (r.error) errors.push(r.error);
+  const extensions: unknown[] = Array.isArray(settings.value?.extensions) ? settings.value.extensions : [];
+  const extension = extensions.some((e) => isOwnedOsExtension(e, OS_EXTENSION_PATH));
+  const wrapper = extensions.some((e) => isOwnedOsExtension(e, OS_MCP_EXTENSION_PATH));
+  // Entries from another CCT install (old version, moved prefix) mean `cct install --os` must rerun.
+  const foreignCct = extensions.some((e) => typeof e === "string"
+    && /(?:^|[/\\])os-(?:mcp-|inbox-)?extension\.ts$/.test(e) && /cct/i.test(e)
+    && !isOwnedOsExtension(e, OS_EXTENSION_PATH) && !isOwnedOsExtension(e, OS_MCP_EXTENSION_PATH));
+  const server = mcp.value?.mcpServers?.cct;
+  const serverArg = Array.isArray(server?.args) ? server.args[server.args.length - 1] : undefined;
+  const mcpServer = typeof serverArg === "string" && isOwnedOsExtension(serverArg, SERVER_PATH);
+  const mcpCommandOk = typeof server?.command === "string" && existsSync(server.command);
+  const env = server?.env ?? {};
+  const mcpEnvOk = env.CCT_RUNTIME === "os" && env.CCT_TOOL_SURFACE === "compact" && env.CCT_OS_INBOX_BODY === "1";
+  return {
+    settings_path: settingsPath,
+    mcp_path: mcpPath,
+    adapter_state_path: adapterStatePath,
+    extension,
+    wrapper,
+    adapter_state: existsSync(adapterStatePath),
+    mcp_server: mcpServer,
+    mcp_command_ok: mcpCommandOk,
+    mcp_env_ok: mcpEnvOk,
+    stale: foreignCct || (server !== undefined && !mcpServer),
+    connected: extension && mcpServer && mcpCommandOk && mcpEnvOk,
+    errors,
+  };
+}
+
+async function cmdStatusJson() {
+  let health: HealthResponse | undefined;
+  try {
+    const res = await fetch(`${BROKER_URL}/health`, { signal: AbortSignal.timeout(2000) });
+    if (res.ok) health = ((await res.json()) as BrokerResponse<HealthResponse>).data;
+  } catch {}
+  console.log(JSON.stringify({
+    schema: 1,
+    version: packageVersion(),
+    package_dir: CCT_DIR,
+    node: process.version,
+    broker: {
+      url: BROKER_URL,
+      mode: IS_REMOTE ? "remote" : "local",
+      running: health !== undefined,
+      peers: health?.peers ?? null,
+      pools: health?.pools ?? null,
+    },
+    os: osStatus(),
+  }, null, 2));
+}
+
+async function cmdStatus(args: string[] = []) {
+  if (args.includes("--json")) return cmdStatusJson();
   await requireBroker();
   const health = await brokerFetch<HealthResponse>("/health");
   const peers = await brokerFetch<PeerInfo[]>("/list-peers", {});
@@ -550,7 +626,7 @@ async function cmdStart() {
     console.log("Broker is already running.");
     return;
   }
-  const proc = nodeSpawn("npx", ["tsx", BROKER_PATH], {
+  const proc = nodeSpawn(process.execPath, [TSX_CLI, BROKER_PATH], {
     stdio: ["ignore", "ignore", "inherit"],
     detached: true,
   });
@@ -588,7 +664,7 @@ async function cmdLanStart(args: string[]) {
   }
 
   const env = { ...process.env, CCT_HOST: "0.0.0.0", CCT_TOKEN: token };
-  const proc = nodeSpawn("npx", ["tsx", BROKER_PATH], {
+  const proc = nodeSpawn(process.execPath, [TSX_CLI, BROKER_PATH], {
     stdio: ["ignore", "ignore", "inherit"],
     env,
     detached: true,
@@ -1264,8 +1340,13 @@ try {
     case undefined:
       await cmdHelp();
       break;
+    case "version":
+    case "--version":
+    case "-v":
+      console.log(packageVersion());
+      break;
     case "status":
-      await cmdStatus();
+      await cmdStatus(subArgs);
       break;
     case "whoami":
       await cmdWhoami();

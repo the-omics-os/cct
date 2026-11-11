@@ -1,10 +1,31 @@
 # Changelog
 
-## 0.2.2 — candidate, unpublished
+## 0.2.3 — candidate, unpublished
 
 Source candidate only. Not published, tagged, pushed or installed. The footer has
 automated acceptance only: no user visual approval is recorded for it. The 0.2.1
-approval covers the incoming and outgoing cards.
+approval covers the incoming and outgoing cards. The earlier 0.2.2 candidate was
+never published; its footer and flag changes ship in 0.2.3.
+
+### Added
+
+- `cct version` (also `--version`, `-v`) prints the package version.
+- `cct status --json` prints one machine-readable object without requiring a
+  running broker: `schema` (1), `version`, `package_dir`, `node`, `broker`
+  (`url`, `mode`, `running`, `peers`, `pools`) and `os` (resolved settings, MCP and
+  wrapper-state paths; `extension`, `wrapper`, `adapter_state`, `mcp_server`,
+  `mcp_command_ok`, `mcp_env_ok`, `stale`, `connected`, `errors`). It is read-only
+  and exits 0 whatever the state. `connected` means this package's
+  `os-extension.ts` is enabled and `mcpServers.cct` runs this package's
+  `server.ts` with an existing command and the os environment. `stale` means
+  entries from another CCT install: rerun `cct install --os`.
+
+### Fixed
+
+- The broker is now started with the node running CCT and CCT's own pinned tsx
+  (`server.ts` lazy start, `cct start`, `cct lan-start`). These used
+  `npx tsx`, which on a global install could download an unpinned tsx or fail
+  offline. The opencode plugin and the Claude/Codex MCP launch commands are unchanged.
 
 ### Changed
 
@@ -33,12 +54,12 @@ approval covers the incoming and outgoing cards.
   read only the count and are unchanged, but they echo the escaped entries into
   reason text. Pool names containing those characters therefore appear escaped there.
   The personal Claude statusline shows the stored escaped form.
-- Version 0.2.2 in `package.json`, `package-lock.json` and `npm-shrinkwrap.json`.
+- Version 0.2.3 in `package.json`, `package-lock.json` and `npm-shrinkwrap.json`.
 
 ### Compatibility
 
 - Unread flag: no wire schema change. A flag is rewritten only by its own peer's MCP
-  server. Until that peer runs 0.2.2 and polls, or calls `cct_check_messages`, its footer
+  server. Until that peer runs 0.2.3 and polls, or calls `cct_check_messages`, its footer
   may show: a raw name containing an escape-like sequence (`%2C`, `%44M`, …) decoded
   (`a%2Cb` as `a,b`); a raw pool named exactly `DM` as direct unread (`DM(n)`, not
   `@DM(n)`); or `flags unavailable` for a raw name containing `,`. Totals, counts, hook
@@ -78,7 +99,7 @@ approval covers the incoming and outgoing cards.
 - `npm run test:os-footer` runs both footer suites. `test-os-inbox-pump.ts` asserts the
   footer and the `/cct-wake` diagnostic separately.
 
-### Known issues (preexisting; not changed in 0.2.2)
+### Known issues (preexisting; not changed in 0.2.3)
 
 - The os unread flag and body feed use `/message/peek`, which does not filter by active
   pool membership. `/message/unread-count` does. Unread messages from a pool the peer
