@@ -1,9 +1,9 @@
 # Canonical os automatic DM body delivery
 
 This is the current D19 delivery contract, superseding D18 notices. The filename
-preserves its design history. **0.2.1 is the last published release and is
-registry-verified; user UI approval covers the 0.2.1 cards.** Local installation uses the
-published wrapper. The unpublished 0.2.3 candidate changes only the footer and the
+preserves its design history. **0.2.3 is the latest published release; user UI
+approval covers the 0.2.1 cards.** Local installation uses the published wrapper.
+Relative to 0.2.1, 0.2.3 changes only the footer and the
 unread-flag presentation (ARCHITECTURE D20); body delivery and acknowledgment
 semantics are unchanged.
 

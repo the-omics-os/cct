@@ -24,7 +24,7 @@
 //                  broker row only.
 //
 // Tools (`cct`, `cct_check_messages`), the busy gate, and idle wake arrive in
-// PHASE_2/PHASE_3. Design + decision register: .planning/opencode-runtime/PLAN.md
+// later phases.
 
 import type { Hooks, PluginInput } from "@opencode-ai/plugin";
 import { createHash } from "node:crypto";

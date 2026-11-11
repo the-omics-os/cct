@@ -1,9 +1,8 @@
 # Changelog
 
-## 0.2.3 — candidate, unpublished
+## 0.2.3
 
-Source candidate only. Not published, tagged, pushed or installed. The footer has
-automated acceptance only: no user visual approval is recorded for it. The 0.2.1
+The footer has automated acceptance only: no user visual approval is recorded for it. The 0.2.1
 approval covers the incoming and outgoing cards. The earlier 0.2.2 candidate was
 never published; its footer and flag changes ship in 0.2.3.
 
