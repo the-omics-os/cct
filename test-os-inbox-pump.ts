@@ -123,6 +123,13 @@ try {
     f.end("completed", stopReason); f.receipt([2, 5]);
     f.offer([]); f.settle(); f.tick(); assert.equal(f.sends.length, 1, "successful rows never loop");
   });
+  test("idle start via custom-message before_agent_start (Pi #10739) does not draft the batch twice", f => {
+    f.offer([dm(1), dm(2)]); f.tick(); assert.equal(f.sends.length, 1);
+    const before = f.event("before_agent_start", { messageType: "custom", message: { ...f.sends[0].message, role: "custom" } });
+    assert.equal(before, undefined, "own starting batch must not be drafted again");
+    f.idle = false; f.event("agent_start"); f.event("turn_start");
+    f.context(f.sends[0].message); f.end(); f.receipt([1, 2]);
+  });
   test("unrelated assistant with no context cannot ack", f => { f.offer(); f.tick(); f.begin(); f.end(); f.noReceipt(); });
   test("message_end history notification alone cannot ack", f => {
     f.offer(); f.tick(); f.begin();

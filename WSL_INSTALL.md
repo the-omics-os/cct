@@ -4,7 +4,7 @@ Install from a reviewed CCT npm tarball without a source checkout. Target:
 Windows 11, WSL2 Ubuntu, **Node.js 22.19.0 or newer**, and all working files on
 the WSL Linux filesystem (for example `$HOME/companions`, not `/mnt/c`).
 
-Use the reviewed `omicsos-cct-0.2.3.tgz` release asset, verified against its
+Use the reviewed `omicsos-cct-0.2.4.tgz` release asset, verified against its
 published sha256, not an assumption about npm `latest`. Runtime dependencies are pinned to
 SDK 1.30.1 and tsx 4.23.15.
 
@@ -36,10 +36,10 @@ package; the explicit settings entry is what enables the factory.
 
 ## Install CCT
 
-Copy the reviewed `omicsos-cct-0.2.3.tgz` into `$HOME/companions/cct/` within WSL:
+Copy the reviewed `omicsos-cct-0.2.4.tgz` into `$HOME/companions/cct/` within WSL:
 
 ```bash
-npm install --global "$HOME/companions/cct/omicsos-cct-0.2.3.tgz"
+npm install --global "$HOME/companions/cct/omicsos-cct-0.2.4.tgz"
 
 # Use the same directories/config mode for both installer and os host.
 export OS_CODING_AGENT_DIR="$HOME/.os/agent"

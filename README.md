@@ -42,10 +42,11 @@ The outgoing formatter ships as CCT's `os-mcp-extension.ts` wrapper, delegating
 to the unmodified `pi-mcp-adapter@2.33.0` factory. No os-core or third-party file
 edits are required. See the [delivery contract](https://github.com/the-omics-os/cct/blob/v0.2.1/cct/DM_BODY_PROTOTYPE.md).
 
-**Release status:** 0.2.3 is published on npm and GitHub. User UI approval covers
+**Release status:** 0.2.4 is published on npm and GitHub. It is 0.2.3 plus a fix
+for duplicate DM bodies on idle wakes with os 1.3+. User UI approval covers
 the 0.2.1 cards; the 0.2.3 footer has automated acceptance only. The existing
-`v0.2.0` tag is preserved. See [release notes](https://github.com/the-omics-os/cct/releases/tag/v0.2.3)
-and CHANGELOG `0.2.3`.
+`v0.2.0` tag is preserved. See [release notes](https://github.com/the-omics-os/cct/releases/tag/v0.2.4)
+and CHANGELOG `0.2.4`.
 
 ## Quick Start
 
