@@ -1,5 +1,94 @@
 # Changelog
 
+## 0.2.2 — candidate, unpublished
+
+Source candidate only. Not published, tagged, pushed or installed. The footer has
+automated acceptance only: no user visual approval is recorded for it. The 0.2.1
+approval covers the incoming and outgoing cards.
+
+### Changed
+
+- os footer consolidation: the canonical `os-extension.ts` owns one footer status key,
+  `cct`, shown as `CCT: <peer name> | DM(n) | @pool(n) | <short exceptional state>`.
+  The personal statusline duplicated identity and flags. It is superseded by this key
+  once activation is decided. `cct-wake` no longer owns a status key.
+- Each unread pool is its own `|` segment, for example
+  `CCT: os-xxxx | DM(2) | @alpha(1) | @beta(3)`. Pools are no longer space-joined
+  inside one segment, and the earlier three-pool cap and `+N` overflow are removed. A
+  `|` inside a pool name is shown as `¦` so separators stay unambiguous.
+- A display name longer than 40 characters is never truncated. The footer shows the
+  unique peer ID instead, because an ellipsis could resemble another peer.
+- Footer file reads are bounded: file B 4 KiB, session marker 512 bytes and unread flag
+  64 KiB. Larger files are rejected whole, never truncated. An oversized flag shows
+  `flags unavailable`. The delivery path reads file B with the same 4 KiB bound; valid
+  files behave as before.
+- A malformed, oversized or unreadable file B keeps the identity already resolved in
+  the session. Delivery still cannot resolve the peer from that file, so it reports
+  `inbox stale` and makes no delivery attempt.
+- Verbose delivery reasons stay in `/cct-wake`. The footer shows only short
+  exceptional states. Usual scheduled, appended and pending states are omitted.
+- Unread flag contract in `shared/unread-flag.ts`, shared by every writer and reader.
+  Pool names escape `%`, `,`, `:`, `|`, control characters and the exact name `DM`
+  (as `%44M`). Direct unread stays `DM`. `total` is the sum of the entries. Hook scripts
+  read only the count and are unchanged, but they echo the escaped entries into
+  reason text. Pool names containing those characters therefore appear escaped there.
+  The personal Claude statusline shows the stored escaped form.
+- Version 0.2.2 in `package.json`, `package-lock.json` and `npm-shrinkwrap.json`.
+
+### Compatibility
+
+- Unread flag: no wire schema change. A flag is rewritten only by its own peer's MCP
+  server. Until that peer runs 0.2.2 and polls, or calls `cct_check_messages`, its footer
+  may show: a raw name containing an escape-like sequence (`%2C`, `%44M`, …) decoded
+  (`a%2Cb` as `a,b`); a raw pool named exactly `DM` as direct unread (`DM(n)`, not
+  `@DM(n)`); or `flags unavailable` for a raw name containing `,`. Totals, counts, hook
+  scripts and delivery are unaffected, and the footer never drives delivery or
+  acknowledgment. No migration is provided. Protocol expansion was rejected as
+  disproportionate for a display-only ambiguity.
+
+### Fixed
+
+- A real pool named `DM` was indistinguishable from direct unread in the flag.
+- Pool names containing `,`, `:` or `|` could corrupt the flag summary.
+- After `cct_check_messages`, the non-os flag kept a per-pool summary that still
+  counted the batch just returned, while the total excluded it. Summary and total
+  now agree. Legacy flags the strict reader cannot parse unambiguously (for example
+  a comma inside a pool name) show `flags unavailable` until the next poll rewrites them.
+
+### Tests
+
+- `test-os-footer.ts`: flag and identity contract, freshness boundaries, footer
+  composition (one segment per pool), and the real os-extension status surface with
+  the single `cct` key.
+- `test-os-footer-broker.ts`: isolated real broker plus real os and claude MCP
+  servers. The flag matches broker rows, including a pool named `DM` and delimiter
+  names. Each pool is checked as its own footer segment. Also checks no stale summary
+  after `cct_check_messages`.
+- `test-os-autostart.py` (installed-runtime acceptance) reads the canonical `cct` key
+  from the host RPC `setStatus` stream. It no longer loads or reads a personal
+  footer. Its MCP child environment matches `cct install --os`
+  (`CCT_TOOL_SURFACE=compact`, `CCT_OS_INBOX_BODY=1`), because the footer's inbox state
+  depends on the body feed. It asserts the footer and the absence of any `cct-wake`
+  status key. Private HOME, CCT_DIR and broker; no operator state is read or written.
+- `test-compact-packed.ts` accepts `CCT_PACK_ARTIFACT` (and optional
+  `CCT_PACK_ARTIFACT_SHA256`) to test an exact archive instead of a fresh pack.
+- `test-os-footer.ts` also covers the 40/41-character name boundary, identity fallback,
+  bounded B, marker and flag reads (exact limit and one byte over), and exactly one
+  identity segment.
+- `npm run test:os-footer` runs both footer suites. `test-os-inbox-pump.ts` asserts the
+  footer and the `/cct-wake` diagnostic separately.
+
+### Known issues (preexisting; not changed in 0.2.2)
+
+- The os unread flag and body feed use `/message/peek`, which does not filter by active
+  pool membership. `/message/unread-count` does. Unread messages from a pool the peer
+  has left therefore still count in the os footer and body feed, and in
+  `cct_check_messages`. Verified on a private broker
+  (before leave: unread-count 2, after leave: unread-count 0, peek 2). No regression
+  covers it yet. Fixing it changes delivery and needs its own decision.
+- At startup the os footer can show `inbox stale` for up to about two seconds, until the
+  first poll writes the body feed.
+
 ## 0.2.1 — 2026-10-12
 
 Published as `@omicsos/cct@0.2.1` and GitHub `v0.2.1`. The registry artifact,
@@ -14,7 +103,7 @@ GitHub `v0.2.0` tag is preserved; no earlier history was overwritten.
   context. This is response evidence, **not task-completion acknowledgment**.
 - Readable incoming sender/body and outgoing target/body/status cards, with
   explicit foreground and matching background across wrapped/padded rows.
-  User visual approval is complete.
+  User visual approval of these cards is complete.
 - Shipped CCT-owned `os-mcp-extension.ts` presentation wrapper delegating to the
   original, unmodified `pi-mcp-adapter@2.33.0` factory. Only CCT display callbacks
   are decorated; no os-core or third-party file edits are required.

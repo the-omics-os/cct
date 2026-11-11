@@ -187,7 +187,9 @@ try {
       now += 65_000;
     }
     f.offer(); f.tick(); assert.equal(f.sends.length, 3); f.noReceipt();
-    assert.match(f.statuses.at(-1)!, /three delivery failures/);
+    assert.equal(f.statuses.at(-1), "CCT: fixture | 3 failures", "footer keeps identity and a short exceptional state");
+    f.command("status", f.ctx);
+    assert.match(f.notifications.at(-1)!, /three delivery failures/, "/cct-wake keeps the full diagnostic");
     f.resume(); f.tick(); assert.equal(f.sends.length, 4);
   });
   test("human-origin final continuations cannot evade the automatic budget", f => {

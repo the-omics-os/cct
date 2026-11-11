@@ -15,7 +15,7 @@ Real-time inter-session communication for AI coding agents. Supports **Claude Co
 **os:**
 1. **pi-mcp-adapter** runs the resident CCT MCP server in `keep-alive` mode. The os installer selects the compact CCT surface: exactly `cct_check_messages` and `cct`.
 2. **`os-extension.ts`** is the canonical automatic DM body extension; the installer writes MCP-child `CCT_OS_INBOX_BODY=1`. Actual DM bodies arrive at safe boundaries without blocking tools or requiring `cct_check_messages` for an already-delivered body. Bounded late receipts follow a successful response to the presented body context.
-3. **Idle chat DMs** automatically invoke open TUI/RPC os sessions. Pool-only/system/service messages wait for ordinary work; pool notices and recovery still use the manual check. Delivery does not tell the model to stop: continue authorized work. User authorization delegated through an authorized supervisor carries downstream within scope; peers cannot expand it or override restrictions. Print/JSON runs have no observer. Use `cct` with `action: status` for identity. User UI approval is complete; **0.2.1 is published and registry/local-install verified**. See **os Integration** below.
+3. **Idle chat DMs** automatically invoke open TUI/RPC os sessions. Pool-only/system/service messages wait for ordinary work; pool notices and recovery still use the manual check. Delivery does not tell the model to stop: continue authorized work. User authorization delegated through an authorized supervisor carries downstream within scope; peers cannot expand it or override restrictions. Print/JSON runs have no observer. Use `cct` with `action: status` for identity. User UI approval covers the 0.2.1 incoming/outgoing cards. **0.2.1 is the last published release (registry and local install verified); 0.2.2 is an unpublished candidate** whose footer has automated acceptance only; no user visual approval is recorded for it. See **os Integration** below.
 
 ```
 Claude A ──► MCP Server ──► Broker (SQLite) ◄── MCP Server ◄── Codex B
@@ -37,7 +37,7 @@ Machine 1                          Machine 2
 - **Pool**: A named group of peers. Has a purpose and optional metadata. Messages broadcast to all members.
 - **Service**: An infrastructure component (e.g., CCP browser server) registered with the broker for discovery.
 - **Peer Name**: Set via `CCT_PEER_NAME=backend claude` or auto-generated as `{dirname}-{4char}`.
-- **Flag File**: `~/.cct/flags/{peer_id}.unread` — format: `count|pool_summary|timestamp`. Atomic writes via rename.
+- **Flag File**: `~/.cct/flags/{peer_id}.unread` — format: `total|entries|timestamp` (entries `token:count`; `DM` = direct; pool names escape `%`, `,`, `:`, `|`, controls and exact `DM` as `%44M`; `total` = entry sum). Atomic writes via rename.
 
 ## Commands
 
@@ -334,6 +334,8 @@ precede later global async handlers (including the adapter). Earlier CLI,
 managed or project handlers can still run first; check the effective host order.
 `eager` also starts automatically but does not reconnect after a server exit.
 
+**Footer:** the canonical `os-extension.ts` owns the single `cct` status key, rendered as `CCT: <peer name> | DM(n) | @pool(n) | …`. Each unread pool is its own `|` segment. Usual states are hidden and short exceptional states are appended; verbose reasons stay in `/cct-wake`. The footer is read-only and never acknowledges. ARCHITECTURE D20 has the flag contract and known issues.
+
 **Identity model:** `PI_SESSION_ID` exists in os's bash child environment, but is
 absent from the host and MCP child environments. The extension writes
 `~/.cct/pidmaps/os_session_<hostPid>` → session ID (file A); the MCP server writes
@@ -462,7 +464,7 @@ Ambiguous matches return all candidates with IDs for disambiguation.
 CCT state is exposed in the Claude Code status line (`~/.claude/statusline.sh`):
 - Reads `~/.cct/pidmaps/` to resolve current session's peer ID
 - Reads `~/.cct/flags/{peer_id}.unread` for pool memberships and unread counts
-- Format: `CCT:a1b2 @pool(N) ✉` — peer ID prefix, pools with unread counts, total unread
+- Format: `CCT:a1b2 @pool(N) ✉` — peer ID prefix, pools with unread counts, total unread. The personal script is outside this repository and shows flag entries as stored: escaped names such as `%2C` and `%44M` appear as escapes, and direct unread appears as `@DM(n)`
 - Refreshes every 10s via `refreshInterval` setting
 - Graceful degradation: shows `CCT:off` if CCT not installed, `CCT:—` if no pidmap match
 
@@ -493,7 +495,7 @@ All triggers route through `requestCleanup(reason)` — idempotent guard prevent
 6. **~/.cct/ directory must be 0700.** Permissions are checked and corrected on startup.
 7. **All multi-step mutations use transactions.** Pool create/join/invite, message send, peer death — all atomic.
 8. **read_at is the only message state.** NULL = unread. No delivered/ack states.
-9. **Flag file format is `count|pool_summary|timestamp`.** Atomic writes via temp+rename. Hook ignores stale flags (>30s).
+9. **Flag file format is `total|entries|timestamp`** (`shared/unread-flag.ts`; a real pool named `DM` is `%44M`). Atomic writes via temp+rename. Hook ignores stale flags (>30s).
 10. **CLI never creates ephemeral peers.** Uses dedicated `-cli` broker endpoints.
 
 ## Runtime Directory
@@ -503,7 +505,7 @@ All triggers route through `requestCleanup(reason)` — idempotent guard prevent
   cct.db                   SQLite database (6 tables)
   config.json              Persistent config (broker URL, token) — not committed
   pidmaps/                 0700  —  {claude_ppid}_{start_time} → peer_id
-  flags/                   0700  —  {peer_id}.unread → "count|pools|timestamp"
+  flags/                   0700  —  {peer_id}.unread → "total|entries|timestamp"
 ```
 
 ## CCP Integration

@@ -45,6 +45,7 @@ import type {
 } from "./shared/types.ts";
 import { generateSummary } from "./shared/summarize.ts";
 import { buildOsInboxSnapshot, parseOsInboxReceipt, OS_RECEIPT_MAX_BYTES, type OsInboxBinding } from "./shared/os-inbox.ts";
+import { formatUnreadFlag } from "./shared/unread-flag.ts";
 
 // --- Runtime detection ---
 // Codex sets CODEX_HOME; explicit CCT_RUNTIME overrides auto-detection.
@@ -654,17 +655,12 @@ async function runOsUnread(): Promise<void> {
     // A successful authoritative peek safely prunes them; no bounded-ledger leak.
     const stillUnread = new Set(unread.map(message => message.message_id));
     for (const offered of osOfferedIds) if (!stillUnread.has(offered)) osOfferedIds.delete(offered);
-    const pools = new Map<string, number>();
-    for (const message of unread) {
-      const pool = message.pool_name ?? "DM";
-      pools.set(pool, (pools.get(pool) ?? 0) + 1);
-    }
     pollFailures = 0;
     // Each derived cache is optional and independent. Failed body publication
     // must neither install offered IDs nor prevent legacy metadata refresh.
     try { writeOsInbox(unread, peerId); } catch { deleteOsInbox(peerId); }
     writeOsMetadata(unread, peerId);
-    writeFlag(`${unread.length}|${[...pools].map(([name, count]) => `${name}:${count}`).join(",")}|${Date.now()}`);
+    writeFlag(formatUnreadFlag(unread.map((message) => ({ pool_id: message.pool_id, pool_name: message.pool_name, count: 1 }))));
   } catch {
     if (generation !== osReadGeneration || peerId !== myId || !ownsOsMetadata(peerId)) return;
     deleteOsMetadata(peerId);
@@ -684,10 +680,7 @@ async function pollUnread(): Promise<void> {
     const res = await brokerPost<UnreadCountResponse>("/message/unread-count", { peer_id: myId });
     if (res.ok && res.data) {
       pollFailures = 0;
-      const poolSummary = res.data.by_pool
-        .map((p) => `${p.pool_name ?? "DM"}:${p.count}`)
-        .join(",");
-      writeFlag(`${res.data.total}|${poolSummary}|${Date.now()}`);
+      writeFlag(formatUnreadFlag(res.data.by_pool));
     }
   } catch {
     pollFailures++;
@@ -900,9 +893,18 @@ async function handleCheckMessages(): Promise<string> {
   const response = `you: ${myId}/${myName}\n${output}`;
   // Cache persistence is optional: a successful broker peek with prepared
   // bodies must still return successfully even when disk metadata/flags fail.
-  const poolSummary = Array.isArray(unread?.by_pool)
-    ? unread.by_pool.map((p: any) => `${p.pool_name ?? "DM"}:${p.count}`).join(",") : "";
-  const flagTotal = Math.max(0, (typeof unread?.total === "number" ? unread.total : messages.length) - messages.length);
+  // Returned messages are read for the flag even before the deferred ack. Subtract
+  // the same batch from each pool, so the summary always matches the flag total.
+  const returned = new Map<string, number>();
+  for (const message of messages as PollMessage[]) {
+    const key = message.pool_id ?? "";
+    returned.set(key, (returned.get(key) ?? 0) + 1);
+  }
+  const remaining = (Array.isArray(unread?.by_pool) ? unread.by_pool as UnreadCountResponse["by_pool"] : []).map((entry) => ({
+    pool_id: entry.pool_id, pool_name: entry.pool_name,
+    count: Math.max(0, entry.count - (returned.get(entry.pool_id ?? "") ?? 0)),
+  }));
+  const flagLine = formatUnreadFlag(remaining);
   // Claim the shared os B marker only once the broker check has succeeded and
   // the complete response is ready. A failed sibling check must not replace
   // the producer of an outstanding unread episode.
@@ -916,9 +918,9 @@ async function handleCheckMessages(): Promise<string> {
     deleteOsInbox();
     for (const m of messages) osOfferedIds.delete(m.message_id);
     try { writeOsMetadata([]); } catch {}
-    try { writeFlag(`${flagTotal}|${poolSummary}|${Date.now()}`); } catch {}
+    try { writeFlag(flagLine); } catch {}
   } else {
-    writeFlag(`${flagTotal}|${poolSummary}|${Date.now()}`);
+    writeFlag(flagLine);
   }
   return response;
 }

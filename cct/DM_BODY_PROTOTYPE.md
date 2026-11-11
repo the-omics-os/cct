@@ -1,8 +1,11 @@
 # Canonical os automatic DM body delivery
 
 This is the current D19 delivery contract, superseding D18 notices. The filename
-preserves its design history. **0.2.1 is published and registry-verified; user
-UI approval is complete.** Local installation uses the published wrapper.
+preserves its design history. **0.2.1 is the last published release and is
+registry-verified; user UI approval covers the 0.2.1 cards.** Local installation uses the
+published wrapper. The unpublished 0.2.2 candidate changes only the footer and the
+unread-flag presentation (ARCHITECTURE D20); body delivery and acknowledgment
+semantics are unchanged.
 
 ## Components and setup
 
@@ -83,7 +86,7 @@ history shows a display-unavailable diagnostic, not raw protocol framing.
 Both incoming and outgoing cards paint the theme's `text` foreground and an
 explicit `customMessageBg` background on every wrapped/padded row. This avoids
 placing light-theme dark text on an unknown terminal background. The user
-personally confirmed readability; no further UI approval is pending.
+personally confirmed the 0.2.1 card readability. No user visual approval is recorded for the 0.2.2 footer.
 
 Outgoing direct `cct` sends show `CCT → target`, full body and `Sending…`,
 `Sent`, `Send failed` or `Send status unknown`. Only the pinned adapter's direct
@@ -183,7 +186,7 @@ native compaction, reload, wrapped incoming/outgoing cards and restored history.
 Private HOME/broker and synthetic-provider observations verify actual provider
 body payloads, zero model inbox-tool calls, retained cancellation, late read and
 owned cleanup. Real-model exchanges separately verified automatic delivery and
-scoped delegated continuation. User visual approval is complete.
+scoped delegated continuation. User visual approval covers the 0.2.1 cards.
 
 Former D18 notice/wake/hardening/endurance results are historical, not current
 body-delivery acceptance. No long body-delivery soak or arbitrary host certification

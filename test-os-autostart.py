@@ -2,10 +2,14 @@
 """Automatic os registration: real installed host/adapter, isolated broker/provider.
 
 CCT_OS_ADAPTER=/path/to/index.ts python3 test-os-autostart.py
-No external model, production broker, or real peer messages are used.
+The footer under test is the canonical os-extension.ts `cct` status key, read from the
+host's RPC setStatus stream. No personal extension is loaded or read. Private HOME and
+CCT_DIR, an isolated broker and a synthetic provider; no external model or production
+broker and no real peer messages.
 """
 import json
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 import shutil
@@ -20,7 +24,6 @@ REPO = Path(__file__).resolve().parent
 NODE = shutil.which("node")
 OS_BIN = os.environ.get("CCT_OS_BIN") or shutil.which("os")
 ADAPTER = Path(os.environ["CCT_OS_ADAPTER"]).resolve()
-FOOTER = Path(os.environ.get("CCT_OS_FOOTER", str(Path.home() / ".os/extensions/statusline.ts")))
 PORT = int(os.environ.get("CCT_OS_TEST_PORT", "17934"))
 with socket.socket() as probe:
     probe.bind(("127.0.0.1", PORT))
@@ -61,6 +64,9 @@ def rows(query, args=()):
         return [dict(row) for row in db.execute(query, args)]
 
 
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
 def jsonlines(path):
     return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
@@ -71,20 +77,6 @@ let marker=null;
 try { marker=fs.readFileSync(`${process.env.CCT_DIR}/pidmaps/os_session_${process.ppid}`,"utf8").trim(); } catch {}
 fs.appendFileSync(process.env.PROBE_LAUNCH_LOG,JSON.stringify({pid:process.pid,ppid:process.ppid,at:Date.now(),marker})+"\\n");
 await import(""" + json.dumps(str(REPO / "server.ts")) + ");\n")
-FOOTER_PROBE = WORK / "footer-observer.ts"
-FOOTER_PROBE.write_text("import footer from " + json.dumps(str(FOOTER)) + """;
-import fs from "node:fs";
-export default function(pi:any) {
-  footer({on(event:any,handler:any) {
-    pi.on(event,(e:any,ctx:any)=>handler(e,{...ctx,hasUI:true,ui:{...ctx.ui,setStatus(key:string,text:string|undefined) {
-      const cct=text?.split(" | ").find((s:string)=>s.startsWith("CCT:"));
-      fs.appendFileSync(process.env.PROBE_LOG!,JSON.stringify({kind:"footer",at:Date.now(),cct})+"\\n");
-    }}}));
-  }});
-}
-""")
-
-
 class Session:
     def __init__(self, name, order="adapter-first", lifecycle="keep-alive", agent=None, resume=None):
         self.dir = WORK / name
@@ -101,14 +93,17 @@ class Session:
         extensions = [str(ADAPTER), str(REPO / "os-extension.ts")]
         if order == "marker-first":
             extensions.reverse()
-        extensions += [str(REPO / "test-fixtures/os/probe.ts"), str(FOOTER_PROBE)]
+        extensions += [str(REPO / "test-fixtures/os/probe.ts")]
         (self.agent / "settings.json").write_text(json.dumps({
             "extensions": extensions, "compaction": {"enabled": False}, "retry": {"enabled": False},
             "defaultProvider": "cct-probe", "defaultModel": "local",
         }))
         (self.agent / "mcp.json").write_text(json.dumps({"mcpServers": {"cct": {
             "command": NODE, "args": ["--import", LOADER, str(LAUNCHER)],
-            "env": {"CCT_RUNTIME": "os"}, "lifecycle": lifecycle,
+            # Same env `cct install --os` writes (AGENTS.md "Required CCT adapter settings").
+            # The footer's `inbox` state depends on the body feed, so omitting it reports stale.
+            "env": {"CCT_RUNTIME": "os", "CCT_TOOL_SURFACE": "compact", "CCT_OS_INBOX_BODY": "1"},
+            "lifecycle": lifecycle,
             "directTools": True, "toolPrefix": "none", "debug": True,
         }}}))
         env = {**BASE, "HOME": str(self.home), "TMPDIR": str(self.dir), "TERM": "dumb",
@@ -162,12 +157,21 @@ class Session:
         return [e for e in jsonlines(self.log) if e.get("kind") == "tool_call"]
 
     def footer(self):
-        return next((e["cct"] for e in reversed(jsonlines(self.log))
-                     if e.get("kind") == "footer" and e.get("cct")), None)
+        """Last text of the canonical `cct` status key, as the host reports it over RPC."""
+        value = None
+        for e in jsonlines(self.rpc_log):
+            if e.get("type") == "extension_ui_request" and e.get("method") == "setStatus" \
+                    and e.get("statusKey") == "cct":
+                value = e.get("statusText")
+        return None if value is None else ANSI.sub("", value)
+
+    def status_keys(self):
+        return {e.get("statusKey") for e in jsonlines(self.rpc_log)
+                if e.get("type") == "extension_ui_request" and e.get("method") == "setStatus"}
 
     def ready(self):
         peer = wait(lambda: next((p for p in self.peers() if p["session_key"] == "os:" + self.sid), None))
-        wait(lambda: self.footer() == "CCT:" + peer["name"], timeout=20)
+        wait(lambda: self.footer() == "CCT: " + peer["name"], timeout=20)
         return peer
 
     def snapshot(self, name):
@@ -273,11 +277,13 @@ try:
     s.snapshot("child-recovered")
     s.prompt("/probe-disable-cct")
     flag = CCT / "flags" / f"{peer['id']}.unread"
-    flag.write_text(f"1||{int(time.time() * 1000)}")
+    flag.write_text(f"1|DM:1|{int(time.time() * 1000)}")
     check("inactive check_messages does not block ordinary tools",
           not s.tool("bash", {"command": "true"}).get("isError"))
     s.prompt("/probe-enable-cct")
     check("CCT read remains callable", not s.tool("cct_check_messages", {}).get("isError"))
+    check("single canonical footer: only the cct key, never the retired cct-wake key",
+          "cct" in s.status_keys() and "cct-wake" not in s.status_keys())
     s.stop()
     wait(lambda: not s.peers())
 
@@ -286,7 +292,7 @@ try:
     lazy.ready()
     lazy.stop()
     lazy = Session("lazy-warm", lifecycle="lazy-keep-alive", agent=lazy.agent)
-    wait(lambda: lazy.footer() == "CCT:pending")
+    wait(lambda: lazy.footer() == "CCT: pending")
     time.sleep(2)
     snap = lazy.snapshot("lazy-differential")
     check("old warm lazy mode remains pending without registration",

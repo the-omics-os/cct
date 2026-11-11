@@ -1,8 +1,9 @@
 # CCT Architecture — Design Decisions
 
-Core design date: 2026-04-19. Current release target: 0.2.1.
-Status: design authority; user UI approval complete, release publication and
-verification in progress. D16–D19 extend the original Claude-only design.
+Core design date: 2026-04-19. Last published release: 0.2.1. Current candidate: 0.2.2
+(unpublished; D20).
+Status: design authority; user UI approval covers the 0.2.1 cards. The 0.2.2 footer (D20) has automated acceptance and no recorded user visual approval. D16–D20 extend the original
+Claude-only design.
 The existing `v0.2.0` tag is preserved, not overwritten.
 
 ## Design Decisions (resolved)
@@ -15,7 +16,7 @@ The research proves no MCP-native push exists for API auth. PreToolUse hook is o
 ### D2: Single source of truth
 **Decision: SQLite broker only. No file-based message queues.**
 
-The broker owns all state: peers, pools, memberships, messages. The hook does NOT read inbox bodies or curl the broker. Instead, the **MCP server writes a derived flag** (`~/.cct/flags/{peer_id}.unread`, containing `count|pool_summary|timestamp`) whenever it polls the broker. The hook reads this small file and ignores stale flags. The MCP server keeps the flag in sync; SQLite remains authoritative.
+The broker owns all state: peers, pools, memberships, messages. The hook does NOT read inbox bodies or curl the broker. Instead, the **MCP server writes a derived flag** (`~/.cct/flags/{peer_id}.unread`, containing `total|entries|timestamp`, D20) whenever it polls the broker. The hook reads this small file and ignores stale flags. The MCP server keeps the flag in sync; SQLite remains authoritative.
 
 Flow:
 ```
@@ -245,12 +246,13 @@ Use the adapter's existing `keep-alive` setting; no adapter patch is required.
 D19's installer puts canonical CCT first among explicit global entries. Connections must settle to one live MCP process and one
 active peer per host, with the resolved session key. The installer persists the
 setting without changing other clients' configuration. The footer remains a
-reader of A and B. No timeout is claimed to make every marker race impossible;
+reader of A, B and the unread flag (D20). No timeout is claimed to make every marker race impossible;
 delayed and absent-marker controls exercise the fallback.
 
 **Historical blocking contract (superseded by D18 for os).** os `tool_call` handlers must return
 `{ block: true, reason }` (`runner.ts:982-1003`). Throwing produces an extension
-error and does not establish this block contract. The handler exempts exact `cct`, all `cct_*` tools, and ToolSearch, reads B and the existing `count|pool_summary|timestamp` flag,
+error and does not establish this block contract. The handler exempts exact `cct`, all `cct_*` tools, and ToolSearch, reads B and the then-current `count|pool_summary|timestamp` flag (superseded by
+D20's `total|entries|timestamp`),
 and ignores stale or malformed flags. Both delivery handlers require the exact
 `cct_check_messages` tool to be active. Missing identity emits one diagnostic
 per session; missing identity or an unavailable direct tool allows work without
@@ -473,8 +475,8 @@ long body-delivery soak.
 
 **Decision:** integrate actual-body delivery in canonical `os-extension.ts`.
 D19 supersedes D18's one-shot notice/controller for os only; Claude/Codex hooks,
-manual tools and SQLite `read_at` semantics are unchanged. User UI approval is
-complete; 0.2.1 publication verification remains in progress.
+manual tools and SQLite `read_at` semantics are unchanged. User UI approval covers the
+0.2.1 cards; 0.2.1 is published and verified.
 
 **Installation:** `cct install --os` selects canonical `os-extension.ts`, removes
 duplicate canonical/prototype entries, preserves unrelated order and writes
@@ -512,7 +514,7 @@ full body and honest pending, broker-confirmed, failed or unknown status. Both
 paint explicit `text` foreground and matching `customMessageBg` background on
 wrapped/padded rows. Terminal control neutralization is display-only. Model
 framing and receipt semantics are unchanged. `Sent` is broker send confirmation,
-not recipient reading or task completion. User visual approval is complete.
+not recipient reading or task completion. User visual approval covers these 0.2.1 cards.
 Node minimum is 22.19.0; runtime pins are SDK 1.30.1 and tsx 4.23.15.
 
 **Channel:** the B-marker owner polls every two seconds and publishes atomic
@@ -578,7 +580,7 @@ plus installed RPC/TUI cases cover actual bodies, zero model inbox-tool calls,
 cancellation retention, late acknowledgment, owned cleanup, native compaction,
 restart/reload and readable incoming/outgoing history. Real-model exchanges
 verified automatic delivery and scoped delegated continuation. The user personally
-confirmed the UI; no further UI approval is pending. D18 wake/hardening/endurance
+confirmed the 0.2.1 cards; no further approval is pending for them. The 0.2.2 footer has no recorded user visual approval. D18 wake/hardening/endurance
 results are historical, not current acceptance. No long body soak or arbitrary
 host/extension-order certification is claimed. Contract and compatibility limits:
 [DM_BODY_PROTOTYPE.md](DM_BODY_PROTOTYPE.md).
@@ -587,6 +589,63 @@ host/extension-order certification is claimed. Contract and compatibility limits
 to a claim of complete OpenCode delivery, installer or feature support.
 
 ---
+
+## D20: Single canonical os footer and escaped unread flag contract
+
+**Decision:** the canonical `os-extension.ts` is the only os footer. It owns one status
+key, `cct`, rendered as `CCT: <peer name> | DM(n) | @<pool>(n) | @<pool>(n) | …`. Each
+unread pool is its own `|` segment; none is merged, space-joined or hidden. Usual
+states are omitted. Short exceptional states (`auto-wake off`, `3 failures`,
+`flags stale`) are appended as a segment; verbose reasons stay in `/cct-wake`. The
+footer is a read-only reader of files A and B and of the unread flag. It never
+acknowledges, reads bodies or changes delivery.
+
+**Flag contract (`shared/unread-flag.ts`; one writer, one strict parser):**
+`total|entries|epoch-ms`, with `entries = token:count[,token:count]`. Direct unread is
+the token `DM`. A pool token escapes `%`, `,`, `:`, `|` and C0/C1 controls as `%HH`.
+The exact pool name `DM` is written `%44M`, so a real pool named DM never equals direct
+unread. Zero counts are never written, and `total` is always the sum of the entries.
+Legacy raw-name flags are read when they are consistent. Ambiguous or inconsistent
+flags are rejected and the footer shows `flags unavailable`; nothing is guessed. The
+footer decodes names for display and shows a `|` inside a decoded name as `¦`.
+
+**Freshness:** counts render only for a flag no older than 30 seconds and not in the
+future, and only for non-zero entries.
+
+**Identity and bounds:** a display name over 40 characters is replaced by the peer ID,
+never truncated, because an ellipsis could resemble another peer. Footer reads are bounded:
+file B 4 KiB, session marker 512 bytes, flag 64 KiB. Larger files are rejected whole. An
+oversized, malformed or unreadable B keeps the identity already resolved in the session.
+Absent B remains pending or none. The delivery path reads B with the same 4 KiB bound and
+behaves as before for valid files. An oversized flag shows `flags unavailable`.
+
+**Compatibility decision (no wire schema change):** the 0.2.2 flag keeps the 0.2.1 layout.
+A flag is rewritten only by its own peer's MCP server, and a 0.2.1 server writes raw pool
+names. Until that peer runs 0.2.2 and polls, its footer may show: a raw name containing an
+escape-like sequence (`%2C`, `%44M`, …) decoded (`a%2Cb` as `a,b`); a raw pool named `DM`
+as direct unread; or `flags unavailable` for a raw name containing `,`. The 0.2.2 server
+rewrites the flag on its next successful poll or `cct_check_messages`. No migration exists.
+Totals, counts, hook scripts and delivery are unaffected. A protocol expansion was rejected
+as disproportionate for a display-only ambiguity.
+
+**Approval status:** user visual approval covers the 0.2.1 incoming/outgoing cards. The
+0.2.2 footer has automated acceptance only: the host RPC `setStatus` stream and a real
+broker. No user visual approval is recorded for it.
+
+**Other readers:** hook scripts read only the leading count and echo the entries into
+reason text, so escaped names can appear there. The personal Claude statusline, which
+lives outside this repository, splits the entries on `,` and `:` and shows escapes as
+stored. Neither reader acknowledges messages. No delivery or acknowledgment semantics
+change in D20.
+
+**Known issues, preexisting and not changed by D20:**
+- The os flag and body feed derive from `/message/peek` (also used by
+  `cct_check_messages`). That query does not filter by active pool membership, while
+  `/message/unread-count` does. Unread messages from a pool the peer has left
+  therefore still count in the os footer and body feed. This was verified on a private
+  broker. No regression covers it yet, and fixing it would change delivery.
+- At startup the footer can show `inbox stale` for up to about two seconds, until the
+  first poll writes the body feed.
 
 ## SQLite Schema
 
@@ -669,7 +728,7 @@ CREATE INDEX idx_peers_status ON peers(status)
   pidmaps/                       0700  PID → peer_id mappings
     {claude_pid}_{start_time}          Contains: peer_id
   flags/                         0700  Fast unread count flags
-    {peer_id}.unread                   Contains: count|pool_summary|timestamp
+    {peer_id}.unread                   Contains: total|entries|timestamp (D20)
     {peer_id}.os-inbox                 Bounded automatic-body snapshot (os)
     {peer_id}.os-receipt               Bounded late response receipt (os)
 
@@ -736,8 +795,8 @@ have separate contracts. LAN Bearer authentication covers everything except
 ## Hook Logic (pure bash)
 
 `hook.sh` parses the Claude tool call, exempts CCT tools and ToolSearch, resolves
-the peer through process pidmaps and reads `count|pool_summary|timestamp` from
-the derived flag. Missing/malformed/stale flags allow work. Fresh unread counts
+the peer through process pidmaps and reads the leading count from the derived flag
+(`total|entries|timestamp`, D20; the hook ignores the entries apart from echoing them). Missing/malformed/stale flags allow work. Fresh unread counts
 block ordinary calls with the recovery tool named in the reason. `hook-codex.sh`
 implements the corresponding Codex JSON contract. The canonical os extension
 never blocks tools. These hook files are the implementation authority; no HTTP,

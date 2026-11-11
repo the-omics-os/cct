@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtemp, rm, symlink } from "node:fs/promises";
+import { copyFile, mkdtemp, readFile, rm, symlink } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawn } from "node:child_process";
@@ -18,11 +19,21 @@ const broker = spawn(process.execPath, ["--import", resolve("node_modules/tsx/di
 let transport: StdioClientTransport | undefined;
 let client: Client | undefined;
 try {
-  execFileSync("npm", ["pack", "--pack-destination", dir], { cwd: process.cwd(), stdio: "pipe" });
-  const tgz = (await import("node:fs/promises")).readdir(dir).then((files) => files.find((f) => f.endsWith(".tgz"))!);
-  const artifact = join(dir, await tgz);
+  let artifact: string;
+  if (process.env.CCT_PACK_ARTIFACT) {
+    // The exact approved archive. A fresh pack would not necessarily reproduce its bytes.
+    artifact = join(dir, "approved.tgz");
+    await copyFile(resolve(process.env.CCT_PACK_ARTIFACT), artifact);
+    const sha256 = createHash("sha256").update(await readFile(artifact)).digest("hex");
+    if (process.env.CCT_PACK_ARTIFACT_SHA256) assert.equal(sha256, process.env.CCT_PACK_ARTIFACT_SHA256, "approved archive bytes changed");
+  } else {
+    execFileSync("npm", ["pack", "--pack-destination", dir], { cwd: process.cwd(), stdio: "pipe" });
+    const tgz = (await import("node:fs/promises")).readdir(dir).then((files) => files.find((f) => f.endsWith(".tgz"))!);
+    artifact = join(dir, await tgz);
+  }
+  const artifactSha256 = createHash("sha256").update(await readFile(artifact)).digest("hex");
   const listing = execFileSync("tar", ["-tzf", artifact], { encoding: "utf8" }).split("\n").filter(Boolean);
-  for (const file of ["package/server.ts", "package/cli.ts", "package/os-extension.ts", "package/shared/compact.ts", "package/shared/constants.ts"]) {
+  for (const file of ["package/server.ts", "package/cli.ts", "package/os-extension.ts", "package/shared/compact.ts", "package/shared/constants.ts", "package/shared/os-footer.ts", "package/shared/unread-flag.ts"]) {
     assert.ok(listing.includes(file), `packed artifact is missing ${file}`);
   }
   execFileSync("tar", ["-xzf", artifact, "-C", dir]);
@@ -55,7 +66,7 @@ try {
     await delay(100);
   }
   assert.match(String((checked.content?.[0] as { text?: string })?.text ?? ""), /packed-artifact-check-message/);
-  console.log(JSON.stringify({ passed: true, package_files: ["server.ts", "cli.ts", "os-extension.ts", "shared/compact.ts", "shared/constants.ts"], tool_list: tools.tools.map((tool) => tool.name), message_read_from_packed_server: true }, null, 2));
+  console.log(JSON.stringify({ passed: true, artifact: process.env.CCT_PACK_ARTIFACT ? "approved" : "fresh-pack", artifact_sha256: artifactSha256, package_files: ["server.ts", "cli.ts", "os-extension.ts", "shared/compact.ts", "shared/constants.ts", "shared/os-footer.ts", "shared/unread-flag.ts"], tool_list: tools.tools.map((tool) => tool.name), message_read_from_packed_server: true }, null, 2));
   connection.close();
 } finally {
   await client?.close().catch(() => undefined);

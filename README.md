@@ -43,8 +43,9 @@ to the unmodified `pi-mcp-adapter@2.33.0` factory. No os-core or third-party fil
 edits are required. See the [delivery contract](https://github.com/the-omics-os/cct/blob/v0.2.1/cct/DM_BODY_PROTOTYPE.md).
 
 **Release status:** 0.2.1 is published on npm and GitHub; registry installation
-and local setup are verified. User UI approval is complete. The existing
+and local setup are verified. User UI approval covers the 0.2.1 cards. The existing
 `v0.2.0` tag is preserved. See [release notes](https://github.com/the-omics-os/cct/releases/tag/v0.2.1).
+0.2.2 is an unpublished candidate: see CHANGELOG `0.2.2`.
 
 ## Quick Start
 
@@ -108,6 +109,8 @@ CCT:dd5c @feature-x(2) ✉3
 ```
 
 Then create `~/.claude/statusline.sh` with CCT integration. The status line reads from `~/.cct/pidmaps/` and `~/.cct/flags/` to resolve the current session's peer ID and pool memberships. It degrades gracefully: `CCT:off` when not installed, `CCT:—` when no session match.
+
+The flag stores pool names escaped (`%2C` for a comma, `%44M` for a pool named `DM`), and direct unread is the `DM` token. A script that reads the flag directly shows the stored form. The os footer below decodes names.
 
 ## os adapter setup
 
@@ -369,6 +372,24 @@ needed.** Pool notices, oversized bodies and recovery retain `cct_check_messages
   Arbitrary later context transformations and old-host capabilities are not
   certified. Existing broker peer-death cleanup is not crash-proof retention.
 
+### os footer
+
+The canonical `os-extension.ts` owns one footer key, `cct`. It renders
+`CCT: <peer name> | DM(n) | @<pool>(n) | @<pool>(n) | …`: the peer name first, then
+direct unread as `DM(n)`, then one `|` segment for each unread pool. A quiet session
+shows identity alone. Counts come only from an unread flag that is no older than 30
+seconds and only for non-zero entries. A real pool named `DM` renders as `@DM(n)`, and
+a `|` inside a pool name renders as `¦`. Usual states (scheduled, appended, pending)
+are omitted. Short exceptional states such as `auto-wake off`, `3 failures` or
+`flags stale` appear as an extra segment. Full diagnostics stay in `/cct-wake`.
+A display name longer than 40 characters is replaced by the peer ID, never truncated.
+Footer reads are size-bounded. An oversized or malformed peer file keeps the identity
+already shown in the session; delivery still needs a valid file.
+
+Pool counts follow the os flag, which can include a pool you have left (a known
+preexisting issue; see CHANGELOG `0.2.2` and ARCHITECTURE D20). Identity does not
+depend on any personal status line.
+
 ### Verification
 
 ```bash
@@ -387,7 +408,7 @@ Recorded acceptance covers controller and private-server receipt gates,
 isolated installers, installed RPC actual-body delivery, and real TUI Esc,
 restart, compaction and reload. Terminal checks cover incoming/outgoing cards,
 light/dark themes, wrapped bodies and history without changing provider content.
-The user personally confirmed the UI; no further UI approval is pending.
+The user personally confirmed the 0.2.1 cards. No user visual approval is recorded for the 0.2.2 footer.
 Real-model exchanges also verified automatic bodies and late acknowledgments
 without model inbox checks. This is bounded acceptance, not a long body-delivery
 soak or arbitrary host/extension-order certification. Former D18 notice/wake

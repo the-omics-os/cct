@@ -3,11 +3,15 @@
 // containing the batch. This is delivery evidence, NOT task completion, fsync,
 // exactly-once effects, or protection against a hostile in-process extension.
 // Uses the host-provided pi-tui only for presentation; delivery remains CCT-only.
-import { chmodSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { renderInboxMessage } from "./shared/os-inbox-renderer.ts";
+import {
+  identityView, PIDMAP_MAX_BYTES, renderFooter, SESSION_MARKER_MAX_BYTES, unreadView, UNREAD_FLAG_MAX_BYTES,
+  type FooterIdentity, type FooterUnread,
+} from "./shared/os-footer.ts";
 
 type Entry = { type: string; customType?: string; data?: any; details?: any; content?: any };
 type Context = {
@@ -41,7 +45,11 @@ export default function inboxExtension(pi: Api): void {
   let session = "", epoch = 0, timer: ReturnType<typeof setInterval> | undefined;
   let running = false, humanRun = false, preflight = false, replacing = false, waitingUI = false;
   let paused = false, budgetBroken = false, receiptProblem = false;
-  let reason = "waiting for registration", lastStatus = "";
+  // `reason` is the full diagnostic for /cct-wake. `footerState` is the short
+  // exceptional label shown in the single `cct` footer; usual states leave it empty.
+  let reason = "waiting for registration", footerState = "", lastFooter = "";
+  // Last peer identity resolved in this session. Used only while file B is unusable.
+  let knownPeer: Extract<FooterIdentity, { kind: "peer" }> | undefined;
   let times: number[] = [], streak = 0, nextAttempt = 0, failures = 0;
   let dispatched = false, dispatchAt = 0;
   let contextBatch: { peerId: string; ids: number[] } | undefined;
@@ -54,11 +62,56 @@ export default function inboxExtension(pi: Api): void {
 
   const current = (ctx: Context) => !!session && ctx.sessionManager.getSessionId() === session;
   const enabled = (ctx: Context) => current(ctx) && (ctx.mode === "tui" || ctx.mode === "rpc");
-  function status(ctx: Context, value: string): void {
-    reason = value;
-    if (!enabled(ctx) || value === lastStatus) return;
-    lastStatus = value;
-    ctx.ui.setStatus("cct-wake", value ? `CCT: ${value}` : undefined);
+  function status(ctx: Context, value: string, short = ""): void {
+    reason = value; footerState = short;
+    publish(ctx);
+  }
+  // Read-only: identity (file B, or pending/none from file A) and the flag. Identity
+  // is always the footer prefix; verbose reasons never replace it.
+  /**
+   * Reads at most `max` bytes. A larger file throws and is never truncated. ENOENT is
+   * absence (undefined). Reading stops at max+1 bytes even if the file grows meanwhile.
+   */
+  function readOptional(path: string, max: number): string | undefined {
+    let fd: number | undefined;
+    try {
+      fd = openSync(path, "r");
+      const buffer = Buffer.alloc(max + 1);
+      let size = 0, read = 0;
+      do { read = readSync(fd, buffer, size, max + 1 - size, null); size += read; } while (read > 0 && size <= max);
+      if (size > max) throw new Error("oversized channel file");
+      return buffer.toString("utf8", 0, size);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
+    } finally {
+      if (fd !== undefined) try { closeSync(fd); } catch { /* Already closed. */ }
+    }
+  }
+  function composeFooter(): string {
+    let identity: FooterIdentity = { kind: "unavailable" }, unread: FooterUnread = { kind: "absent" };
+    try {
+      const pidmap = readOptional(join(pidmaps, `os_${session}`), PIDMAP_MAX_BYTES);
+      identity = identityView(pidmap, pidmap === undefined && readOptional(marker, SESSION_MARKER_MAX_BYTES) === session);
+    } catch { identity = { kind: "unavailable" }; }
+    // Malformed, oversized or unreadable B keeps the identity already resolved in this
+    // session. Absent B (pending/none) is not masked by the cache.
+    if (identity.kind === "peer") knownPeer = identity;
+    else if (identity.kind === "unavailable" && knownPeer) identity = knownPeer;
+    if (identity.kind === "peer") {
+      try { unread = unreadView(readOptional(join(flags, `${identity.peerId}.unread`), UNREAD_FLAG_MAX_BYTES), Date.now()); }
+      catch { unread = { kind: "unavailable" }; }
+    }
+    // Before a registered peer exists, feed-path failures are expected. The identity line
+    // is the whole story there, so no state label is published.
+    return renderFooter(identity, unread, identity.kind === "peer" ? footerState : "");
+  }
+  function publish(ctx: Context): void {
+    if (!enabled(ctx)) return;
+    const text = composeFooter();
+    if (text === lastFooter) return;
+    lastFooter = text;
+    ctx.ui.setStatus("cct", text);
   }
   function readJson(path: string, max: number): any {
     if (statSync(path).size > max) throw new Error("oversized channel file");
@@ -67,7 +120,9 @@ export default function inboxExtension(pi: Api): void {
   function feed(ctx: Context): Feed | undefined {
     if (!enabled(ctx)) return;
     try {
-      const [peer, , producer] = readFileSync(join(pidmaps, `os_${session}`), "utf8").trim().split("|");
+      const raw = readOptional(join(pidmaps, `os_${session}`), PIDMAP_MAX_BYTES);
+      if (raw === undefined) throw new Error("missing identity");
+      const [peer, , producer] = raw.trim().split("|");
       if (!token(peer) || !token(producer)) throw new Error("unresolved identity");
       const f: Feed = readJson(join(flags, `${peer}.os-inbox`), 128 * 1024);
       if (f.version !== 1 || f.peerId !== peer || f.producer !== producer || f.sessionId !== session ||
@@ -81,7 +136,7 @@ export default function inboxExtension(pi: Api): void {
           new Set(f.messages.map(m => m.message_id)).size !== f.messages.length) throw new Error("invalid/stale inbox");
       return f;
     } catch {
-      status(ctx, "direct inbox unavailable/stale; manual check available (server upgrade may be required)");
+      status(ctx, "direct inbox unavailable/stale; manual check available (server upgrade may be required)", "inbox stale");
     }
   }
   function persistBudget(): boolean {
@@ -95,24 +150,26 @@ export default function inboxExtension(pi: Api): void {
     if (!ids.length) return;
     const path = join(flags, `${f.peerId}.os-receipt`), tmp = `${path}.${process.pid}.tmp`;
     try {
-      const [, , owner] = readFileSync(join(pidmaps, `os_${session}`), "utf8").trim().split("|");
+      const raw = readOptional(join(pidmaps, `os_${session}`), PIDMAP_MAX_BYTES);
+      if (raw === undefined) throw new Error("missing identity");
+      const [, , owner] = raw.trim().split("|");
       if (owner !== f.producer || f.sessionId !== session) return;
       writeFileSync(tmp, JSON.stringify({ version: 1, peerId: f.peerId, sessionId: session,
         producer: f.producer, consumed: ids }), { mode: 0o600 });
       chmodSync(tmp, 0o600); renameSync(tmp, path); receiptProblem = false;
-    } catch { receiptProblem = true; status(ctx, "receipt write failed; broker still owns unread messages"); }
+    } catch { receiptProblem = true; status(ctx, "receipt write failed; broker still owns unread messages", "receipt failed"); }
     finally { try { unlinkSync(tmp); } catch {} }
   }
   function pending(f: Feed): Dm[] { return f.messages.filter(m => !consumed.get(f.peerId)?.has(m.message_id)); }
   function automaticAllowed(f: Feed, ctx: Context): boolean {
-    if (paused) { status(ctx, "paused after cancellation; inbox retained (/cct-wake resume or human input)"); return false; }
-    if (process.env.CCT_OS_AUTO_WAKE === "0") { status(ctx, "automatic delivery disabled; inbox retained"); return false; }
-    if (!f.localBroker && process.env.CCT_OS_AUTO_WAKE_REMOTE !== "1") { status(ctx, "remote broker; automatic delivery disabled"); return false; }
-    if (budgetBroken) { status(ctx, "budget persistence unavailable; manual/human delivery only"); return false; }
-    if (failures >= 3) { status(ctx, "three delivery failures; inbox retained (/cct-wake resume or human input to retry)"); return false; }
+    if (paused) { status(ctx, "paused after cancellation; inbox retained (/cct-wake resume or human input)", "paused"); return false; }
+    if (process.env.CCT_OS_AUTO_WAKE === "0") { status(ctx, "automatic delivery disabled; inbox retained", "auto-wake off"); return false; }
+    if (!f.localBroker && process.env.CCT_OS_AUTO_WAKE_REMOTE !== "1") { status(ctx, "remote broker; automatic delivery disabled", "remote: auto-wake off"); return false; }
+    if (budgetBroken) { status(ctx, "budget persistence unavailable; manual/human delivery only", "budget error"); return false; }
+    if (failures >= 3) { status(ctx, "three delivery failures; inbox retained (/cct-wake resume or human input to retry)", "3 failures"); return false; }
     const now = Date.now(); times = times.filter(t => t > now - 60_000);
     const due = Math.max(nextAttempt, times.length >= 5 ? times[0] + 60_000 : 0);
-    if (now < due) { status(ctx, `inbox pending; retry at ${new Date(due).toISOString()}`); return false; }
+    if (now < due) { status(ctx, `inbox pending; retry at ${new Date(due).toISOString()}`, "throttled"); return false; }
     return true;
   }
   function spend(): boolean {
@@ -138,7 +195,7 @@ export default function inboxExtension(pi: Api): void {
     failures++;
     nextAttempt = Math.max(nextAttempt, Date.now() + Math.min(60_000, 2_000 * 2 ** Math.min(failures - 1, 5)));
     persistBudget();
-    status(ctx, `delivery failed; inbox retained, retry at ${new Date(nextAttempt).toISOString()}`);
+    status(ctx, `delivery failed; inbox retained, retry at ${new Date(nextAttempt).toISOString()}`, "delivery failed");
   }
   function observe(ctx: Context): void {
     if (!enabled(ctx)) return;
@@ -150,7 +207,7 @@ export default function inboxExtension(pi: Api): void {
     const messages = pending(f);
     if (!messages.length) {
       if (receiptProblem) return;
-      status(ctx, f.blocked ?? (f.messages.length ? "response received; awaiting broker acknowledgment" : f.poolCount ? `${f.poolCount} pool message(s); awaiting human work` : "")); return;
+      status(ctx, f.blocked ?? (f.messages.length ? "response received; awaiting broker acknowledgment" : f.poolCount ? `${f.poolCount} pool message(s); awaiting human work` : ""), f.blocked ? "manual check" : ""); return;
     }
     if (running || !ctx.isIdle()) { status(ctx, `${messages.length} DM(s) pending at next safe boundary`); return; }
     if (dispatched) {
@@ -169,7 +226,7 @@ export default function inboxExtension(pi: Api): void {
   function boundary(event: any, ctx: Context): any {
     if (!enabled(ctx)) return;
     if (event.outcome === "aborted") {
-      paused = true; contextBatch = undefined; persistBudget(); status(ctx, "paused after cancellation; inbox retained"); return;
+      paused = true; contextBatch = undefined; persistBudget(); status(ctx, "paused after cancellation; inbox retained", "paused"); return;
     }
     if (event.outcome === "error") { contextBatch = undefined; return; }
     const f = feed(ctx); if (!f) return;
@@ -188,7 +245,7 @@ export default function inboxExtension(pi: Api): void {
   function reset(): void {
     epoch++; if (timer) clearInterval(timer); timer = undefined;
     session = ""; running = humanRun = preflight = replacing = waitingUI = paused = budgetBroken = receiptProblem = dispatched = false;
-    times = []; streak = failures = nextAttempt = dispatchAt = 0; lastStatus = "";
+    times = []; streak = failures = nextAttempt = dispatchAt = 0; footerState = lastFooter = ""; knownPeer = undefined;
     contextBatch = undefined; consumed.clear(); envelopes.clear(); attempted.clear(); poolEpisode = "";
   }
   pi.registerCommand("cct-wake", {
@@ -222,11 +279,12 @@ export default function inboxExtension(pi: Api): void {
     try {
       mkdirSync(pidmaps, { recursive: true, mode: 0o700 }); chmodSync(dir, 0o700); chmodSync(pidmaps, 0o700);
       writeFileSync(marker, session, { mode: 0o600 }); chmodSync(marker, 0o600);
-    } catch { status(ctx, "identity marker unavailable"); }
+    } catch { status(ctx, "identity marker unavailable", "marker unavailable"); }
     if (!enabled(ctx)) return;
+    publish(ctx);
     const ownEpoch = epoch;
-    timer = setInterval(() => { if (ownEpoch === epoch) { try { observe(ctx); } catch {
-      try { status(ctx, "inbox observer failed; manual check available"); } catch { /* Invalidated host context. */ }
+    timer = setInterval(() => { if (ownEpoch === epoch) { try { publish(ctx); observe(ctx); } catch {
+      try { status(ctx, "inbox observer failed; manual check available", "observer failed"); } catch { /* Invalidated host context. */ }
     } } }, 1_000);
     timer.unref?.();
   });
@@ -287,7 +345,7 @@ export default function inboxExtension(pi: Api): void {
       // This is after the response, not an early durable-acceptance promise.
       // If the process dies here, broker redelivery is permitted.
       try { pi.appendEntry(CONSUMED, { sessionId: session, peerId: batch.peerId, ids: batch.ids }); }
-      catch { status(ctx, "delivery checkpoint failed; recovery may replay messages"); }
+      catch { status(ctx, "delivery checkpoint failed; recovery may replay messages", "checkpoint failed"); }
       failures = 0;
       const f = feed(ctx); if (f) receipt(f, ctx);
     }
@@ -312,7 +370,9 @@ export default function inboxExtension(pi: Api): void {
   pi.on("session_shutdown", (_event, ctx) => {
     if (!current(ctx)) return;
     const f = feed(ctx); if (f) receipt(f, ctx);
-    const old = session; reset();
+    const old = session;
+    if (lastFooter) { try { ctx.ui.setStatus("cct", undefined); } catch { /* Invalidated host context. */ } }
+    reset();
     try { if (readFileSync(marker, "utf8") === old) unlinkSync(marker); } catch {}
   });
 }

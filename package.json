@@ -1,6 +1,6 @@
 {
   "name": "@omicsos/cct",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Claude Code Talk \u2014 real-time inter-session communication for Claude Code",
   "author": "Kevin Yar <kevin.yar@omics-os.com>",
   "license": "MIT",
@@ -62,6 +62,7 @@
     "test:os-inbox-lifecycle": "python3 test-os-inbox-lifecycle.py --case esc && python3 test-os-inbox-lifecycle.py --case restart && python3 test-os-inbox-lifecycle.py --case compact && python3 test-os-inbox-lifecycle.py --case reload",
     "test:opencode-identity": "tsx test-opencode-identity.ts",
     "test:os-wrapper": "tsx test-os-mcp-extension.ts && python3 test-os-adapter-installer.py",
+    "test:os-footer": "tsx test-os-footer.ts && tsx test-os-footer-broker.ts",
     "test:os-cards": "python3 test-os-cct-cards-ui.py --theme light && python3 test-os-cct-cards-ui.py --theme dark"
   },
   "engines": {
