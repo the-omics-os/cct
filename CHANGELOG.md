@@ -12,6 +12,19 @@
   Without runtime flags, `cct install` also selects grok when `grok` is on PATH
   or `~/.grok` exists. Acceptance: `npm run test:grok-identity` (private broker).
 
+## 0.2.4
+
+Hotfix on 0.2.3. No other changes.
+
+### Fixed
+
+- os: DM bodies were delivered twice when a DM started an idle session. Since
+  Pi #10739 (os 1.3.x), a run started by `pi.sendMessage(..., { triggerTurn: true })`
+  also fires `before_agent_start`, and the handler drafted the still-unconsumed batch
+  again under a new nonce. It now skips that event when the starting message is its
+  own `cct-inbox` batch. Older hosts are unaffected. Deliveries at tool boundaries and
+  on human prompts were always single. Regression test in `test-os-inbox-pump.ts`.
+
 ## 0.2.3
 
 The footer has automated acceptance only: no user visual approval is recorded for it. The 0.2.1

@@ -293,8 +293,12 @@ export default function inboxExtension(pi: Api): void {
     paused = false; failures = streak = 0; nextAttempt = 0; persistBudget();
     if (running) humanRun = true; else if (!replacing) preflight = true;
   });
-  pi.on("before_agent_start", (_event, ctx) => {
+  pi.on("before_agent_start", (event, ctx) => {
     if (!enabled(ctx) || replacing) return;
+    // Hosts with Pi #10739 (os 1.3+) also emit this for our own idle sendMessage start.
+    // That batch is already the starting message; drafting again would deliver it twice.
+    if (event.messageType === "custom" && event.message?.customType === "cct-inbox" &&
+        envelopes.has(event.message.details?.nonce)) return;
     const f = feed(ctx); if (!f) return;
     receipt(f, ctx); const messages = pending(f);
     if (messages.length) return { message: draft(f, messages) };

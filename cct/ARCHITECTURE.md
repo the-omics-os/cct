@@ -1,6 +1,6 @@
 # CCT Architecture — Design Decisions
 
-Core design date: 2026-04-19. Last published release: 0.2.3 (footer: D20).
+Core design date: 2026-04-19. Last published release: 0.2.4 (footer: D20; 0.2.4 fixes idle-wake duplicate delivery).
 Status: design authority; user UI approval covers the 0.2.1 cards. The 0.2.3 footer (D20) has automated acceptance and no recorded user visual approval. D16–D20 extend the original
 Claude-only design.
 The existing `v0.2.0` tag is preserved, not overwritten.
