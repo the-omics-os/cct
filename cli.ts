@@ -631,7 +631,8 @@ async function cmdStart() {
     detached: true,
   });
   proc.unref();
-  await new Promise(r => setTimeout(r, 500));
+  // A cold tsx start can take a few seconds; wait as long as server.ts does.
+  for (let i = 0; i < 20 && !(await brokerIsRunning()); i++) await new Promise(r => setTimeout(r, 250));
   if (await brokerIsRunning()) {
     console.log("Broker started on localhost.");
   } else {
