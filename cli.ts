@@ -48,6 +48,10 @@ const OS_EXTENSION_PATH = join(CCT_DIR, "os-extension.ts");
 const OS_MCP_EXTENSION_PATH = join(CCT_DIR, "os-mcp-extension.ts");
 // The prototype must never run alongside the canonical body-delivery extension.
 const OS_PROTOTYPE_EXTENSION_PATH = join(CCT_DIR, "os-inbox-extension.ts");
+const GROK_PLUGIN_PATH = join(CCT_DIR, "grok-plugin.ts");
+const GROK_CONFIG_DIR = join(homedir(), ".grok");
+const GROK_PLUGINS_DIR = join(GROK_CONFIG_DIR, "plugins");
+const GROK_PLUGIN_FILE = join(GROK_PLUGINS_DIR, "cct.js");
 
 function isCctOsExtension(entry: unknown): boolean {
   return isOwnedOsExtension(entry, OS_EXTENSION_PATH) || isOwnedOsExtension(entry, OS_PROTOTYPE_EXTENSION_PATH);
@@ -313,12 +317,12 @@ Commands:
   lan-start                    Start the broker on 0.0.0.0 (LAN mode)
   kill                         Stop the broker
   config                       Show or set persistent config
-  install [--project] [--claude|--codex|--os]    Register MCP + delivery integration
-  uninstall [--project] [--claude|--codex|--os]  Remove MCP + delivery integration
+  install [--project] [--claude|--codex|--os|--grok]    Register MCP + delivery integration
+  uninstall [--project] [--claude|--codex|--os|--grok]  Remove MCP + delivery integration
   help                         Show this help
 
 Installation scope:
-  No runtime flags: Claude Code plus detected Codex and os.
+  No runtime flags: Claude Code plus detected Codex, os, and grok.
   Runtime flags may be combined. --project scopes only Claude; os uses global settings.
 
 LAN mode:
@@ -776,10 +780,10 @@ function backupFile(path: string): void {
   }
 }
 
-type InstallRuntime = "claude" | "codex" | "os";
+type InstallRuntime = "claude" | "codex" | "os" | "grok";
 
 function selectInstallRuntimes(args: string[]): InstallRuntime[] {
-  const runtimes: InstallRuntime[] = ["claude", "codex", "os"];
+  const runtimes: InstallRuntime[] = ["claude", "codex", "os", "grok"];
   for (const arg of args) {
     if (arg !== "--project" && !runtimes.some((runtime) => arg === `--${runtime}`)) {
       die(`Unknown install/uninstall option: ${arg}`);
@@ -787,7 +791,12 @@ function selectInstallRuntimes(args: string[]): InstallRuntime[] {
   }
   const selected = runtimes.filter((runtime) => args.includes(`--${runtime}`));
   if (selected.length) return selected;
-  return ["claude", ...(detectCodex() ? ["codex" as const] : []), ...(detectOs() ? ["os" as const] : [])];
+  return [
+    "claude",
+    ...(detectCodex() ? ["codex" as const] : []),
+    ...(detectOs() ? ["os" as const] : []),
+    ...(detectGrok() ? ["grok" as const] : []),
+  ];
 }
 
 async function cmdInstall(args: string[]) {
@@ -797,6 +806,7 @@ async function cmdInstall(args: string[]) {
     if (runtime === "claude") installClaude(args.includes("--project"));
     if (runtime === "codex") installCodex();
     if (runtime === "os") installOs();
+    if (runtime === "grok") installGrok();
   }
 }
 
@@ -856,6 +866,11 @@ function installClaude(projectMode: boolean) {
 function detectCodex(): boolean {
   const codexBin = spawnSync("which", ["codex"]);
   return codexBin.status === 0 && existsSync(join(homedir(), ".codex"));
+}
+
+function detectGrok(): boolean {
+  const grokBin = spawnSync("which", ["grok"]);
+  return (grokBin.status === 0 && Boolean(grokBin.stdout?.toString().trim())) || existsSync(GROK_CONFIG_DIR);
 }
 
 function isOsPackage(dir: string): boolean {
@@ -1221,6 +1236,15 @@ function installCodex(): void {
   console.log(`  Idle delivery: UserPromptSubmit injects context on next prompt`);
 }
 
+function installGrok(): void {
+  mkdirSync(GROK_PLUGINS_DIR, { recursive: true });
+  backupFile(GROK_PLUGIN_FILE);
+  const stub = `export { default } from "file://${GROK_PLUGIN_PATH}";\n`;
+  writeFileSync(GROK_PLUGIN_FILE, stub, { mode: 0o644 });
+  console.log(`Added CCT grok plugin to ${GROK_PLUGIN_FILE}`);
+  console.log("CCT installed for grok-cli (global). Restart grok to activate.");
+}
+
 function removeCctFromToml(toml: string): string {
   const lines = toml.split("\n");
   const result: string[] = [];
@@ -1275,12 +1299,22 @@ function uninstallCodex(): void {
   }
 }
 
+function uninstallGrok(): void {
+  if (existsSync(GROK_PLUGIN_FILE)) {
+    unlinkSync(GROK_PLUGIN_FILE);
+    console.log(`Removed ${GROK_PLUGIN_FILE}`);
+  } else {
+    console.log(`No CCT plugin found in ${GROK_PLUGINS_DIR}`);
+  }
+}
+
 async function cmdUninstall(args: string[]) {
   const runtimes = selectInstallRuntimes(args);
   for (const runtime of runtimes) {
     if (runtime === "claude") uninstallClaude(args.includes("--project"));
     if (runtime === "codex") uninstallCodex();
     if (runtime === "os") uninstallOs();
+    if (runtime === "grok") uninstallGrok();
   }
 }
 

@@ -160,6 +160,7 @@ cct/
   server.ts              MCP stdio server (17-tool legacy surface; 2-tool compact os surface; runtime detection, deferred ack, orphan prevention)
   cli.ts                 CLI (runtime-scoped installer for Claude, Codex, and os)
   os-extension.ts        Canonical os identity and automatic DM body delivery
+  grok-plugin.ts         grok-cli runtime plugin (experimental): identity, registration, lifecycle
   os-mcp-extension.ts    Release-owned outgoing wrapper delegating original adapter
   hook.sh                Claude Code PreToolUse hook (pure bash, <10ms, stale detection)
   hook-codex.sh          Codex PreToolUse hook (JSON stdin/stdout, <10ms, session_id lookup)
