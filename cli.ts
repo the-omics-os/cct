@@ -296,7 +296,7 @@ function writeJsonFile(path: string, data: any): void {
 // --- Commands ---
 
 async function cmdHelp() {
-  console.log(`CCT — Claude Code Talk
+  console.log(`CCT — Cross-Context Talk
 
 Usage: cct <command> [args]
 
