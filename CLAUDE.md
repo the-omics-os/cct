@@ -1,4 +1,4 @@
-# CCT (Claude Code Talk)
+# CCT (Cross-Context Talk)
 
 Real-time inter-session communication for AI coding agents. Supports **Claude Code**, **OpenAI Codex CLI**, and **os**. Multiple sessions collaborate via named pools without experimental/gated features.
 
