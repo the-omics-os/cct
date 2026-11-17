@@ -123,6 +123,14 @@ for test in test-os-extension.ts test-os-notifications.ts test-os-notification-s
   fi
 done
 
+# Presence notices: own in-process broker on a private HOME/port. Runs alone
+# via `npm run test:presence`; a failure here does not stop later sections.
+if node --import "$(dirname "$BROKER_TS")/node_modules/tsx/dist/loader.mjs" "$(dirname "$BROKER_TS")/test-presence-notices.ts"; then
+  pass "test-presence-notices.ts"
+else
+  fail "test-presence-notices.ts"
+fi
+
 # --- Start broker ---
 
 echo ""

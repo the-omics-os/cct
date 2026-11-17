@@ -55,6 +55,7 @@
     "typecheck": "tsc --noEmit",
     "test": "./test-integration.sh",
     "test:codex-session": "tsx test-codex-session.ts",
+    "test:presence": "tsx test-presence-notices.ts",
     "test:codex-identity": "./test-codex-identity-e2e.sh",
     "test:codex-concurrent": "./test-codex-concurrent-mcp-e2e.sh",
     "test:os-identity": "./test-os-identity-e2e.sh",

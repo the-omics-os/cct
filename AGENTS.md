@@ -171,6 +171,7 @@ cct/
   test-os-extension.ts   Canonical os extension wiring checks
   test-os-inbox-pump.ts  Automatic body controller (62 checks)
   test-os-inbox-server.ts Isolated broker/MCP body and read-receipt tests
+  test-presence-notices.ts In-process isolated broker: disconnect/reconnect notice bounds (npm run test:presence)
   test-os-inbox-installer.py Isolated canonical installer tests
   test-os-inbox-body.py  Installed RPC actual-body delivery test
   test-os-inbox-lifecycle.py Installed TUI Esc, restart, compaction and reload
