@@ -122,7 +122,7 @@ class Cards(ui.Presentation):
 
     def setup(self):
         # Copy source, never installed node_modules, .git, generated output/caches.
-        source = Path(os.environ.get("CCT_OS_ADAPTER", body.DEFAULT_ADAPTER)).resolve()
+        source = Path(os.environ.get("CCT_OS_ADAPTER", body.DEFAULT_ADAPTER)).expanduser().resolve()
         stage = self.root / "adapter-source"
         shutil.copytree(source.parent, stage, ignore=shutil.ignore_patterns(
             ".git", "node_modules", ".venv", "__pycache__", ".pytest_cache", "dist", "__tests__",
