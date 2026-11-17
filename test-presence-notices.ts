@@ -14,6 +14,7 @@
 //      if P is now dead, exactly one "disconnected";
 //  (c) one check-messages result (/message/peek, what cct_check_messages
 //      reads) carries at most one presence notice per peer and pool.
+// Finally a sweep firing long after its schedule (system sleep) kills nobody.
 import { mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -171,6 +172,27 @@ try {
     check(`(b) sleep: everyone alive again: no notice about ${p.name}`, kinds.length === 0, summary(kinds));
   }
   check("(c) one check-messages result for R: <= 1 presence notice per peer and pool", (await maxPerPeerPool(r)) <= 1, `max ${await maxPerPeerPool(r)}`);
+
+  // F10 root cause: the wall clock jumps over the sleep while the 30s sweep
+  // timer does not, so the first sweep after a wake fires long after its
+  // schedule with every peer's last heartbeat older than 3 x 15s. That sweep
+  // must kill nobody, and the next on-time sweep is still inside the heartbeat
+  // grace window counted from the wake.
+  console.log("=== sweep after a 2-minute system sleep ===");
+  const awake = (db.prepare("SELECT id FROM peers WHERE status = 'active'").all() as { id: string }[]).map((p) => p.id);
+  const messagesBefore = (db.prepare("SELECT COUNT(*) AS n FROM messages").get() as { n: number }).n;
+  const realNow = Date.now;
+  Date.now = () => realNow() + 120_000;
+  try {
+    runSweep(); // late: 120s of wall time since the previous sweep
+    runSweep(); // on time, inside the grace window
+  } finally {
+    Date.now = realNow;
+  }
+  const killed = awake.filter((id) => (db.prepare("SELECT status FROM peers WHERE id = ?").get(id) as { status: string }).status !== "active");
+  check("sleep sweep: no member marked dead", awake.length >= 5 && killed.length === 0, `${killed.length} of ${awake.length} killed`);
+  const written = (db.prepare("SELECT COUNT(*) AS n FROM messages").get() as { n: number }).n - messagesBefore;
+  check("sleep sweep: no notice written", written === 0, `${written} new messages`);
 } catch (error) {
   console.log(`  FAIL: harness error: ${(error as Error).message}`);
   failures++;

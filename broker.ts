@@ -357,6 +357,52 @@ function insertSystemMessageTyped(poolId: string, msgType: string, body: string,
   }
 }
 
+// Presence notices have no kind column: they are the broker's own system
+// messages "Peer <name> (<cwd>) disconnected." and "Peer <name> reconnected.".
+// Matching from_id + msg_type + this exact text never touches chat (from_id is
+// a peer id) or other system notices.
+const PRESENCE_ROWS_SQL = `
+  SELECT mr.message_id, mr.peer_id, mr.read_at, substr(m.body, -15) = ') disconnected.' AS dead
+  FROM messages m JOIN message_recipients mr ON mr.message_id = m.id
+  WHERE m.pool_id = ? AND m.from_id = 'system' AND m.msg_type = 'system'
+    AND (m.body = 'Peer ' || ? || ' reconnected.'
+      OR (substr(m.body, 1, length(?) + 7) = 'Peer ' || ? || ' (' AND substr(m.body, -15) = ') disconnected.'))`;
+
+// Write a disconnect (dead) or reconnect notice about a peer so each member
+// holds at most one unread presence notice per peer and pool: unread notices
+// about the peer are superseded (deleted), and a member whose last READ notice
+// already shows this state (none read = alive) gets nothing. `names` covers a
+// rename on revive, since older notices carry the older name.
+function writePresenceNotice(poolId: string, peerId: string, names: string[], body: string, dead: boolean): void {
+  const lastRead = new Map<string, { message_id: number; dead: number }>();
+  const superseded = new Set<number>();
+  for (const name of new Set(names)) {
+    const rows = db.prepare(PRESENCE_ROWS_SQL).all(poolId, name, name, name) as { message_id: number; peer_id: string; read_at: string | null; dead: number }[];
+    for (const r of rows) {
+      if (r.read_at == null) {
+        db.prepare("DELETE FROM message_recipients WHERE message_id = ? AND peer_id = ?").run(r.message_id, r.peer_id);
+        superseded.add(r.message_id);
+      } else if ((lastRead.get(r.peer_id)?.message_id ?? -1) < r.message_id) {
+        lastRead.set(r.peer_id, r);
+      }
+    }
+  }
+  for (const id of superseded) {
+    db.prepare("DELETE FROM messages WHERE id = ? AND NOT EXISTS (SELECT 1 FROM message_recipients WHERE message_id = ?)").run(id, id);
+  }
+
+  const recipients = (db.prepare(
+    "SELECT peer_id FROM pool_members WHERE pool_id = ? AND status = 'active' AND peer_id != ?"
+  ).all(poolId, peerId) as { peer_id: string }[]).filter((m) => Boolean(lastRead.get(m.peer_id)?.dead) !== dead);
+  if (recipients.length === 0) return;
+  const result = db.prepare(
+    "INSERT INTO messages (pool_id, from_id, body, msg_type, seq, created_at) VALUES (?, 'system', ?, 'system', ?, ?)"
+  ).run(poolId, body, getNextSeq(poolId), now());
+  for (const m of recipients) {
+    db.prepare("INSERT INTO message_recipients (message_id, peer_id) VALUES (?, ?)").run(Number(result.lastInsertRowid), m.peer_id);
+  }
+}
+
 function archivePoolIfEmpty(poolId: string): void {
   const count = db.prepare(
     "SELECT COUNT(*) as cnt FROM pool_members WHERE pool_id = ? AND status = 'active'"
@@ -389,7 +435,7 @@ function handleHealth(): BrokerResponse {
 // un-archives pools that were archived by that death. Runs inside the caller's
 // transaction (registerPeerTx). No system "rejoined" spam — the peer never
 // intended to leave; from the pool's view it just reconnected.
-function restoreMembershipsAfterRevive(peerId: string, diedAt: string): void {
+function restoreMembershipsAfterRevive(peerId: string, diedAt: string, nameAtDeath: string): void {
   const dropped = db.prepare(
     "SELECT pool_id FROM pool_members WHERE peer_id = ? AND status = 'left' AND left_at = ?"
   ).all(peerId, diedAt) as { pool_id: string }[];
@@ -405,7 +451,8 @@ function restoreMembershipsAfterRevive(peerId: string, diedAt: string): void {
       db.prepare("UPDATE pools SET status = 'active' WHERE id = ?").run(pool_id);
     }
     const peer = db.prepare("SELECT name FROM peers WHERE id = ?").get(peerId) as { name: string } | null;
-    insertSystemMessage(pool_id, `Peer ${peer?.name ?? peerId} reconnected.`, undefined, peerId);
+    const name = peer?.name ?? peerId;
+    writePresenceNotice(pool_id, peerId, [name, nameAtDeath], `Peer ${name} reconnected.`, false);
   }
 }
 
@@ -588,7 +635,7 @@ const registerPeerTx = transaction((body: RegisterRequest, id: string, secret: s
       // in its pools. Memberships the peer left on its own have a different left_at
       // and are left untouched.
       if (wasDead && existing.died_at) {
-        restoreMembershipsAfterRevive(existing.id, existing.died_at);
+        restoreMembershipsAfterRevive(existing.id, existing.died_at, existing.name);
       }
 
       reapDeadCodexHostPeers(runtime, body.host_pid, existing.id);
@@ -771,7 +818,7 @@ const markPeerDeadTx = transaction((peerId: string) => {
     db.prepare(
       "UPDATE pool_members SET status = 'left', left_at = ? WHERE pool_id = ? AND peer_id = ?"
     ).run(deathTs, pool_id, peerId);
-    insertSystemMessage(pool_id, `Peer ${peer?.name ?? peerId} (${peer?.cwd ?? "unknown"}) disconnected.`);
+    writePresenceNotice(pool_id, peerId, [peer?.name ?? peerId], `Peer ${peer?.name ?? peerId} (${peer?.cwd ?? "unknown"}) disconnected.`, true);
     db.prepare("DELETE FROM pool_throttles WHERE pool_id = ? AND set_by_peer_id = ?").run(pool_id, peerId);
     archivePoolIfEmpty(pool_id);
   }
@@ -2016,7 +2063,21 @@ function cleanupPeerArtifacts(peerId: string, pid: number): void {
   } catch {}
 }
 
+// Peer ages are wall-clock (they include system sleep) but timers stop while
+// the machine sleeps, so after a wake the overdue sweep would run before the
+// peers' queued heartbeats arrive and kill every member at once. A sweep that
+// fires much later than scheduled marks nobody dead and starts one heartbeat
+// grace window: ages count from the wake at the earliest.
+const LATE_SWEEP_MS = STALE_CHECK_INTERVAL_MS + HEARTBEAT_INTERVAL_MS;
+let lastSweepAt = Date.now();
+let staleGraceFrom = 0;
+
 function cleanupStalePeers(): void {
+  const sweepAt = Date.now();
+  const late = sweepAt - lastSweepAt > LATE_SWEEP_MS;
+  lastSweepAt = sweepAt;
+  if (late) staleGraceFrom = sweepAt;
+
   const activePeers = db.prepare(
     "SELECT id, pid, pid_start, host_pid, host_pid_start, last_seen FROM peers WHERE status = 'active'"
   ).all() as {
@@ -2029,7 +2090,7 @@ function cleanupStalePeers(): void {
   }[];
 
   for (const peer of activePeers) {
-    const age = Date.now() - new Date(peer.last_seen).getTime();
+    const age = sweepAt - Math.max(new Date(peer.last_seen).getTime(), staleGraceFrom);
     const hostDead = peer.host_pid != null && !pidIsAlive(peer.host_pid, peer.host_pid_start ?? "");
     const heartbeatStale = age > HEARTBEAT_INTERVAL_MS * 3;
 
@@ -2058,7 +2119,7 @@ function cleanupStalePeers(): void {
       }
     }
 
-    if (hostDead || (!anyLive && age > HEARTBEAT_INTERVAL_MS) || heartbeatStale) {
+    if (!late && (hostDead || (!anyLive && age > HEARTBEAT_INTERVAL_MS) || heartbeatStale)) {
       markPeerDead(peer.id);
       cleanupPeerArtifacts(peer.id, peer.pid);
     }

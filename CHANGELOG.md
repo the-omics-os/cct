@@ -12,6 +12,33 @@
   Without runtime flags, `cct install` also selects grok when `grok` is on PATH
   or `~/.grok` exists. Acceptance: `npm run test:grok-identity` (private broker).
 
+## 0.2.5
+
+### Fixed
+
+- Broker: presence notices no longer pile up. Every death and revive wrote a
+  new "Peer X (cwd) disconnected." / "Peer X reconnected." system message and
+  nothing superseded them: one live database held 5,772 disconnected + 5,580
+  reconnected notices, and a single check-messages result carried 203. A new
+  notice about a peer now replaces that member's unread notice about the same
+  peer and pool (superseded messages without recipients are deleted), and a
+  member whose last read notice already shows the new state gets none. A member
+  holds at most one unread presence notice per peer and pool, and none when the
+  peer is back in the state the member last read. Notices are still plain
+  `system` messages; chat is never touched.
+- Broker: no mass death after system sleep. Peer ages are wall-clock and
+  include the sleep, but the 30 s stale-sweep timer stops while the Mac sleeps,
+  so after a wake longer than ~45 s the overdue sweep ran before the peers'
+  queued heartbeats and marked every member dead, followed seconds later by a
+  revive each (134 of 135 multi-peer disconnect bursts started within 30 s of a
+  wake). A sweep that fires more than one heartbeat interval later than
+  scheduled now marks nobody dead, and ages count from the wake at the earliest,
+  which gives every peer one heartbeat grace window. Normal stale detection is
+  unchanged.
+
+Regression test: `npm run test:presence` (`test-presence-notices.ts`, also part
+of `test-integration.sh`).
+
 ## 0.2.4
 
 Hotfix on 0.2.3. No other changes.
