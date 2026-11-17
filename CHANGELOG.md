@@ -1,17 +1,5 @@
 # Changelog
 
-## Unreleased
-
-### Added
-
-- grok-cli runtime (experimental): `cct install --grok` / `cct uninstall --grok`
-  write or remove a one-line plugin stub at `~/.grok/plugins/cct.js` that loads
-  `grok-plugin.ts`. One peer per grok instance directory
-  (`session_key = grok:<sanitized dir>`), with register, heartbeat, revive and
-  unregister. Identity and lifecycle only: no message delivery or tools yet.
-  Without runtime flags, `cct install` also selects grok when `grok` is on PATH
-  or `~/.grok` exists. Acceptance: `npm run test:grok-identity` (private broker).
-
 ## 0.2.5
 
 ### Fixed
@@ -38,6 +26,16 @@
 
 Regression test: `npm run test:presence` (`test-presence-notices.ts`, also part
 of `test-integration.sh`).
+
+### Added
+
+- grok-cli runtime (experimental): `cct install --grok` / `cct uninstall --grok`
+  write or remove a one-line plugin stub at `~/.grok/plugins/cct.js` that loads
+  `grok-plugin.ts`. One peer per grok instance directory
+  (`session_key = grok:<sanitized dir>`), with register, heartbeat, revive and
+  unregister. Identity and lifecycle only: no message delivery or tools yet.
+  Without runtime flags, `cct install` also selects grok when `grok` is on PATH
+  or `~/.grok` exists. Acceptance: `npm run test:grok-identity` (private broker).
 
 ## 0.2.4
 
