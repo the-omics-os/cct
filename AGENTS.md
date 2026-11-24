@@ -166,33 +166,6 @@ cct/
   hook-codex.sh          Codex PreToolUse hook (JSON stdin/stdout, <10ms, session_id lookup)
   prompt-codex.sh        Codex UserPromptSubmit hook (idle delivery via additionalContext)
   session-start-codex.sh Codex SessionStart hook (identity bridge: session_id → peer_id)
-  test-integration.sh    Integration tests (isolated broker, refuses occupied ports)
-  test-compact-surface.ts Compact schemas, validation, mapping, status, and MCP surface tests
-  test-os-extension.ts   Canonical os extension wiring checks
-  test-os-inbox-pump.ts  Automatic body controller (62 checks)
-  test-os-inbox-server.ts Isolated broker/MCP body and read-receipt tests
-  test-presence-notices.ts In-process isolated broker: disconnect/reconnect notice bounds (npm run test:presence)
-  test-os-inbox-installer.py Isolated canonical installer tests
-  test-os-inbox-body.py  Installed RPC actual-body delivery test
-  test-os-inbox-lifecycle.py Installed TUI Esc, restart, compaction and reload
-  test-os-notifications.ts Legacy notice one-shot controller
-  test-os-notification-server.ts Sibling-MCP ownership/check/cache-failure regressions
-  test-os-inbox-wake.py   Legacy notice/wake test
-  test-os-inbox-hardening.py Legacy notice hardening test
-  test-os-inbox-endurance.py Legacy notice quiet/long-run harness
-  test-os-inbox-endurance-run.sh Bounded long-run runner
-  test-os-compact-installer.py Isolated compact os installer settings and idempotence
-  test-os-compact-live.py Installed os compact-surface test with a synthetic provider
-  test-compact-packed.ts Packed-artifact test for compact tools
-  test-compact-measurements.ts Schema and compact output measurement tests
-  test-os-compact-terminate.ts Safe terminate-path test with a fake host
-  test-codex-session.ts  Unit tests for codex session/fork-chain resolution
-  test-codex-identity-e2e.sh  E2E: fake codex host + real server.ts, stable id across resume (port 17889)
-  test-os-identity-e2e.sh E2E: os marker, fallback, MCP siblings, compact surface, and resume (default port 17890)
-  test-os-runtime-live.py Installed os test with a local synthetic provider (15-minute idle check)
-  test-os-autostart.py    Installed os automatic registration, session changes and recovery
-  test-os-install-autostart.py Scoped installer upgrade and idempotent reinstall checks
-  test-fixtures/os/      Local provider and runtime fixtures for installed-os tests
   shared/
     types.ts             TypeScript interfaces
     constants.ts         Ports, paths, timeouts, and compact action definitions
@@ -202,6 +175,39 @@ cct/
     os-inbox-renderer.ts  Display-only incoming sender/body cards
     summarize.ts         Git-based summary generation
     codex-session.ts     Codex session id + fork-chain root resolution from rollout transcripts
+  test/                  All tests; run from the repo root (npm run test:<name>)
+    test-integration.sh    Integration tests (isolated broker, refuses occupied ports)
+    test-compact-surface.ts Compact schemas, validation, mapping, status, and MCP surface tests
+    test-os-extension.ts   Canonical os extension wiring checks
+    test-os-inbox-pump.ts  Automatic body controller (62 checks)
+    test-os-inbox-server.ts Isolated broker/MCP body and read-receipt tests
+    test-presence-notices.ts In-process isolated broker: disconnect/reconnect notice bounds (npm run test:presence)
+    test-os-inbox-installer.py Isolated canonical installer tests
+    test-os-inbox-body.py  Installed RPC actual-body delivery test
+    test-os-inbox-lifecycle.py Installed TUI Esc, restart, compaction and reload
+    test-os-notifications.ts Legacy notice one-shot controller
+    test-os-notification-server.ts Sibling-MCP ownership/check/cache-failure regressions
+    test-os-inbox-wake.py   Legacy notice/wake test
+    test-os-inbox-hardening.py Legacy notice hardening test
+    test-os-inbox-endurance.py Legacy notice quiet/long-run harness
+    test-os-inbox-endurance-run.sh Bounded long-run runner
+    test-os-compact-installer.py Isolated compact os installer settings and idempotence
+    test-os-compact-live.py Installed os compact-surface test with a synthetic provider
+    test-compact-packed.ts Packed-artifact test for compact tools
+    test-compact-measurements.ts Schema and compact output measurement tests
+    test-os-compact-terminate.ts Safe terminate-path test with a fake host
+    test-codex-session.ts  Unit tests for codex session/fork-chain resolution
+    test-codex-identity-e2e.sh  E2E: fake codex host + real server.ts, stable id across resume (port 17889)
+    test-os-identity-e2e.sh E2E: os marker, fallback, MCP siblings, compact surface, and resume (default port 17890)
+    test-os-runtime-live.py Installed os test with a local synthetic provider (15-minute idle check)
+    test-os-autostart.py    Installed os automatic registration, session changes and recovery
+    test-os-install-autostart.py Scoped installer upgrade and idempotent reinstall checks
+    fixtures/os/      Local provider and runtime fixtures for installed-os tests
+  docs/
+    ARCHITECTURE.md      Design decisions and rationale
+    DM_BODY_PROTOTYPE.md os automatic-body contract and limits
+    os.md                os setup, delivery, footer, verification
+    WSL_INSTALL.md       WSL2/Ubuntu install guide
   package.json
   tsconfig.json
 ```
@@ -217,7 +223,7 @@ cct/
 
 ## Design Documents
 
-Core design documents live in `cct/`:
+Core design documents live in `docs/`:
 - `ARCHITECTURE.md` — **Design decisions and rationale**, including os integration, automatic DM body delivery (which replaced the earlier notice/wake design) and the outgoing wrapper.
 - `DM_BODY_PROTOTYPE.md` — Current automatic-body contract and compatibility limits.
 
@@ -421,16 +427,16 @@ it clears pauses/failure backoff, not rolling budget or opt-out. Explicit checks
 remain available. No closed-process wake or permission bypass.
 
 Delivery contract and current limits (context order, older hosts, provider
-retry): `cct/DM_BODY_PROTOTYPE.md` and README.
+retry): `docs/DM_BODY_PROTOTYPE.md` and `docs/os.md`.
 
 Run `npm run test:os-identity` for source identity checks. Installed-runtime
 tests require an installed os launcher and adapter:
 
 ```bash
 export CCT_OS_ADAPTER=/absolute/path/to/pi-mcp-adapter/index.ts
-python3 test-os-autostart.py
-python3 test-os-install-autostart.py
-python3 test-os-runtime-live.py
+python3 test/test-os-autostart.py
+python3 test/test-os-install-autostart.py
+python3 test/test-os-runtime-live.py
 ```
 
 The default idle interval is 900 seconds; setting `OS_IDLE_SECONDS` lower is only

@@ -36,7 +36,8 @@
     "LICENSE",
     "README.md",
     "CHANGELOG.md",
-    "WSL_INSTALL.md"
+    "docs/WSL_INSTALL.md",
+    "docs/os.md"
   ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.1",
@@ -53,21 +54,21 @@
   "scripts": {
     "start": "tsx broker.ts",
     "typecheck": "tsc --noEmit",
-    "test": "./test-integration.sh",
-    "test:codex-session": "tsx test-codex-session.ts",
-    "test:presence": "tsx test-presence-notices.ts",
-    "test:codex-identity": "./test-codex-identity-e2e.sh",
-    "test:codex-concurrent": "./test-codex-concurrent-mcp-e2e.sh",
-    "test:os-identity": "./test-os-identity-e2e.sh",
-    "test:os-inbox": "tsx test-os-inbox-renderer.ts && tsx test-os-inbox-pump.ts && tsx test-os-inbox-server.ts",
-    "test:os-inbox-ui": "python3 test-os-inbox-ui.py",
-    "test:os-inbox-lifecycle": "python3 test-os-inbox-lifecycle.py --case esc && python3 test-os-inbox-lifecycle.py --case restart && python3 test-os-inbox-lifecycle.py --case compact && python3 test-os-inbox-lifecycle.py --case reload",
-    "test:opencode-identity": "tsx test-opencode-identity.ts",
-    "test:grok-identity": "tsx test-grok-identity.ts",
-    "test:os-wrapper": "tsx test-os-mcp-extension.ts && python3 test-os-adapter-installer.py",
-    "test:os-footer": "tsx test-os-footer.ts && tsx test-os-footer-broker.ts",
-    "test:status-json": "python3 test-status-json.py",
-    "test:os-cards": "python3 test-os-cct-cards-ui.py --theme light && python3 test-os-cct-cards-ui.py --theme dark"
+    "test": "./test/test-integration.sh",
+    "test:codex-session": "tsx test/test-codex-session.ts",
+    "test:presence": "tsx test/test-presence-notices.ts",
+    "test:codex-identity": "./test/test-codex-identity-e2e.sh",
+    "test:codex-concurrent": "./test/test-codex-concurrent-mcp-e2e.sh",
+    "test:os-identity": "./test/test-os-identity-e2e.sh",
+    "test:os-inbox": "tsx test/test-os-inbox-renderer.ts && tsx test/test-os-inbox-pump.ts && tsx test/test-os-inbox-server.ts",
+    "test:os-inbox-ui": "python3 test/test-os-inbox-ui.py",
+    "test:os-inbox-lifecycle": "python3 test/test-os-inbox-lifecycle.py --case esc && python3 test/test-os-inbox-lifecycle.py --case restart && python3 test/test-os-inbox-lifecycle.py --case compact && python3 test/test-os-inbox-lifecycle.py --case reload",
+    "test:opencode-identity": "tsx test/test-opencode-identity.ts",
+    "test:grok-identity": "tsx test/test-grok-identity.ts",
+    "test:os-wrapper": "tsx test/test-os-mcp-extension.ts && python3 test/test-os-adapter-installer.py",
+    "test:os-footer": "tsx test/test-os-footer.ts && tsx test/test-os-footer-broker.ts",
+    "test:status-json": "python3 test/test-status-json.py",
+    "test:os-cards": "python3 test/test-os-cct-cards-ui.py --theme light && python3 test/test-os-cct-cards-ui.py --theme dark"
   },
   "engines": {
     "node": ">=22.19.0"

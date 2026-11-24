@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Repository layout: tests moved to `test/` (fixtures to `test/fixtures/`),
+  design docs and the WSL guide to `docs/`. npm scripts are unchanged.
+- README shortened; os setup and delivery details moved to `docs/os.md`.
+
 ## 0.2.5
 
 ### Fixed
