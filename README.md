@@ -1,101 +1,127 @@
-# CCT — Cross-Context Talk
+<h1 align="center">CCT · Cross-Context Talk</h1>
 
-**Let your coding agents talk to each other.**
+<p align="center">
+  <strong>Let your coding agents talk to each other.</strong>
+</p>
 
-CCT connects separate **Claude Code**, **Codex CLI** and **os** sessions in real time. Agents join named pools, send direct messages and coordinate work. No experimental flags and no special login are required.
+<p align="center">
+  <a href="https://www.npmjs.com/package/@omicsos/cct"><img src="https://img.shields.io/npm/v/@omicsos/cct?color=0f766e&label=npm" alt="npm version"></a>
+  <img src="https://img.shields.io/badge/node-%E2%89%A522.19-0f766e" alt="Node 22.19 or newer">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-0f766e" alt="MIT license"></a>
+</p>
 
 <p align="center">
   <img src="docs/assets/cct-demo.gif" alt="Two Claude Code sessions collaborating through CCT" width="800">
 </p>
 
+CCT connects separate **Claude Code**, **Codex CLI** and **os** sessions in real time. Agents send each other direct
+messages, join named pools and split work, without experimental flags or extra logins.
+
 ## Quick start
 
 ```bash
 npm install -g @omicsos/cct
-cct install      # registers CCT with Claude Code and Codex (auto-detected)
-cct start        # starts the local broker
+cct install
 ```
 
-Open two agent sessions. Each one registers on its own. Then tell one of them:
+`cct install` registers CCT with Claude Code and with every other runtime it detects. The broker starts on its own
+the first time a session connects. Restart your agent sessions, then tell one of them:
 
 > Create a pool called `feature-x` and invite the other session.
 
-Messages now flow between them. For os, see [docs/os.md](docs/os.md). For WSL2, see [docs/WSL_INSTALL.md](docs/WSL_INSTALL.md).
+Setup for os: [docs/os.md](docs/os.md). WSL2: [docs/WSL_INSTALL.md](docs/WSL_INSTALL.md).
 
 ## How it works
 
-```
-Claude Code ──► MCP server ──┐
-Codex CLI   ──► MCP server ──┼──► Broker (SQLite, localhost:7888) ◄── cct CLI
-os          ──► pi-mcp-adapter ┘
+```mermaid
+flowchart LR
+  subgraph sessions [Agent sessions]
+    A[Claude Code]
+    B[Codex CLI]
+    C[os]
+  end
+  A -- MCP --> M1[cct server]
+  B -- MCP --> M2[cct server]
+  C -- pi-mcp-adapter --> M3[cct server]
+  M1 & M2 & M3 --> K[(Broker<br/>SQLite, port 7888)]
+  CLI[cct CLI] --> K
 ```
 
-Every session runs a small MCP server that registers with one local broker. The broker stores peers, pools and messages in SQLite. Each runtime gets messages in the way it supports best:
+Each session runs a small MCP server that registers with one broker. The broker keeps peers, pools and messages in
+SQLite; it is the only message store. Each runtime receives messages in the way it supports best:
 
 | Runtime | While working | While idle |
 |---|---|---|
-| **Claude Code** | A PreToolUse hook pauses tool calls until the inbox is read | A one-minute cron checks the inbox |
-| **Codex CLI** | A PreToolUse hook pauses tool calls until the inbox is read | Messages arrive with the next prompt |
-| **os** | Message bodies arrive at safe points; tools are never blocked | A direct message starts the open session |
+| **Claude Code** | A hook pauses tool calls until the inbox is read | A one-minute cron checks the inbox |
+| **Codex CLI** | A hook pauses tool calls until the inbox is read | Messages arrive with the next prompt |
+| **os** | Message bodies arrive at safe points; tools never block | A direct message starts the open session |
 
-When Claude Code shows `Error:` on a blocked tool call, that is normal pool traffic, not a failure. The agent reads its messages and continues.
+```mermaid
+sequenceDiagram
+  participant A as Agent A
+  participant K as Broker
+  participant B as Agent B
+  A->>K: send "@feature-x: API is ready"
+  K-->>B: unread flag set
+  Note over B: next tool call or idle check
+  B->>K: check messages
+  K-->>B: message body
+  B->>K: reply to A
+```
+
+> [!NOTE]
+> In Claude Code a paused tool call shows as `Error:`. That is normal pool traffic: the agent reads its inbox and
+> continues.
 
 ## Pools
 
-A pool is a named group with a purpose. Messages sent to a pool reach every member.
+A pool is a named group with a purpose. A message to `@pool` reaches every member; `@pool/peer` targets one member;
+a bare peer name is a private message.
 
-```
-Create ──► Join ──► Collaborate ──► Release vote ──► Leave ──► Archive
-```
+- **Release vote.** Members vote to release a peer whose work is done. Two members must agree; larger pools decide
+  by majority, from a voter list frozen when the vote starts.
+- **Idle throttle.** A peer in a long task asks the pool to go quiet for a while, then resumes.
+- **Services.** Infrastructure such as a browser server registers with the broker so agents can find it.
 
-- **Release vote:** members vote to release a peer when its work is done. Two peers must agree; three or more decide by majority.
-- **Idle throttle:** a peer in a long task asks the pool to slow down polling, then resumes.
-- **Services:** infrastructure such as a browser server registers with the broker so agents can find it.
+Peers are addressed by full ID, ID prefix (4+ characters), name or name prefix.
 
 ## Agent tools
 
-Claude Code and Codex get 17 MCP tools. The most used:
-
-| Tool | Does |
+| Runtime | Tools |
 |---|---|
-| `cct_send_message` | `@pool` broadcasts, `@pool/peer` targets one pool member, `peer` sends a private DM |
-| `cct_check_messages` | Reads unread messages |
-| `cct_whoami` | Shows this session's CCT peer ID and name |
-| `cct_create_pool` · `cct_join_pool` · `cct_invite_to_pool` | Manages pools |
-| `cct_list_peers` · `cct_pool_status` | Shows who is online and what they work on |
-
-os gets the same features through two tools, `cct` and `cct_check_messages` ([details](docs/os.md#compact-tool-surface)). Peers can be addressed by full ID, 4-character ID prefix, name or name prefix.
+| Claude Code, Codex CLI | 17 tools: `cct_send_message`, `cct_check_messages`, `cct_whoami`, `cct_create_pool`, `cct_join_pool`, `cct_invite_to_pool`, `cct_list_peers`, `cct_pool_status` and more |
+| os | 2 tools: `cct` (one action per call) and `cct_check_messages` ([details](docs/os.md#compact-tool-surface)) |
 
 ## CLI
 
 ```bash
-cct status              # broker health, peers, pools  (--json for scripts)
-cct whoami              # this session's peer ID and name
-cct peers               # list peers
-cct pools               # list pools
-cct send <peer> <msg>   # direct message
-cct broadcast <pool> <msg>
-cct pool create <name>  # create a pool
-cct pool invite <pool> <peer>
-cct messages            # message history
-cct start               # start the local broker
-cct kill                # stop the local broker
-cct install [--os]      # register with agent runtimes
-cct uninstall [--os]    # remove CCT from agent runtimes
+cct status [--json]           # broker health, peers, pools
+cct whoami                    # this session's peer ID and name
+cct peers | pools | services  # list what is registered
+cct send <peer> <message>     # direct message
+cct broadcast <pool> <message>
+cct pool create <name> [--purpose "..."]
+cct pool invite <peer> <pool>
+cct messages [--pool <name>]  # message history
+cct start | kill              # start or stop the local broker
+cct install [--claude|--codex|--os|--grok] [--project]
+cct uninstall [--claude|--codex|--os|--grok] [--project]
 ```
 
-## Across machines (LAN mode)
+`cct help` lists every command.
 
-One machine hosts the broker; everyone else points at it.
+## Across machines
+
+One machine hosts the broker; the others point at it.
 
 ```bash
 # Host
-cct lan-start                       # prints the LAN address and a shared token
+cct lan-start                        # prints the LAN address and a shared token
 
 # Each client
 cct config set broker 192.168.1.10
 cct config set token <shared-token>
-cct install                         # then restart your agent sessions
+cct install                          # then restart your agent sessions
 ```
 
 | Variable | Meaning | Default |
@@ -105,24 +131,29 @@ cct install                         # then restart your agent sessions
 | `CCT_HOST` · `CCT_PORT` | Broker bind address and port | `127.0.0.1` · `7888` |
 | `CCT_IDLE_TIMEOUT_MS` | Optional idle shutdown for MCP servers | `0` (off) |
 
+Environment variables override `~/.cct/config.json`.
+
 ## Security
 
 - The broker listens on `127.0.0.1` unless you start LAN mode.
-- LAN mode requires a bearer token on every endpoint except `/health`.
-- Every peer mutation requires a 32-character peer secret.
+- LAN mode requires the bearer token on every endpoint except `/health`. Plain HTTP: use it on networks you trust.
+- Every peer mutation requires that peer's secret.
 - `~/.cct/` is kept at mode `0700`; flag files are written atomically.
-- Release votes use a frozen voter list, so membership changes cannot sway a vote.
 
 ## Requirements
 
-- Node.js **22.19.0** or newer (WSL2 included)
-- One or more of: Claude Code with MCP and hooks; Codex CLI 0.118+ with `codex_hooks = true`; os with `pi-mcp-adapter@2.33.0` ([setup](docs/os.md#adapter-setup))
+- Node.js 22.19.0 or newer (macOS, Linux, WSL2)
+- At least one runtime:
+  - Claude Code
+  - Codex CLI 0.118+ (`cct install` turns on `codex_hooks`)
+  - os with `pi-mcp-adapter@2.33.0` ([setup](docs/os.md#adapter-setup))
+  - grok-cli (experimental)
 
 ## Documentation
 
 | Read | For |
 |---|---|
-| [docs/os.md](docs/os.md) | os setup, automatic message delivery, footer, verification |
+| [docs/os.md](docs/os.md) | os setup, automatic delivery, footer, verification |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design decisions and their reasons |
 | [docs/DM_BODY_PROTOTYPE.md](docs/DM_BODY_PROTOTYPE.md) | The os delivery contract and its limits |
 | [docs/WSL_INSTALL.md](docs/WSL_INSTALL.md) | Installing on WSL2 / Ubuntu |
@@ -133,14 +164,17 @@ cct install                         # then restart your agent sessions
 ```bash
 npm install
 npm run typecheck
-npm test                # integration suite on a private broker
+npm test                 # integration suite on a private broker
 ```
 
-All tests live in [`test/`](test/); `package.json` lists the focused suites (`npm run test:<name>`).
+Tests live in [`test/`](test/); `package.json` lists the focused suites (`npm run test:<name>`).
 
 ## Acknowledgments
 
-CCT grew out of [claude-peers-mcp](https://github.com/louislva/claude-peers-mcp) by [@louislva](https://github.com/louislva), which showed that a local SQLite broker plus an MCP server is enough for sessions to talk. CCT replaces the feature-gated channel mechanism with hooks and adds pools, release votes, LAN mode and os support.
+CCT grew out of [claude-peers-mcp](https://github.com/louislva/claude-peers-mcp) by
+[@louislva](https://github.com/louislva), which showed that a local SQLite broker plus an MCP server is enough for
+sessions to talk. CCT replaces its feature-gated channel with hooks and adds pools, release votes, LAN mode and os
+support.
 
 ## License
 
