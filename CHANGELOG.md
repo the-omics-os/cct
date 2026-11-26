@@ -1,12 +1,29 @@
 # Changelog
 
-## Unreleased
+## 0.2.6
+
+Documentation and layout only. Runtime files (`broker.ts`, `server.ts`,
+`cli.ts`, the os/grok/opencode extensions, hooks, `shared/`, `bin/`) are
+byte-identical to 0.2.5.
 
 ### Changed
 
 - Repository layout: tests moved to `test/` (fixtures to `test/fixtures/`),
   design docs and the WSL guide to `docs/`. npm scripts are unchanged.
-- README shortened; os setup and delivery details moved to `docs/os.md`.
+- README rewritten: Mermaid architecture and message-flow diagrams, shorter
+  sections. os setup and delivery details moved to `docs/os.md`, which now
+  ships in the package.
+
+### Fixed
+
+- README: `cct pool invite` argument order (`<peer> <pool>`); quick start no
+  longer asks for `cct start` (the broker starts on first connect); grok-cli
+  (experimental) listed; LAN mode noted as plain HTTP.
+
+Token-cost gate: nothing a session receives changed. `git diff v0.2.5` is
+empty for every runtime file; `test/test-compact-surface.ts` (89 passed) and
+`test/test-compact-measurements.ts` pass, so tool schemas and outputs match
+0.2.5. Integration suite: 148 passed, 0 failed.
 
 ## 0.2.5
 

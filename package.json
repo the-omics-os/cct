@@ -1,7 +1,7 @@
 {
   "name": "@omicsos/cct",
-  "version": "0.2.5",
-  "description": "Cross-Context Talk \u2014 real-time inter-session communication for coding agents",
+  "version": "0.2.6",
+  "description": "Cross-Context Talk — real-time inter-session communication for coding agents",
   "author": "Kevin Yar <kevin.yar@omics-os.com>",
   "license": "MIT",
   "repository": {
